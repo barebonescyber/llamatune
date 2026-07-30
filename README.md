@@ -699,4 +699,4 @@ require a GPU for ordinary development validation.
 
 ## License
 
-llamatune is distributed under the [MIT License](LICENSE).
+llamatune is distributed under the [Apache License 2.0](LICENSE).

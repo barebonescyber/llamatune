@@ -8,6 +8,12 @@ Use a focused branch, keep behavior changes documented, and do not commit model
 files, session artifacts, credentials, or workstation-specific notes. Put local
 notes in `NOTES.local.md`, which is intentionally ignored.
 
+Every commit must include a `Signed-off-by: Name <email>` trailer certifying
+the contribution under the
+[Developer Certificate of Origin 1.1](https://developercertificate.org/).
+Create the trailer with `git commit -s`; never sign off on another contributor's
+behalf.
+
 Run all four quality gates before submitting a change:
 
 ```sh

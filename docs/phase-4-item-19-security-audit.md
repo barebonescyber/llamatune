@@ -1,13 +1,14 @@
 # Phase 4 Item 19 security audit
 
-Status date: 2026-07-27.
+Status date: 2026-07-29.
 
-Status: **local pre-public audit complete; public-repository CodeQL and GitHub
-security evidence remain required before release**.
+Status: **local and initial public-repository audits complete; an exact-candidate
+rerun remains required before release**.
 
-This document records the local Item 19 release audit and the state observed
-in the private development repository. That historical GitHub state is not
-evidence for the clean public repository.
+This document records the local Item 19 release audit, the historical state
+observed in the private development repository, and the first audit of the
+clean public repository. Evidence from the private development repository is
+not public release evidence.
 
 ## Local results
 
@@ -71,19 +72,46 @@ intentionally skipped with `run_codeql=false` under the approved private-repo
 deferral. The private workflow URL is intentionally not published as public
 release evidence.
 
+## Public-repository GitHub state observed
+
+The clean public repository was published at exact root commit
+`785af3ed43579593b0482b4c29d870b1250ca869`. Its
+[`CI` run 30508890102](https://github.com/barebonescyber/llamatune/actions/runs/30508890102)
+passed the required Linux and Windows matrix, advisory macOS lanes,
+release-artifact inspection, checksum verification, and clean wheel-install
+smoke tests.
+
+The public repository's manual
+[`Security audit`](https://github.com/barebonescyber/llamatune/actions/runs/30510039068)
+workflow then ran against that same root commit with `run_codeql=true`.
+
+- Dependency, source, and tracked-file secret audit: passed
+- CodeQL / Python: passed
+- Open CodeQL alerts after the run: 0
+- Open secret-scanning alerts after the run: 0
+- Open Dependabot security alerts after the run: 0
+
+Post-publication settings were also verified: the `main` ruleset is active;
+secret scanning and push protection are enabled; private vulnerability
+reporting is enabled; Dependabot security updates are enabled; GitHub Actions
+has read-only default permissions; and referenced actions must be pinned by
+full commit SHA.
+
 ## Certification disposition
 
-The local portion of Item 19 is complete:
+The local portion and initial clean-public-repository baseline of Item 19 are
+complete:
 
 - the exact locked dependencies have no known vulnerability;
 - the source and tracked-file scans have no unaccepted finding;
 - dependency and Dependabot surfaces are enabled and reviewed; and
-- the same checks pass in the published GitHub Actions workflow.
+- the same checks plus CodeQL pass in the published GitHub Actions workflow.
 
-The new public repository must rerun all GitHub-hosted checks against its exact
-candidate commit. CodeQL remains a mandatory public-release gate, not completed
-evidence. Run `Security audit` with `run_codeql=true`, review the resulting
-code-scanning alerts, and record the public workflow URL before tagging or
-announcing the public beta. Do not enable CodeQL default setup alongside the
-committed advanced workflow; the advanced workflow is the evidence path of
-record.
+Commit `785af3e` is a pre-candidate public baseline, not the final candidate:
+the release-preparation change that records it also changes the distributed
+license and package metadata. After that change is merged, rerun all required
+CI and the `Security audit` workflow with `run_codeql=true` against the
+resulting exact candidate commit. Review the resulting alerts and record that
+final workflow URL in the release evidence before tagging or announcing the
+beta. Do not enable CodeQL default setup alongside the committed advanced
+workflow; the advanced workflow is the evidence path of record.

@@ -13,7 +13,7 @@ remains authoritative for product behavior.
 ## Candidate record
 
 - Candidate version: `0.1.0b2` (SemVer release identity `0.1.0-beta.2`)
-- Candidate state: **UNFROZEN**
+- Candidate state: **UNFROZEN — public security baseline complete; exact-candidate rerun pending**
 - Candidate tag: _unset_
 - Git commit SHA: _unset_
 - Candidate build/run URL: _unset_
@@ -189,7 +189,12 @@ Evidence: _unset_
 - [ ] Dependency, static-analysis, secret-scanning, and CodeQL checks have acceptable
   results.
 
-Evidence: _unset_
+Evidence: Pre-candidate public security baseline:
+[`Security audit` run 30510039068](https://github.com/barebonescyber/llamatune/actions/runs/30510039068)
+passed dependency, source, tracked-file secret, and CodeQL checks on root commit
+`785af3ed43579593b0482b4c29d870b1250ca869`, with zero open CodeQL,
+secret-scanning, or Dependabot security alerts. This gate remains unchecked
+until the workflow is rerun on the exact post-merge candidate.
 
 ## E. Native Linux acceptance
 
