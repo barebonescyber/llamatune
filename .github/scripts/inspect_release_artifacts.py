@@ -78,7 +78,6 @@ FORBIDDEN_SUFFIXES = {".gguf", ".pyc", ".session"}
 
 REQUIRED_CLASSIFIERS = {
     "Development Status :: 4 - Beta",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.11",
@@ -132,8 +131,30 @@ def _validate_wheel_metadata(raw: bytes) -> None:
         raise ValueError("wheel metadata omits Maintainer")
     if not metadata["Keywords"]:
         raise ValueError("wheel metadata omits Keywords")
+    if metadata["License-Expression"] != expected.get("license"):
+        raise ValueError("wheel License-Expression does not match pyproject.toml")
+
+    raw_license_files = expected.get("license-files")
+    if not isinstance(raw_license_files, list):
+        raise ValueError("pyproject.toml omits license-files")
+    expected_license_files: set[str] = set()
+    for license_file in raw_license_files:
+        if not isinstance(license_file, str):
+            raise ValueError("pyproject.toml license-files contains a non-string value")
+        expected_license_files.add(license_file)
+    license_files = set(metadata.get_all("License-File", []))
+    if license_files != expected_license_files:
+        raise ValueError("wheel License-File fields do not match pyproject.toml")
 
     classifiers = set(metadata.get_all("Classifier", []))
+    deprecated_license_classifiers = sorted(
+        classifier for classifier in classifiers if classifier.startswith("License ::")
+    )
+    if deprecated_license_classifiers:
+        raise ValueError(
+            "wheel metadata contains deprecated license classifiers: "
+            f"{', '.join(deprecated_license_classifiers)}"
+        )
     missing_classifiers = sorted(REQUIRED_CLASSIFIERS - classifiers)
     if missing_classifiers:
         raise ValueError(

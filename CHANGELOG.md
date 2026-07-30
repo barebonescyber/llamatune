@@ -21,6 +21,8 @@ No changes yet.
 
 ### Changed
 
+- Project licensing changed from MIT to Apache-2.0, with PEP 639 package metadata and
+  contributor sign-off requirements.
 - Experimental beta surfaces are labeled consistently in documentation, command help, and
   generated report titles.
 - Release archives exclude tests, local reports, planning documents, and other files
