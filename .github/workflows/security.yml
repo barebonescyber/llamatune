@@ -1,0 +1,69 @@
+name: Security audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_codeql:
+        description: "Run CodeQL (requires GitHub Code Security for this private repository)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  local-audit:
+    name: Dependency, source, and secret audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Export exact locked dependencies
+        run: >-
+          uv export --locked --all-groups --no-emit-project
+          --output-file "$RUNNER_TEMP/requirements.txt"
+      - name: Audit dependencies
+        run: >-
+          uvx --from pip-audit==2.10.1 pip-audit
+          --requirement "$RUNNER_TEMP/requirements.txt"
+          --disable-pip --no-deps
+      - name: Scan Python source
+        run: >-
+          uvx --from bandit==1.9.4 bandit
+          --recursive src
+          --severity-level medium
+          --confidence-level medium
+      - name: Scan tracked files for secrets
+        run: | # pragma: allowlist secret
+          uvx --from detect-secrets==1.5.0 detect-secrets scan \
+            > "$RUNNER_TEMP/detect-secrets.json"
+          python .github/scripts/check_secret_scan.py \
+            "$RUNNER_TEMP/detect-secrets.json"
+
+  codeql:
+    name: CodeQL / Python
+    if: ${{ inputs.run_codeql }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4
+        with:
+          languages: python
+          queries: security-extended
+      - name: Analyze
+        uses: github/codeql-action/analyze@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4
+        with:
+          category: "/language:python"

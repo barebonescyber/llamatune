@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/barebonescyber/llamatune/security/advisories/new
+    about: Report suspected vulnerabilities privately.
+  - name: Support policy
+    url: https://github.com/barebonescyber/llamatune/blob/main/SUPPORT.md
+    about: Review the supported, experimental, and excluded surfaces.

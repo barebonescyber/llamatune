@@ -1,0 +1,34 @@
+name: Feature request
+description: Propose a scoped improvement to llamatune.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the user problem and why existing behavior is insufficient.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful contract, including safety implications.
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Intended surface
+      options:
+        - Beta-supported core
+        - Experimental feature
+        - Future or excluded surface
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Acceptance evidence
+      description: Explain how the behavior could be tested without real models or network access in CI.

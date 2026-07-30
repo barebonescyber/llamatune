@@ -1,0 +1,355 @@
+{
+  "schema_version": 1,
+  "name": "agentic",
+  "version": 1,
+  "kind": "agentic",
+  "tasks": [
+    {
+      "id": "restock",
+      "weight": 1,
+      "max_tokens": 256,
+      "prompt": "Order 5 units so stock becomes 6.",
+      "environment": {
+        "initial_state": {
+          "stock": 1,
+          "ordered": false
+        },
+        "tools": [
+          {
+            "name": "order",
+            "params": {
+              "sku": "string",
+              "amount": "number"
+            },
+            "effects": [
+              {
+                "set": [
+                  "ordered",
+                  true
+                ]
+              },
+              {
+                "incr": [
+                  "stock",
+                  "$arg.amount"
+                ]
+              }
+            ],
+            "result": "stock is {state.stock}"
+          }
+        ],
+        "goal": {
+          "state_subset": {
+            "ordered": true,
+            "stock": 6
+          }
+        },
+        "max_steps": 3,
+        "optimal_steps": 1
+      }
+    },
+    {
+      "id": "assign-owner",
+      "weight": 1,
+      "max_tokens": 256,
+      "prompt": "Assign Ari as the project owner.",
+      "environment": {
+        "initial_state": {
+          "project": {
+            "owner": null
+          }
+        },
+        "tools": [
+          {
+            "name": "assign",
+            "params": {
+              "owner": "string"
+            },
+            "effects": [
+              {
+                "set": [
+                  "project.owner",
+                  "$arg.owner"
+                ]
+              }
+            ],
+            "result": "owner {state.project.owner}"
+          }
+        ],
+        "goal": {
+          "state_subset": {
+            "project": {
+              "owner": "Ari"
+            }
+          }
+        },
+        "max_steps": 3,
+        "optimal_steps": 1
+      }
+    },
+    {
+      "id": "append-label",
+      "weight": 1,
+      "max_tokens": 256,
+      "prompt": "Add the urgent label.",
+      "environment": {
+        "initial_state": {
+          "labels": []
+        },
+        "tools": [
+          {
+            "name": "label",
+            "params": {
+              "name": "string"
+            },
+            "effects": [
+              {
+                "append": [
+                  "labels",
+                  "$arg.name"
+                ]
+              }
+            ],
+            "result": "labels updated"
+          }
+        ],
+        "goal": {
+          "state_subset": {
+            "labels": [
+              "urgent"
+            ]
+          }
+        },
+        "max_steps": 3,
+        "optimal_steps": 1
+      }
+    },
+    {
+      "id": "close-ticket",
+      "weight": 1,
+      "max_tokens": 256,
+      "prompt": "Record note resolved and close the ticket in one update.",
+      "environment": {
+        "initial_state": {
+          "ticket": {
+            "status": "open",
+            "notes": []
+          }
+        },
+        "tools": [
+          {
+            "name": "resolve",
+            "params": {
+              "note": "string"
+            },
+            "effects": [
+              {
+                "append": [
+                  "ticket.notes",
+                  "$arg.note"
+                ]
+              },
+              {
+                "set": [
+                  "ticket.status",
+                  "closed"
+                ]
+              }
+            ],
+            "result": "resolved and closed"
+          }
+        ],
+        "goal": {
+          "state_subset": {
+            "ticket": {
+              "status": "closed",
+              "notes": [
+                "resolved"
+              ]
+            }
+          }
+        },
+        "max_steps": 4,
+        "optimal_steps": 1
+      }
+    },
+    {
+      "id": "two-counters",
+      "weight": 1,
+      "max_tokens": 256,
+      "prompt": "Increment both left and right once with the paired operation.",
+      "environment": {
+        "initial_state": {
+          "left": 0,
+          "right": 0
+        },
+        "tools": [
+          {
+            "name": "increment_pair",
+            "params": {},
+            "effects": [
+              {
+                "incr": [
+                  "left",
+                  1
+                ]
+              },
+              {
+                "incr": [
+                  "right",
+                  1
+                ]
+              }
+            ],
+            "result": "both incremented"
+          }
+        ],
+        "goal": {
+          "state_subset": {
+            "left": 1,
+            "right": 1
+          }
+        },
+        "max_steps": 4,
+        "optimal_steps": 1
+      }
+    },
+    {
+      "id": "publish",
+      "weight": 1,
+      "max_tokens": 256,
+      "prompt": "Review and publish the draft with the release operation.",
+      "environment": {
+        "initial_state": {
+          "draft": {
+            "reviewed": false,
+            "published": false
+          }
+        },
+        "tools": [
+          {
+            "name": "release",
+            "params": {},
+            "effects": [
+              {
+                "set": [
+                  "draft.reviewed",
+                  true
+                ]
+              },
+              {
+                "set": [
+                  "draft.published",
+                  true
+                ]
+              }
+            ],
+            "result": "reviewed and published"
+          }
+        ],
+        "goal": {
+          "state_subset": {
+            "draft": {
+              "reviewed": true,
+              "published": true
+            }
+          }
+        },
+        "max_steps": 4,
+        "optimal_steps": 1
+      }
+    },
+    {
+      "id": "queue-jobs",
+      "weight": 1,
+      "max_tokens": 256,
+      "prompt": "Enqueue alpha followed by beta with one batch operation.",
+      "environment": {
+        "initial_state": {
+          "queue": []
+        },
+        "tools": [
+          {
+            "name": "enqueue_pair",
+            "params": {
+              "first": "string",
+              "second": "string"
+            },
+            "effects": [
+              {
+                "append": [
+                  "queue",
+                  "$arg.first"
+                ]
+              },
+              {
+                "append": [
+                  "queue",
+                  "$arg.second"
+                ]
+              }
+            ],
+            "result": "pair queued"
+          }
+        ],
+        "goal": {
+          "state_subset": {
+            "queue": [
+              "alpha",
+              "beta"
+            ]
+          }
+        },
+        "max_steps": 4,
+        "optimal_steps": 1
+      }
+    },
+    {
+      "id": "activate-user",
+      "weight": 1,
+      "max_tokens": 256,
+      "prompt": "Set the user role to editor and activate the user in one update.",
+      "environment": {
+        "initial_state": {
+          "user": {
+            "role": "viewer",
+            "active": false
+          }
+        },
+        "tools": [
+          {
+            "name": "update_user",
+            "params": {
+              "role": "string"
+            },
+            "effects": [
+              {
+                "set": [
+                  "user.role",
+                  "$arg.role"
+                ]
+              },
+              {
+                "set": [
+                  "user.active",
+                  true
+                ]
+              }
+            ],
+            "result": "role set and user active"
+          }
+        ],
+        "goal": {
+          "state_subset": {
+            "user": {
+              "role": "editor",
+              "active": true
+            }
+          }
+        },
+        "max_steps": 4,
+        "optimal_steps": 1
+      }
+    }
+  ]
+}

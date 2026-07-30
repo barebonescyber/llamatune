@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "name": "ifollow",
+  "version": 1,
+  "kind": "ifollow",
+  "tasks": [
+    {
+      "id": "json-status",
+      "weight": 1,
+      "max_tokens": 96,
+      "prompt": "Return a JSON object with status equal to ready and count equal to 2.",
+      "constraints": [
+        {
+          "type": "json_object",
+          "schema_subset": {
+            "status": "ready",
+            "count": 2
+          }
+        }
+      ]
+    },
+    {
+      "id": "five-words",
+      "weight": 1,
+      "max_tokens": 64,
+      "prompt": "Describe a quiet library in at most five words.",
+      "constraints": [
+        {
+          "type": "max_words",
+          "value": 5
+        }
+      ]
+    },
+    {
+      "id": "short-line",
+      "weight": 1,
+      "max_tokens": 64,
+      "prompt": "Write a response of at most 24 characters about rain.",
+      "constraints": [
+        {
+          "type": "max_chars",
+          "value": 24
+        }
+      ]
+    },
+    {
+      "id": "include-blue",
+      "weight": 1,
+      "max_tokens": 64,
+      "prompt": "Write one sentence that includes the word blue.",
+      "constraints": [
+        {
+          "type": "must_include",
+          "values": [
+            "blue"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "exclude-red",
+      "weight": 1,
+      "max_tokens": 64,
+      "prompt": "Describe snow without using the word red.",
+      "constraints": [
+        {
+          "type": "must_not_include",
+          "values": [
+            "red"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "ticket-format",
+      "weight": 1,
+      "max_tokens": 64,
+      "prompt": "Output exactly TICKET- followed by three digits.",
+      "constraints": [
+        {
+          "type": "regex_full",
+          "pattern": "TICKET-[0-9]{3}"
+        }
+      ]
+    },
+    {
+      "id": "english-ascii",
+      "weight": 1,
+      "max_tokens": 64,
+      "prompt": "Reply in simple English: the task is complete.",
+      "constraints": [
+        {
+          "type": "language",
+          "value": "english"
+        }
+      ]
+    },
+    {
+      "id": "bounded-message",
+      "weight": 1,
+      "max_tokens": 64,
+      "prompt": "Reply with a line starting BEGIN and ending END.",
+      "constraints": [
+        {
+          "type": "starts_with",
+          "value": "BEGIN"
+        },
+        {
+          "type": "ends_with",
+          "value": "END"
+        }
+      ]
+    },
+    {
+      "id": "two-terms",
+      "weight": 1,
+      "max_tokens": 96,
+      "prompt": "In at most twelve words, include both cedar and river.",
+      "constraints": [
+        {
+          "type": "max_words",
+          "value": 12
+        },
+        {
+          "type": "must_include",
+          "values": [
+            "cedar",
+            "river"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "json-owner",
+      "weight": 1,
+      "max_tokens": 96,
+      "prompt": "Return JSON with owner Mira and active true, with no prose.",
+      "constraints": [
+        {
+          "type": "json_object",
+          "schema_subset": {
+            "owner": "Mira",
+            "active": true
+          }
+        },
+        {
+          "type": "starts_with",
+          "value": "{"
+        },
+        {
+          "type": "ends_with",
+          "value": "}"
+        }
+      ]
+    },
+    {
+      "id": "needle-orbit",
+      "weight": 1,
+      "max_tokens": 64,
+      "kind": "needle",
+      "needle": "ORBIT-17",
+      "question": "What is the access code?",
+      "haystack_ratio": 0.55,
+      "position": 0.1,
+      "ctx_min": 2048
+    },
+    {
+      "id": "needle-harbor",
+      "weight": 1,
+      "max_tokens": 64,
+      "kind": "needle",
+      "needle": "HARBOR-29",
+      "question": "What is the harbor identifier?",
+      "haystack_ratio": 0.6,
+      "position": 0.3,
+      "ctx_min": 2048
+    },
+    {
+      "id": "needle-copper",
+      "weight": 1,
+      "max_tokens": 64,
+      "kind": "needle",
+      "needle": "COPPER-41",
+      "question": "What is the material code?",
+      "haystack_ratio": 0.65,
+      "position": 0.5,
+      "ctx_min": 2048
+    },
+    {
+      "id": "needle-lantern",
+      "weight": 1,
+      "max_tokens": 64,
+      "kind": "needle",
+      "needle": "LANTERN-63",
+      "question": "What is the lantern code?",
+      "haystack_ratio": 0.7,
+      "position": 0.7,
+      "ctx_min": 2048
+    },
+    {
+      "id": "needle-meadow",
+      "weight": 1,
+      "max_tokens": 64,
+      "kind": "needle",
+      "needle": "MEADOW-85",
+      "question": "What is the meadow code?",
+      "haystack_ratio": 0.75,
+      "position": 0.9,
+      "ctx_min": 2048
+    }
+  ]
+}

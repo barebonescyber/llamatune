@@ -1,0 +1,59 @@
+name: Bug report
+description: Report reproducible behavior in llamatune.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, environment values, private models, or
+        unsanitized session evidence. Report security issues privately.
+  - type: input
+    id: version
+    attributes:
+      label: llamatune version or commit
+      placeholder: 0.1.0b2 or a full commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: support_surface
+    attributes:
+      label: Support surface
+      options:
+        - Beta-supported
+        - Experimental
+        - Excluded or unsure
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and llama.cpp identity
+      description: Include OS, architecture, Python, llama.cpp build, and backend.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include a redacted command, exit code, and reproducibility.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Sensitive-data check
+      options:
+        - label: I removed credentials, environment values, private models, and unsanitized evidence.
+          required: true

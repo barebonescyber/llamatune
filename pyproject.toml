@@ -1,0 +1,104 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llamatune"
+version = "0.1.0b2"
+description = "Finds the fastest llama.cpp runtime settings for a GGUF model on the local workstation."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+maintainers = [
+    { name = "barebonescyber" },
+]
+keywords = ["gguf", "llama.cpp", "benchmark", "performance", "tuning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Benchmark",
+]
+dependencies = [
+    "typer<1",
+    "gguf<1",
+    "rich>=15.0.0,<16",
+]
+
+[project.urls]
+Changelog = "https://github.com/barebonescyber/llamatune/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/barebonescyber/llamatune#readme"
+Issues = "https://github.com/barebonescyber/llamatune/issues"
+Repository = "https://github.com/barebonescyber/llamatune"
+
+[project.scripts]
+llamatune = "llamatune.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "pytest-randomly",
+    "ruff",
+    "mypy",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llamatune"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/.gitignore",
+    "/CHANGELOG.md",
+    "/DESIGN.md",
+    "/LICENSE",
+    "/README.md",
+    "/SECURITY.md",
+    "/SUPPORT.md",
+    "/docs/beta-acceptance-checklist.md",
+    "/docs/beta-contract.md",
+    "/docs/compatibility-policy.md",
+    "/pyproject.toml",
+    "/src",
+    "/uv.lock",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["A", "B", "C4", "E", "F", "I", "N", "PTH", "RUF", "S", "SIM", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.mypy]
+# Note: the installed numpy version's shipped .pyi stubs use PEP 695 `type`
+# statements, which are a hard *syntax* requirement of Python >= 3.12 (mypy
+# cannot even parse the stub file under a 3.11 target). numpy is only a
+# transitive dependency (via gguf) plus a direct import in test fixtures
+# that build GGUF files -- llamatune's own runtime requirement stays
+# `requires-python = ">=3.11"` (DESIGN §16); this setting only raises the
+# floor for mypy's own stub-parsing pass, not the supported runtime.
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = "gguf.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = "--cov=llamatune --cov-branch --cov-report=term --cov-report=json:coverage.json --cov-fail-under=85"
+testpaths = ["tests"]

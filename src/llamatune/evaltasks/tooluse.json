@@ -1,0 +1,698 @@
+{
+  "schema_version": 1,
+  "name": "tooluse",
+  "version": 1,
+  "kind": "tooluse",
+  "tasks": [
+    {
+      "id": "weather-current",
+      "weight": 1,
+      "max_tokens": 192,
+      "tools": [
+        {
+          "name": "weather",
+          "description": "Deterministic weather lookup.",
+          "params": {
+            "type": "object"
+          }
+        }
+      ],
+      "turns": [
+        {
+          "user": "Check the temperature in Oslo."
+        },
+        {
+          "expect": {
+            "tool": "weather",
+            "args_equal": {
+              "city": "Oslo"
+            }
+          },
+          "tool_result": {
+            "city": "Oslo"
+          }
+        },
+        {
+          "user": "Summarize the weather-current lookup."
+        },
+        {
+          "expect_final": {
+            "contains": [
+              "12 C"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "inventory-check",
+      "weight": 1,
+      "max_tokens": 192,
+      "tools": [
+        {
+          "name": "inventory",
+          "description": "Deterministic inventory lookup.",
+          "params": {
+            "type": "object"
+          }
+        }
+      ],
+      "turns": [
+        {
+          "user": "Find stock for SKU A17."
+        },
+        {
+          "expect": {
+            "tool": "inventory",
+            "args_equal": {
+              "sku": "A17"
+            }
+          },
+          "tool_result": {
+            "sku": "A17",
+            "stock": 4
+          }
+        },
+        {
+          "user": "Summarize the inventory-check lookup."
+        },
+        {
+          "expect_final": {
+            "contains": [
+              "4"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "calendar-day",
+      "weight": 1,
+      "max_tokens": 192,
+      "tools": [
+        {
+          "name": "calendar",
+          "description": "Deterministic calendar lookup.",
+          "params": {
+            "type": "object"
+          }
+        }
+      ],
+      "turns": [
+        {
+          "user": "Look up events on 2026-08-01."
+        },
+        {
+          "expect": {
+            "tool": "calendar",
+            "args_equal": {
+              "date": "2026-08-01"
+            }
+          },
+          "tool_result": {
+            "events": [
+              "review"
+            ]
+          }
+        },
+        {
+          "user": "Summarize the calendar-day lookup."
+        },
+        {
+          "expect_final": {
+            "contains": [
+              "review"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "unit-convert",
+      "weight": 1,
+      "max_tokens": 192,
+      "tools": [
+        {
+          "name": "convert",
+          "description": "Deterministic convert lookup.",
+          "params": {
+            "type": "object"
+          }
+        }
+      ],
+      "turns": [
+        {
+          "user": "Convert 5 kilometers to meters."
+        },
+        {
+          "expect": {
+            "tool": "convert",
+            "args_equal": {
+              "value": 5,
+              "from": "km",
+              "to": "m"
+            }
+          },
+          "tool_result": {
+            "result": 5000
+          }
+        },
+        {
+          "user": "Summarize the unit-convert lookup."
+        },
+        {
+          "expect_final": {
+            "contains": [
+              "5000"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "ticket-status",
+      "weight": 1,
+      "max_tokens": 192,
+      "tools": [
+        {
+          "name": "ticket",
+          "description": "Deterministic ticket lookup.",
+          "params": {
+            "type": "object"
+          }
+        }
+      ],
+      "turns": [
+        {
+          "user": "Check support ticket 42."
+        },
+        {
+          "expect": {
+            "tool": "ticket",
+            "args_equal": {
+              "id": 42
+            }
+          },
+          "tool_result": {
+            "status": "closed"
+          }
+        },
+        {
+          "user": "Summarize the ticket-status lookup."
+        },
+        {
+          "expect_final": {
+            "contains": [
+              "closed"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "lookup-owner",
+      "weight": 1,
+      "max_tokens": 192,
+      "tools": [
+        {
+          "name": "owner",
+          "description": "Deterministic owner lookup.",
+          "params": {
+            "type": "object"
+          }
+        }
+      ],
+      "turns": [
+        {
+          "user": "Who owns project Cedar?"
+        },
+        {
+          "expect": {
+            "tool": "owner",
+            "args_equal": {
+              "project": "Cedar"
+            }
+          },
+          "tool_result": {
+            "owner": "Mira"
+          }
+        },
+        {
+          "user": "Summarize the lookup-owner result."
+        },
+        {
+          "expect_final": {
+            "contains": [
+              "Mira"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "price-check",
+      "weight": 1,
+      "max_tokens": 192,
+      "tools": [
+        {
+          "name": "price",
+          "description": "Deterministic price lookup.",
+          "params": {
+            "type": "object"
+          }
+        }
+      ],
+      "turns": [
+        {
+          "user": "Get the price for item B2."
+        },
+        {
+          "expect": {
+            "tool": "price",
+            "args_equal": {
+              "item": "B2"
+            }
+          },
+          "tool_result": {
+            "price": 19.5
+          }
+        },
+        {
+          "user": "Summarize the price-check lookup."
+        },
+        {
+          "expect_final": {
+            "contains": [
+              "19.5"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "timezone",
+      "weight": 1,
+      "max_tokens": 192,
+      "tools": [
+        {
+          "name": "timezone",
+          "description": "Deterministic timezone lookup.",
+          "params": {
+            "type": "object"
+          }
+        }
+      ],
+      "turns": [
+        {
+          "user": "Find the UTC offset for Tokyo."
+        },
+        {
+          "expect": {
+            "tool": "timezone",
+            "args_equal": {
+              "city": "Tokyo"
+            }
+          },
+          "tool_result": {
+            "offset": "+09:00"
+          }
+        },
+        {
+          "user": "Summarize the timezone lookup."
+        },
+        {
+          "expect_final": {
+            "contains": [
+              "+09:00"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "route-distance",
+      "weight": 1,
+      "max_tokens": 192,
+      "tools": [
+        {
+          "name": "route",
+          "description": "Deterministic route lookup.",
+          "params": {
+            "type": "object"
+          }
+        }
+      ],
+      "turns": [
+        {
+          "user": "Find distance from A to B."
+        },
+        {
+          "expect": {
+            "tool": "route",
+            "args_equal": {
+              "origin": "A",
+              "destination": "B"
+            }
+          },
+          "tool_result": {
+            "km": 7
+          }
+        },
+        {
+          "user": "Summarize the route-distance lookup."
+        },
+        {
+          "expect_final": {
+            "contains": [
+              "7"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "document-title",
+      "weight": 1,
+      "max_tokens": 192,
+      "tools": [
+        {
+          "name": "document",
+          "description": "Deterministic document lookup.",
+          "params": {
+            "type": "object"
+          }
+        }
+      ],
+      "turns": [
+        {
+          "user": "Read the title of document D9."
+        },
+        {
+          "expect": {
+            "tool": "document",
+            "args_equal": {
+              "id": "D9"
+            }
+          },
+          "tool_result": {
+            "title": "Safety Notes"
+          }
+        },
+        {
+          "user": "Summarize the document-title lookup."
+        },
+        {
+          "expect_final": {
+            "contains": [
+              "Safety Notes"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "weather-plan",
+      "weight": 1,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "name": "weather",
+          "description": "Deterministic weather lookup.",
+          "params": {
+            "type": "object"
+          }
+        }
+      ],
+      "turns": [
+        {
+          "user": "Check Oslo weather, then check Bergen weather."
+        },
+        {
+          "expect": {
+            "tool": "weather",
+            "args_equal": {
+              "city": "Oslo"
+            }
+          },
+          "tool_result": {
+            "ok": true,
+            "query": 1
+          }
+        },
+        {
+          "user": "Continue the weather-plan task with its second lookup."
+        },
+        {
+          "expect": {
+            "tool": "weather",
+            "args_equal": {
+              "city": "Bergen"
+            }
+          },
+          "tool_result": {
+            "ok": true,
+            "query": 2
+          }
+        },
+        {
+          "user": "Summarize the completed weather-plan lookups."
+        },
+        {
+          "expect_final": {
+            "contains": [
+              "complete"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "stock-compare",
+      "weight": 1,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "name": "inventory",
+          "description": "Deterministic inventory lookup.",
+          "params": {
+            "type": "object"
+          }
+        }
+      ],
+      "turns": [
+        {
+          "user": "Check stock for A1, then A2."
+        },
+        {
+          "expect": {
+            "tool": "inventory",
+            "args_equal": {
+              "sku": "A1"
+            }
+          },
+          "tool_result": {
+            "ok": true,
+            "query": 1
+          }
+        },
+        {
+          "user": "Continue the stock-compare task with its second lookup."
+        },
+        {
+          "expect": {
+            "tool": "inventory",
+            "args_equal": {
+              "sku": "A2"
+            }
+          },
+          "tool_result": {
+            "ok": true,
+            "query": 2
+          }
+        },
+        {
+          "user": "Summarize the completed stock-compare lookups."
+        },
+        {
+          "expect_final": {
+            "contains": [
+              "complete"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "two-days",
+      "weight": 1,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "name": "calendar",
+          "description": "Deterministic calendar lookup.",
+          "params": {
+            "type": "object"
+          }
+        }
+      ],
+      "turns": [
+        {
+          "user": "Check events on 2026-08-01 and then 2026-08-02."
+        },
+        {
+          "expect": {
+            "tool": "calendar",
+            "args_equal": {
+              "date": "2026-08-01"
+            }
+          },
+          "tool_result": {
+            "ok": true,
+            "query": 1
+          }
+        },
+        {
+          "user": "Continue the two-days task with its second lookup."
+        },
+        {
+          "expect": {
+            "tool": "calendar",
+            "args_equal": {
+              "date": "2026-08-02"
+            }
+          },
+          "tool_result": {
+            "ok": true,
+            "query": 2
+          }
+        },
+        {
+          "user": "Summarize the completed two-days lookups."
+        },
+        {
+          "expect_final": {
+            "contains": [
+              "complete"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "two-converts",
+      "weight": 1,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "name": "convert",
+          "description": "Deterministic convert lookup.",
+          "params": {
+            "type": "object"
+          }
+        }
+      ],
+      "turns": [
+        {
+          "user": "Convert 2 km to m, then 3 km to m."
+        },
+        {
+          "expect": {
+            "tool": "convert",
+            "args_equal": {
+              "value": 2,
+              "from": "km",
+              "to": "m"
+            }
+          },
+          "tool_result": {
+            "ok": true,
+            "query": 1
+          }
+        },
+        {
+          "user": "Continue the two-converts task with its second lookup."
+        },
+        {
+          "expect": {
+            "tool": "convert",
+            "args_equal": {
+              "value": 3,
+              "from": "km",
+              "to": "m"
+            }
+          },
+          "tool_result": {
+            "ok": true,
+            "query": 2
+          }
+        },
+        {
+          "user": "Summarize the completed two-converts lookups."
+        },
+        {
+          "expect_final": {
+            "contains": [
+              "complete"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "two-tickets",
+      "weight": 1,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "name": "ticket",
+          "description": "Deterministic ticket lookup.",
+          "params": {
+            "type": "object"
+          }
+        }
+      ],
+      "turns": [
+        {
+          "user": "Check ticket 7 and then ticket 8."
+        },
+        {
+          "expect": {
+            "tool": "ticket",
+            "args_equal": {
+              "id": 7
+            }
+          },
+          "tool_result": {
+            "ok": true,
+            "query": 1
+          }
+        },
+        {
+          "user": "Continue the two-tickets task with its second lookup."
+        },
+        {
+          "expect": {
+            "tool": "ticket",
+            "args_equal": {
+              "id": 8
+            }
+          },
+          "tool_result": {
+            "ok": true,
+            "query": 2
+          }
+        },
+        {
+          "user": "Summarize the completed two-tickets lookups."
+        },
+        {
+          "expect_final": {
+            "contains": [
+              "complete"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,636 @@
+{
+  "schema_version": 1,
+  "name": "coding",
+  "version": 1,
+  "kind": "coding",
+  "tasks": [
+    {
+      "id": "clamp",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named clamp. Return low when value is below low, high when above high, otherwise value. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "clamp",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "clamp",
+          "params": [
+            "value",
+            "low",
+            "high"
+          ]
+        },
+        {
+          "type": "exec_python",
+          "requires_exec": true,
+          "tests": [
+            "assert clamp(5, 0, 3) == 3",
+            "assert clamp(-2, 0, 3) == 0"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "chunks",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named chunks. Return consecutive list chunks of at most size items; reject non-positive size with ValueError. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "chunks",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "chunks",
+          "params": [
+            "items",
+            "size"
+          ]
+        },
+        {
+          "type": "exec_python",
+          "requires_exec": true,
+          "tests": [
+            "assert chunks([1,2,3,4,5], 2) == [[1,2],[3,4],[5]]"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dedupe",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named dedupe. Return items in first-seen order with duplicates removed. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "dedupe",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "dedupe",
+          "params": [
+            "items"
+          ]
+        },
+        {
+          "type": "exec_python",
+          "requires_exec": true,
+          "tests": [
+            "assert dedupe([1,2,1,3,2]) == [1,2,3]"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "palindrome",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named is_palindrome. Return whether text is a palindrome after removing non-alphanumeric characters and ignoring case. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "is_palindrome",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "is_palindrome",
+          "params": [
+            "text"
+          ]
+        },
+        {
+          "type": "exec_python",
+          "requires_exec": true,
+          "tests": [
+            "assert is_palindrome('Never odd or even') is True",
+            "assert is_palindrome('model') is False"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "word-count",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named count_words. Return a dictionary counting whitespace-separated words after lowercasing. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "count_words",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "count_words",
+          "params": [
+            "text"
+          ]
+        },
+        {
+          "type": "exec_python",
+          "requires_exec": true,
+          "tests": [
+            "assert count_words(' red  blue red ') == {'red': 2, 'blue': 1}"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "flatten",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named flatten. Flatten one level of nested lists while preserving order. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "flatten",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "flatten",
+          "params": [
+            "items"
+          ]
+        },
+        {
+          "type": "exec_python",
+          "requires_exec": true,
+          "tests": [
+            "assert flatten([[1,2],[],[3]]) == [1,2,3]"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "safe-divide",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named safe_divide. Return a divided by b, or None when b is zero. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "safe_divide",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "safe_divide",
+          "params": [
+            "a",
+            "b"
+          ]
+        },
+        {
+          "type": "exec_python",
+          "requires_exec": true,
+          "tests": [
+            "assert safe_divide(8, 2) == 4",
+            "assert safe_divide(1, 0) is None"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "transpose",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named transpose. Transpose a rectangular list of rows; return an empty list for empty input. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "transpose",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "transpose",
+          "params": [
+            "matrix"
+          ]
+        },
+        {
+          "type": "exec_python",
+          "requires_exec": true,
+          "tests": [
+            "assert transpose([[1,2,3],[4,5,6]]) == [[1,4],[2,5],[3,6]]"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "merge-counts",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named merge_counts. Return a new dictionary whose values sum matching integer counts from left and right. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "merge_counts",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "merge_counts",
+          "params": [
+            "left",
+            "right"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rotate",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named rotate. Return a new list rotated left by k positions; empty input returns empty. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "rotate",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "rotate",
+          "params": [
+            "items",
+            "k"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "slugify",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named slugify. Lowercase text, replace runs of non-alphanumeric characters with one hyphen, and trim edge hyphens. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "slugify",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "slugify",
+          "params": [
+            "text"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pairwise",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named pairwise. Return adjacent item pairs as two-element tuples. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "pairwise",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "pairwise",
+          "params": [
+            "items"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "median",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named median. Return the numeric median without mutating values; raise ValueError for empty input. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "median",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "median",
+          "params": [
+            "values"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "group-length",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named group_by_length. Return a dictionary mapping word length to words in original order. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "group_by_length",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "group_by_length",
+          "params": [
+            "words"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "parse-bool",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named parse_bool. Map case-insensitive yes/true/1 to True and no/false/0 to False; otherwise raise ValueError. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "parse_bool",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "parse_bool",
+          "params": [
+            "text"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "retry-delays",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named retry_delays. Return count exponential delays base, base*2, base*4 and so on; reject negative count. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "retry_delays",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "retry_delays",
+          "params": [
+            "base",
+            "count"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "invert",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named invert_mapping. Return a dictionary mapping each value to a list of keys in input iteration order. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "invert_mapping",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "invert_mapping",
+          "params": [
+            "mapping"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "windowed",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named windowed. Return all consecutive windows of exactly size items; reject non-positive size. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "windowed",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "windowed",
+          "params": [
+            "items",
+            "size"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "normalize-space",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named normalize_whitespace. Collapse every run of whitespace to one space and trim both ends. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "normalize_whitespace",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "normalize_whitespace",
+          "params": [
+            "text"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "top-n",
+      "weight": 1,
+      "max_tokens": 384,
+      "prompt": "Write one self-contained Python function named top_n. Return the n largest values in descending order without mutating the input; n <= 0 returns empty. Return only a fenced python code block.",
+      "language": "python",
+      "graders": [
+        {
+          "type": "code_extract",
+          "language": "python"
+        },
+        {
+          "type": "python_parses"
+        },
+        {
+          "type": "defines",
+          "name": "top_n",
+          "kind": "function"
+        },
+        {
+          "type": "signature",
+          "name": "top_n",
+          "params": [
+            "values",
+            "n"
+          ]
+        }
+      ]
+    }
+  ]
+}
