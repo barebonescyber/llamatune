@@ -594,6 +594,35 @@ def test_dry_run_prints_plan_without_creating_session(
     assert not sessions.exists()
 
 
+def test_dry_run_respects_zero_gpu_layer_hard_cap(
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", _fake_hardware)
+    sessions = tmp_path / "sessions"
+    result = runner.invoke(
+        app,
+        [
+            "tune",
+            str(tiny_gguf),
+            "--llama-bin",
+            str(fake_bin_dir),
+            "--sessions-dir",
+            str(sessions),
+            "--initial-gpu-layers",
+            "0",
+            "--max-gpu-layers",
+            "0",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "  gpu_layers:" not in result.output
+    assert not sessions.exists()
+
+
 def test_exit_3_outcome_has_stage_reason_and_no_old_summary(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

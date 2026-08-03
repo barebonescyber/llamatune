@@ -236,6 +236,22 @@ def test_write_analysis_and_write_text(tmp_path: Path) -> None:
     assert (session.dir / "report.md").read_text() == "# Report\n"
 
 
+def test_invalidate_derived_outputs_preserves_session_evidence(tmp_path: Path) -> None:
+    session = _create_session(tmp_path)
+    session.write_analysis({"schema_version": 1, "winner": None})
+    for name in ("recommended.json", "recommended.sh", "report.md"):
+        session.write_text(name, "stale\n")
+
+    session.invalidate_derived_outputs()
+
+    assert not any(
+        (session.dir / name).exists()
+        for name in ("analysis.json", "recommended.json", "recommended.sh", "report.md")
+    )
+    assert (session.dir / "session.json").is_file()
+    assert (session.dir / "journal.jsonl").is_file()
+
+
 def test_record_build_info_updates_llama_and_file(tmp_path: Path) -> None:
     session = _create_session(tmp_path)
     session.record_build_info("abc1234", 1234, "CUDA")

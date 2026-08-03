@@ -36,6 +36,7 @@ from llamatune.config import (
     estimate_vram,
     free_vram_mb,
     gpu_available,
+    gpu_layer_cap,
     gpu_present,
     hardware_signature,
     has_gpu_backend,
@@ -84,8 +85,17 @@ def _detect_gpu_throttle(samples: list[GpuSample]) -> bool:
     return detect_throttle(samples)
 
 
+def _boundary_has_fit(boundary: FeasibilityBoundary) -> bool:
+    """Whether a boundary contains at least one observed fitting placement."""
+    return not (boundary.max_ok_ngl == 0 and boundary.min_fail_ngl == 0)
+
+
 class _BudgetExhaustedError(Exception):
     """Internal signal: a budget is exhausted; jump to confirmation."""
+
+
+class _NoFeasibleConfigError(Exception):
+    """Internal signal: no measured configuration satisfies a binding cap."""
 
 
 class _BaselineError(Exception):
@@ -526,7 +536,7 @@ class _Engine:
         self._check_backend_mismatch()
 
         if self.options.baseline_only:
-            return self._finalize(baseline_only=True)
+            return self._finalize_or_no_feasible(baseline_only=True)
 
         try:
             self._seed_incumbent()
@@ -541,7 +551,23 @@ class _Engine:
         self._finalizing = True
         if not self._stop_requested:
             self._validate_recommendation()
-        return self._finalize(baseline_only=False)
+        return self._finalize_or_no_feasible(baseline_only=False)
+
+    def _finalize_or_no_feasible(self, *, baseline_only: bool) -> TuneOutcome:
+        try:
+            return self._finalize(baseline_only=baseline_only)
+        except _NoFeasibleConfigError as exc:
+            reason = str(exc)
+            self.session.invalidate_derived_outputs()
+            self._append({"type": "stage", "stage": "no_feasible_config", "reason": reason})
+            self._session_end(3, reason=reason)
+            return TuneOutcome(
+                session_dir=self.session.dir,
+                analysis={},
+                exit_code=3,
+                failure_stage="recommendation",
+                failure_reason=reason,
+            )
 
     def _emit(self, event_kind: str, **payload: Any) -> None:
         if self.reporter is None:
@@ -1134,7 +1160,7 @@ class _Engine:
 
     def _joint_discovery(self) -> None:
         ladder = [0]
-        if self.model.moe and "ncmoe" in self.caps:
+        if gpu_layer_cap(self.model, self.options) > 0 and self.model.moe and "ncmoe" in self.caps:
             ladder = list(reversed(moe_cpu_layer_candidates(self.model.n_layer)))
             if self.options.initial_cpu_moe is not None:
                 initial = min(self.model.n_layer, self.options.initial_cpu_moe)
@@ -1145,15 +1171,15 @@ class _Engine:
             self.boundaries.append(boundary)
             self._append({"type": "stage", "stage": "boundary", **dataclasses.asdict(boundary)})
             self._emit("boundary", **dataclasses.asdict(boundary))
-            warm_cap = boundary.max_ok_ngl
+            warm_cap = boundary.max_ok_ngl if _boundary_has_fit(boundary) else None
         self._bisect_minimum_spill()
 
     def _bisect_minimum_spill(self) -> None:
         if not self.model.moe or not self.boundaries:
             return
-        cap = min(self.model.ngl_all, self.options.max_gpu_layers or self.model.ngl_all)
-        successful = [b for b in self.boundaries if b.max_ok_ngl == cap]
-        failing = [b for b in self.boundaries if b.max_ok_ngl < cap]
+        cap = gpu_layer_cap(self.model, self.options)
+        successful = [b for b in self.boundaries if _boundary_has_fit(b) and b.max_ok_ngl == cap]
+        failing = [b for b in self.boundaries if _boundary_has_fit(b) and b.max_ok_ngl < cap]
         if not successful or not failing:
             return
         high = min(b.moe_cpu_layers for b in successful)
@@ -1199,43 +1225,76 @@ class _Engine:
     def _discover_boundary(
         self, base: TrialConfig, ncmoe: int, warm_cap: int | None = None
     ) -> FeasibilityBoundary:
-        cap = self.model.ngl_all
-        cap_source = "model"
-        if self.options.max_gpu_layers is not None and self.options.max_gpu_layers < cap:
-            cap = self.options.max_gpu_layers
-            cap_source = "cli"
+        hard_cap = gpu_layer_cap(self.model, self.options)
+        cap = hard_cap
+        cap_source = (
+            "cli"
+            if self.options.max_gpu_layers is not None
+            and self.options.max_gpu_layers < self.model.ngl_all
+            else "model"
+        )
         if warm_cap is not None and warm_cap < cap:
             cap = min(cap, warm_cap)
             cap_source = "warm_start"
         base = dataclasses.replace(base, moe_cpu_layers=ncmoe)
-        low = min(cap, base.gpu_layers) if self.baseline.kind == "defaults" else 0
+        low: int | None = None
         failed, used = None, 0
         limit = 2 * max(1, max(1, self.model.ngl_all).bit_length()) + 4
-        guess = self.options.initial_gpu_layers
-        if guess is None or guess <= 0 or guess > cap:
-            guess = min(cap, 1)
-        while low < cap and used < limit:
+        baseline_verified = (
+            hasattr(self, "baseline")
+            and self.baseline.kind == "defaults"
+            and base.trial_id == self.default_config.trial_id
+            and base.gpu_layers <= cap
+        )
+        if baseline_verified:
+            low = base.gpu_layers
+        else:
+            guess = self.options.initial_gpu_layers
+            if guess is None or guess > cap:
+                guess = min(cap, 1)
+            status = self._probe(dataclasses.replace(base, gpu_layers=guess), "boundary", None)
+            used += 1
+            if status == "ok":
+                low = guess
+            else:
+                failed = guess
+                if guess > 0 and used < limit:
+                    status = self._probe(dataclasses.replace(base, gpu_layers=0), "boundary", None)
+                    used += 1
+                    if status == "ok":
+                        low = 0
+                    else:
+                        failed = 0
+        while low is not None and low < cap and failed is None and used < limit:
+            guess = min(cap, max(low + 1, low * 2))
             cfg = dataclasses.replace(base, gpu_layers=guess)
             status = self._probe(cfg, "boundary", None)
             used += 1
             if status == "ok":
                 low = guess
-                if low == cap:
-                    break
-                guess = min(cap, max(low + 1, low * 2))
             else:
                 failed = guess
-                break
-        while failed is not None and failed - low > 1 and used < limit:
+        while low is not None and failed is not None and failed - low > 1 and used < limit:
             guess = (low + failed) // 2
             if self._probe(dataclasses.replace(base, gpu_layers=guess), "boundary", None) == "ok":
                 low = guess
             else:
                 failed = guess
             used += 1
-        for ngl in dict.fromkeys(max(0, low - delta) for delta in (0, 1, 2)):
+        compliant: list[tuple[TrialConfig, float, float, float]] = []
+        neighbors = (
+            dict.fromkeys(max(0, low - delta) for delta in (0, 1, 2)) if low is not None else ()
+        )
+        for ngl in neighbors:
             cfg = dataclasses.replace(base, gpu_layers=ngl)
             trial = self._evaluate(cfg, "boundary_neighbor")
+            if (
+                trial.status in ("ok", "unstable")
+                and trial.score is not None
+                and trial.pp is not None
+                and trial.tg is not None
+            ):
+                compliant.append((cfg, trial.pp, trial.tg, trial.score))
             if (
                 trial.status in ("ok", "unstable")
                 and trial.score is not None
@@ -1244,9 +1303,12 @@ class _Engine:
                 and trial.score > self.incumbent_score
             ):
                 self._set_incumbent(cfg, trial.pp, trial.tg, trial.score)
+        if self.incumbent_config.gpu_layers > hard_cap and compliant:
+            cfg, pp, tg, score = max(compliant, key=lambda item: item[3])
+            self._set_incumbent(cfg, pp, tg, score)
         return FeasibilityBoundary(
             moe_cpu_layers=ncmoe,
-            max_ok_ngl=low,
+            max_ok_ngl=low if low is not None else 0,
             min_fail_ngl=failed,
             probes=used,
             cap_ngl=cap,
@@ -1255,13 +1317,14 @@ class _Engine:
 
     def _refine_joint(self) -> None:
         center = self.incumbent_config
+        cap = gpu_layer_cap(self.model, self.options)
         offsets = [(0, -2), (0, -1), (0, 1), (0, 2)]
-        if self.model.moe and "ncmoe" in self.caps:
+        if cap > 0 and self.model.moe and "ncmoe" in self.caps:
             offsets = [(-2, 0), (-1, 0), (1, 0), (2, 0), *offsets]
         for dc, dg in offsets:
             cfg = dataclasses.replace(
                 center,
-                gpu_layers=min(self.model.ngl_all, max(0, center.gpu_layers + dg)),
+                gpu_layers=min(cap, max(0, center.gpu_layers + dg)),
                 moe_cpu_layers=min(self.model.n_layer, max(0, center.moe_cpu_layers + dc)),
             )
             if not is_valid_config(cfg, hardware=self.hardware, model=self.model, llama=self.llama):
@@ -1335,8 +1398,22 @@ class _Engine:
         ctx: int | None,
     ) -> str:
         probe_id = _probe_id(purpose, cfg, ctx)
-        if probe_id in self.probes:
+        if probe_id in self.probes and self._hard_cap_ancestor(cfg) is None:
             return str(self.probes[probe_id]["status"])
+        cap_ancestor = self._hard_cap_ancestor(cfg)
+        if cap_ancestor is not None:
+            record = {
+                "type": "probe",
+                "probe_id": probe_id,
+                "purpose": purpose,
+                "config": cfg.to_dict(),
+                "ctx": ctx,
+                "status": "pruned",
+                "pruned_from": cap_ancestor,
+            }
+            self._append(record)
+            self.probes[probe_id] = record
+            return "pruned"
         ancestor = self._pruned_by(cfg)
         if ancestor is not None and purpose == "boundary":
             record = {
@@ -1671,6 +1748,8 @@ class _Engine:
                 current = cfg
 
     def _execute_batch(self, configs: list[TrialConfig], dim: str) -> dict[str, _Trial]:
+        if any(self._hard_cap_ancestor(config) is not None for config in configs):
+            return {}
         if len(configs) > self._trial_limit() - self.executed_count:
             return {}
         batch_id = hashlib.sha256(
@@ -1871,6 +1950,10 @@ class _Engine:
                 return trial_id
         return None
 
+    def _hard_cap_ancestor(self, cfg: TrialConfig) -> str | None:
+        cap = gpu_layer_cap(self.model, self.options)
+        return f"max_gpu_layers:{cap}" if cfg.gpu_layers > cap else None
+
     def _journal_pruned(self, cfg: TrialConfig, dim: str, ancestor: str) -> None:
         if cfg.trial_id in self.known:
             return
@@ -1893,6 +1976,10 @@ class _Engine:
     # -- trial evaluation ----------------------------------------------
 
     def _evaluate(self, cfg: TrialConfig, dim: str) -> _Trial:
+        cap_ancestor = self._hard_cap_ancestor(cfg)
+        if cap_ancestor is not None:
+            self._journal_pruned(cfg, dim, cap_ancestor)
+            return _Trial(status="pruned", pp=None, tg=None, score=None)
         known = self.known.get(cfg.trial_id)
         if known is not None:
             return _Trial(
@@ -2174,8 +2261,13 @@ class _Engine:
         }
 
     def _context_candidates(self, base: TrialConfig) -> list[TrialConfig]:
-        candidates = [base]
-        for boundary in sorted(self.boundaries, key=lambda b: b.max_ok_ngl, reverse=True):
+        cap = gpu_layer_cap(self.model, self.options)
+        candidates = [base] if base.gpu_layers <= cap else []
+        for boundary in sorted(
+            (boundary for boundary in self.boundaries if _boundary_has_fit(boundary)),
+            key=lambda b: b.max_ok_ngl,
+            reverse=True,
+        ):
             candidates.extend(
                 dataclasses.replace(base, gpu_layers=ngl, moe_cpu_layers=boundary.moe_cpu_layers)
                 for ngl in range(boundary.max_ok_ngl, -1, -1)
@@ -2468,7 +2560,13 @@ class _Engine:
             }
 
     def _finalize(self, *, baseline_only: bool) -> TuneOutcome:
-        records = list(self.known.values())
+        if baseline_only and self._hard_cap_ancestor(self.default_config) is not None:
+            cap = gpu_layer_cap(self.model, self.options)
+            raise _NoFeasibleConfigError(
+                f"baseline defaults exceed max_gpu_layers={cap}; "
+                "no cap-compliant configuration was measured"
+            )
+        records = self._analysis_records()
         winner: dict[str, Any] | None = None
         recommend_config = self.default_config
         expected = self._defaults_expected()
@@ -2508,7 +2606,12 @@ class _Engine:
             if r.get("status") in ("ok", "unstable") and r.get("score") is not None
         ]
         best_record = max(ok_records, key=lambda r: r["score"]) if ok_records else None
-        max_boundary = max(self.boundaries, key=lambda b: b.max_ok_ngl) if self.boundaries else None
+        fitting_boundaries = [
+            boundary for boundary in self.boundaries if _boundary_has_fit(boundary)
+        ]
+        max_boundary = (
+            max(fitting_boundaries, key=lambda b: b.max_ok_ngl) if fitting_boundaries else None
+        )
         estimate = estimate_vram(
             config=recommend_config,
             model=self.model,
@@ -2642,7 +2745,18 @@ class _Engine:
         )
         return TuneOutcome(session_dir=self.session.dir, analysis=analysis, exit_code=exit_code)
 
+    def _analysis_records(self) -> list[dict[str, Any]]:
+        """Exclude successful resumed measurements that violate the active hard cap."""
+        return [
+            record
+            for record in self.known.values()
+            if record.get("status") not in ("ok", "unstable")
+            or self._hard_cap_ancestor(TrialConfig.from_dict(record["config"])) is None
+        ]
+
     def _validate_with_cli(self, config: TrialConfig) -> None:
+        if self._hard_cap_ancestor(config) is not None:
+            return
         if not (
             self.options.validate_with_cli
             and self.llama.cli_path is not None
@@ -2687,6 +2801,8 @@ class _Engine:
             self._emit("warning", message=warning)
 
     def _run_quality_gate(self, config: TrialConfig) -> None:
+        if self._hard_cap_ancestor(config) is not None:
+            return
         if not (
             self.options.quality_corpus is not None
             and self.llama.perplexity_path is not None
@@ -2878,7 +2994,12 @@ class _Engine:
             and self.incumbent_config.to_dict() == self.measured_default.to_dict()
         )
         if no_improvement:
-            return None, self.default_config, self._defaults_expected(), False
+            config, expected = self._fallback_recommendation()
+            return None, config, expected, False
+
+        if self._hard_cap_ancestor(self.incumbent_config) is not None:
+            config, expected = self._fallback_recommendation()
+            return None, config, expected, False
 
         confirm = self._confirm(self.incumbent_config)
         if confirm.confirmed:
@@ -2892,7 +3013,37 @@ class _Engine:
                 winner = self._winner_dict(runner_up, confirm2)
                 return winner, runner_up, self._winner_expected(confirm2), True
 
-        return None, self.default_config, self._defaults_expected(), False
+        config, expected = self._fallback_recommendation()
+        return None, config, expected, False
+
+    def _fallback_recommendation(self) -> tuple[TrialConfig, dict[str, Any]]:
+        """Return defaults, or the best measured config satisfying a binding cap."""
+        cap = gpu_layer_cap(self.model, self.options)
+        if self.default_config.gpu_layers <= cap:
+            return self.default_config, self._defaults_expected()
+        candidates = [
+            record
+            for record in self.known.values()
+            if record.get("status") in ("ok", "unstable")
+            and record.get("score") is not None
+            and int(record["config"]["gpu_layers"]) <= cap
+            and (self.options.ctx_size is None or record["trial_id"] in self.validated_configs)
+        ]
+        if candidates:
+            best = max(candidates, key=lambda record: (record["score"], record["trial_id"]))
+            expected = {
+                "pp": best["pp_mean"],
+                "tg": best["tg_mean"],
+                "improvement_pct": {
+                    "pp": _improvement(float(best["pp_mean"]), self.baseline.pp.mean),
+                    "tg": _improvement(float(best["tg_mean"]), self.baseline.tg.mean),
+                    "score": (float(best["score"]) - 1) * 100,
+                },
+            }
+            return TrialConfig.from_dict(best["config"]), expected
+        raise _NoFeasibleConfigError(
+            f"no successful measured configuration satisfies max_gpu_layers={cap}"
+        )
 
     def _runner_up(self, winner_config: TrialConfig) -> TrialConfig | None:
         winner_dict = winner_config.to_dict()
@@ -2902,6 +3053,7 @@ class _Engine:
             if record["status"] in ("ok", "unstable")
             and record.get("score") is not None
             and record["config"] != winner_dict
+            and int(record["config"]["gpu_layers"]) <= gpu_layer_cap(self.model, self.options)
             and (self.options.ctx_size is None or record["trial_id"] in self.validated_configs)
         ]
         if not candidates:
@@ -2910,6 +3062,8 @@ class _Engine:
         return TrialConfig.from_dict(best["config"])
 
     def _confirm(self, config: TrialConfig) -> _Confirm:
+        if self._hard_cap_ancestor(config) is not None:
+            return _Confirm(False, None, None, 0.0)
         self._quiet_gate("confirmation")
         if (
             self._tuning_budget_enforced

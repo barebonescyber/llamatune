@@ -498,8 +498,15 @@ def _feasibility_section(analysis: dict[str, Any]) -> str:
         for boundary in boundaries:
             min_fail = boundary.get("min_fail_ngl")
             max_ok = boundary.get("max_ok_ngl", "-")
+            no_fit = max_ok == 0 and min_fail == 0
             warm_start_capped = min_fail is None and boundary.get("cap_source") == "warm_start"
-            max_display = f"≤ {max_ok} (search cap)" if warm_start_capped else str(max_ok)
+            max_display = (
+                "none"
+                if no_fit
+                else f"≤ {max_ok} (search cap)"
+                if warm_start_capped
+                else str(max_ok)
+            )
             lines.append(
                 f"| {boundary.get('moe_cpu_layers', '-')} | {max_display} | "
                 f"{min_fail if min_fail is not None else '-'} | "

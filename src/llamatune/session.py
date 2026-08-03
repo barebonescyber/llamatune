@@ -22,6 +22,7 @@ from llamatune.types import GPUInfo, HardwareReport, LlamaCppReport, ModelReport
 _SCHEMA_VERSION = 2
 _SAFE_STEM_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _CREATE_RETRIES = 5
+_DERIVED_OUTPUTS = ("analysis.json", "recommended.json", "recommended.sh", "report.md")
 
 
 class SessionPathError(Exception):
@@ -590,6 +591,15 @@ class Session:
         path = _confine(self._dir, name)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
+
+    def invalidate_derived_outputs(self) -> None:
+        """Remove stale generated outputs while preserving their journal evidence."""
+        for name in _DERIVED_OUTPUTS:
+            path = self._dir / name
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.exists():
+                raise OSError(f"derived output is not a regular file: {path}")
 
     def record_build_info(
         self, commit: str | None, number: int | None, backends: str | None

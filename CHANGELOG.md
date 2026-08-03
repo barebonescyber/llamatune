@@ -9,7 +9,29 @@ and releases use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 No changes yet.
 
-## [0.1.0-beta.2] - 2026-07-27
+## [0.1.0-beta.3] - 2026-08-01
+
+### Fixed
+
+- Enforce an explicit `--max-gpu-layers` hard cap across planning, boundary discovery,
+  search, resumed evidence, confirmation, recommendation emission, and auxiliary
+  validation.
+- Treat cap zero as a CPU-only search constraint while preserving the unmodified
+  llama.cpp defaults measurement as the baseline of record.
+- Return a controlled failure instead of fabricating a recommendation when no measured
+  cap-compliant configuration succeeds, and remove stale derived outputs on resume.
+
+### Known limitations
+
+- The initial beta support claim is limited to native Linux x86_64 and native Windows
+  10/11 x86_64 using CPU-only or NVIDIA CUDA llama.cpp builds; the other implemented
+  platforms and workflows named in the beta contract remain experimental or excluded.
+- Recommendations are valid only for their recorded model, hardware, llama.cpp build,
+  workload, depth, and context identity and require revalidation after any material change.
+- llamatune does not download models, install or build llama.cpp, install GPU drivers, or
+  modify clocks, governors, caches, drivers, fan controls, or other system state.
+
+## 0.1.0-beta.2 (rejected candidate) - 2026-07-27
 
 ### Added
 
@@ -71,5 +93,5 @@ No changes yet.
 - Executor capture-worker failures now retain and surface their original cause
   instead of becoming an unrelated missing-result error.
 
-[Unreleased]: https://github.com/barebonescyber/llamatune/compare/v0.1.0-beta.2...HEAD
-[0.1.0-beta.2]: https://github.com/barebonescyber/llamatune/releases/tag/v0.1.0-beta.2
+[Unreleased]: https://github.com/barebonescyber/llamatune/compare/v0.1.0-beta.3...HEAD
+[0.1.0-beta.3]: https://github.com/barebonescyber/llamatune/compare/5f63164d3a392a0e628e63448a8203b4dbe0d2f0...v0.1.0-beta.3

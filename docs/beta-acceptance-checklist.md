@@ -12,16 +12,42 @@ remains authoritative for product behavior.
 
 ## Candidate record
 
-- Candidate version: `0.1.0b2` (SemVer release identity `0.1.0-beta.2`)
+- Candidate version: `0.1.0b3` (SemVer release identity `0.1.0-beta.3`)
 - Candidate state: **UNFROZEN — public security baseline complete; exact-candidate rerun pending**
 - Candidate tag: _unset_
-- Git commit SHA: _unset_
+- Git commit SHA: _pending freeze evidence set_
 - Candidate build/run URL: _unset_
 - Candidate artifacts and SHA-256 file: _unset_
 - Acceptance start date: _unset_
 - Acceptance owner: [`barebonescyber`](https://github.com/barebonescyber)
-- Final decision: **NOT EVALUATED**
-- Decision date and approver: _unset_
+- Final decision: **NOT EVALUATED**; _pending signed decision tag_
+- Decision date and approver: _pending signed decision tag_
+
+The source checklist cannot contain its own final commit SHA. After the source stops
+changing, the canonical freeze evidence set must bind the candidate without modifying its
+tree:
+
+1. A signed annotated `v0.1.0-beta.3` tag binds the exact public commit and accountable
+   human freeze approval.
+2. A tag-scoped GitHub Actions run binds its URL, event, ref, and head SHA to that tag.
+3. That run's `SHA256SUMS` and GitHub artifact attestations bind the wheel, source archive,
+   and checksum manifest.
+4. The GitHub prerelease record links the tag, run, checksums, and attestation
+   verification; changing that record after approval requires reapproval.
+5. After all gates settle, a protected signed annotated
+   `v0.1.0-beta.3-decision` tag points to the same candidate commit and records the GO or
+   NO-GO decision, approver, date, and evidence links. It is never moved or reused.
+
+Verify the set with `git tag -v`, `gh run view`, `sha256sum --check`, and
+`gh attestation verify` before any native acceptance artifact is used.
+
+### Superseded candidate
+
+- `0.1.0b2` at public commit
+  [`5f63164d3a392a0e628e63448a8203b4dbe0d2f0`](https://github.com/barebonescyber/llamatune/commit/5f63164d3a392a0e628e63448a8203b4dbe0d2f0)
+  is **REJECTED / NO-GO** after a release-blocking GPU-layer-cap defect.
+- No beta2 tag or public release was created. Its identity and artifacts must not be reused
+  for beta3 evidence.
 
 ## How to use this checklist
 
@@ -140,7 +166,8 @@ Evidence: `docs/beta-contract.md`; `README.md`; candidate release notes pending
 
 ## B. Candidate source integrity
 
-- [ ] Candidate version, tag, commit, build URL, and checksums are recorded above.
+- [ ] Candidate version, tag, commit, build URL, and checksums are bound by the candidate
+  record and canonical freeze evidence set.
 - [ ] The candidate commit is on the intended protected release branch.
 - [ ] The repository is clean at tag creation.
 - [ ] All intended changes have completed review.
@@ -290,7 +317,8 @@ Evidence and observation dates: _unset_
 - [ ] Native Linux and native Windows acceptance reports are approved.
 - [ ] Release artifacts, checksums, attestations, changelog, and known limitations are final.
 - [ ] The candidate commit is frozen and no validation-invalidating change remains.
-- [ ] Final approval is recorded in the candidate record.
+- [ ] Final approval is recorded in the canonical freeze evidence set's signed decision
+  tag and linked from the candidate record.
 
 If any item above is false, missing evidence, or invalidated by a later change, the final
 decision remains **NO-GO**.

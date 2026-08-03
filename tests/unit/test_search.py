@@ -611,6 +611,236 @@ class TestLoadWarning:
 
 
 class TestFeasibilitySearch:
+    def test_hard_gpu_cap_prunes_defensively_before_execution(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session, hw, model, llama, options = _setup(
+            tmp_path,
+            fake_bin_dir,
+            tiny_gguf,
+            max_gpu_layers=8,
+        )
+        engine = search._Engine(session, hw, model, llama, options)
+        monkeypatch.setattr(
+            engine,
+            "_execute_trial",
+            lambda *_args, **_kwargs: pytest.fail("out-of-cap trial executed"),
+        )
+        monkeypatch.setattr(
+            engine,
+            "_run_child",
+            lambda *_args, **_kwargs: pytest.fail("out-of-cap probe executed"),
+        )
+
+        result = engine._evaluate(_envelope_config(9), "defensive_cap")
+
+        assert result.status == "pruned"
+        pruned = next(entry for entry in session.entries if entry.get("dim") == "defensive_cap")
+        assert pruned["pruned_from"] == "max_gpu_layers:8"
+        assert engine._probe(_envelope_config(9), "context", 8192) == "pruned"
+        probe = next(entry for entry in session.entries if entry.get("type") == "probe")
+        assert probe["pruned_from"] == "max_gpu_layers:8"
+
+        above = _envelope_config(9)
+        below = _envelope_config(7)
+        engine.known = {
+            above.trial_id: {
+                "trial_id": above.trial_id,
+                "status": "ok",
+                "score": 3.0,
+                "config": above.to_dict(),
+            },
+            below.trial_id: {
+                "trial_id": below.trial_id,
+                "status": "ok",
+                "score": 2.0,
+                "config": below.to_dict(),
+            },
+        }
+        assert engine._runner_up(_envelope_config(8)) == below
+        assert [record["trial_id"] for record in engine._analysis_records()] == [below.trial_id]
+        engine._validate_with_cli(above)
+
+    def test_failed_bounded_probe_is_not_reported_as_a_fitting_cap(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session, hw, model, llama, options = _setup(
+            tmp_path,
+            fake_bin_dir,
+            tiny_gguf,
+            initial_gpu_layers=8,
+            max_gpu_layers=8,
+        )
+        engine = search._Engine(session, hw, model, llama, options)
+        engine.incumbent_config = _envelope_config(33)
+        monkeypatch.setattr(engine, "_probe", lambda *_args, **_kwargs: "failed")
+        monkeypatch.setattr(
+            engine,
+            "_evaluate",
+            lambda *_args, **_kwargs: pytest.fail("unverified boundary measured"),
+        )
+
+        boundary = engine._discover_boundary(_envelope_config(33), 0)
+
+        assert boundary.max_ok_ngl == 0
+        assert boundary.min_fail_ngl == 0
+        assert boundary.probes == 2
+        engine.boundaries = [boundary]
+        assert engine._context_candidates(_envelope_config(33)) == []
+
+    def test_no_successful_capped_config_emits_no_fabricated_recommendation(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session, hw, model, llama, options = _setup(
+            tmp_path,
+            fake_bin_dir,
+            tiny_gguf,
+            budget_trials=40,
+            initial_gpu_layers=0,
+            max_gpu_layers=0,
+        )
+        monkeypatch.setattr(search._Engine, "_probe", lambda *_args, **_kwargs: "failed")
+        monkeypatch.setattr(
+            search._Engine,
+            "_evaluate",
+            lambda *_args, **_kwargs: search._Trial("failed", None, None, None),
+        )
+
+        outcome = search.run_tuning(session, hw, model, llama, options)
+
+        assert outcome.exit_code == 3
+        assert outcome.failure_stage == "recommendation"
+        assert outcome.failure_reason == (
+            "no successful measured configuration satisfies max_gpu_layers=0"
+        )
+        assert not (session.dir / "recommended.json").exists()
+        stage = next(
+            entry for entry in session.entries if entry.get("stage") == "no_feasible_config"
+        )
+        assert stage["reason"] == outcome.failure_reason
+
+    def test_capped_baseline_only_emits_no_above_cap_recommendation(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+    ) -> None:
+        session, hw, model, llama, options = _setup(
+            tmp_path,
+            fake_bin_dir,
+            tiny_gguf,
+            baseline_only=True,
+            max_gpu_layers=0,
+        )
+
+        outcome = search.run_tuning(session, hw, model, llama, options)
+
+        assert outcome.exit_code == 3
+        assert outcome.failure_stage == "recommendation"
+        assert outcome.failure_reason == (
+            "baseline defaults exceed max_gpu_layers=0; no cap-compliant configuration was measured"
+        )
+        assert not (session.dir / "recommended.json").exists()
+
+    def test_no_feasible_resume_invalidates_stale_derived_outputs(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+    ) -> None:
+        session, hw, model, llama, options = _setup(
+            tmp_path,
+            fake_bin_dir,
+            tiny_gguf,
+            max_gpu_layers=0,
+        )
+        for name in ("analysis.json", "recommended.json", "recommended.sh", "report.md"):
+            session.write_text(name, "stale\n")
+        engine = search._Engine(session, hw, model, llama, options)
+        engine.default_config = _envelope_config(33)
+
+        outcome = engine._finalize_or_no_feasible(baseline_only=True)
+
+        assert outcome.exit_code == 3
+        assert not any(
+            (session.dir / name).exists()
+            for name in ("analysis.json", "recommended.json", "recommended.sh", "report.md")
+        )
+
+    def test_hard_gpu_cap_bounds_every_search_measurement(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+    ) -> None:
+        cap = 8
+        session, hw, model, llama, options = _setup(
+            tmp_path,
+            fake_bin_dir,
+            tiny_gguf,
+            budget_trials=100,
+            initial_gpu_layers=cap,
+            max_gpu_layers=cap,
+        )
+        outcome = search.run_tuning(session, hw, model, llama, options)
+
+        assert outcome.exit_code in (0, 1)
+        assert outcome.analysis["baseline"]["resolved_defaults"]["gpu_layers"] > cap
+        boundary = outcome.analysis["feasibility"]["boundaries"][0]
+        assert boundary["cap_ngl"] == cap
+        assert boundary["cap_source"] == "cli"
+        assert outcome.analysis["feasibility"]["recommended"]["gpu_layers"] <= cap
+        assert outcome.analysis["feasibility"]["best_measured"]["gpu_layers"] <= cap
+        recommended = json.loads((session.dir / "recommended.json").read_text())
+        assert recommended["config"]["gpu_layers"] <= cap
+        winner = outcome.analysis["winner"]
+        if winner is not None:
+            assert winner["config"]["gpu_layers"] <= cap
+        measurements = [
+            entry
+            for entry in session.entries
+            if entry.get("type") in {"trial", "probe"} and "config" in entry
+        ]
+        assert measurements
+        assert all(entry["config"]["gpu_layers"] <= cap for entry in measurements)
+        assert any(entry.get("dim") == "joint_refine" for entry in measurements)
+
+    def test_zero_gpu_cap_skips_moe_ladder(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+    ) -> None:
+        session, hw, model, llama, options = _setup(
+            tmp_path,
+            fake_bin_dir,
+            tiny_gguf,
+            budget_trials=40,
+            initial_gpu_layers=0,
+            max_gpu_layers=0,
+        )
+        outcome = search.run_tuning(session, hw, model, llama, options)
+
+        assert outcome.analysis["feasibility"]["recommended"]["gpu_layers"] == 0
+        assert len(outcome.analysis["feasibility"]["boundaries"]) == 1
+        assert all(
+            entry["config"]["moe_cpu_layers"] == 0
+            for entry in session.entries
+            if entry.get("type") in {"trial", "probe"} and "config" in entry
+        )
+
     def test_exact_boundary_and_context_safe_recommendation(
         self,
         tmp_path: Path,
