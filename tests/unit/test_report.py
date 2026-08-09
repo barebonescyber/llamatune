@@ -355,6 +355,18 @@ def test_render_legacy_boundary_remains_bare_maximum() -> None:
     assert "search cap" not in text
 
 
+def test_render_failed_zero_boundary_does_not_claim_a_fitting_placement() -> None:
+    analysis = _analysis_with_winner()
+    analysis["feasibility"] = {
+        "boundaries": [{"moe_cpu_layers": 0, "max_ok_ngl": 0, "min_fail_ngl": 0, "probes": 2}]
+    }
+
+    text = report.render(analysis, _SESSION_META, _HARDWARE, _MODEL, _LLAMACPP)
+
+    assert "| 0 | none | 0 | 2 |" in text
+    assert "| 0 | 0 | 0 | 2 |" not in text
+
+
 def _recommended_export(*, moe: bool = True) -> dict[str, Any]:
     config = _config_dict(moe_cpu_layers=18 if moe else 0)
     if moe:

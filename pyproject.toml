@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llamatune"
-version = "0.1.0b2"
+version = "0.1.0b3"
 description = "Finds the fastest llama.cpp runtime settings for a GGUF model on the local workstation."
 readme = "README.md"
 requires-python = ">=3.11"

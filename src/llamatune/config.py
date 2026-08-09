@@ -374,6 +374,12 @@ def gpu_available(hardware: HardwareReport, llama: LlamaCppReport) -> bool:
     return gpu_present(hardware) and has_gpu_backend(llama) is not False
 
 
+def gpu_layer_cap(model: ModelReport, options: TuneOptions) -> int:
+    """Return the effective hard GPU-layer boundary cap."""
+    requested = options.max_gpu_layers
+    return min(model.ngl_all, requested if requested is not None else model.ngl_all)
+
+
 def applicable_dimensions(
     *,
     hardware: HardwareReport,
@@ -393,7 +399,7 @@ def applicable_dimensions(
     has_gpu = gpu_available(hardware, llama)
     caps = llama.capabilities
 
-    if has_gpu:
+    if has_gpu and gpu_layer_cap(model, options) > 0:
         applicable.add("gpu_layers")
 
     if model.moe and "ncmoe" in caps and incumbent.gpu_layers > 0:
@@ -464,7 +470,7 @@ def candidates_for(
         return ()
 
     if dim == "gpu_layers":
-        return gpu_layer_candidates(model.ngl_all)
+        return gpu_layer_candidates(gpu_layer_cap(model, options))
     if dim == "moe_cpu_layers":
         return moe_cpu_layer_candidates(model.n_layer)
     if dim == "flash_attn":
@@ -528,15 +534,16 @@ def build_search_plan(
             incumbent=incumbent,
         )
     }
-    ladder = list(moe_cpu_layer_candidates(model.n_layer)) if model.moe else []
-    if options.initial_cpu_moe is not None and model.moe:
+    cap = gpu_layer_cap(model, options)
+    ladder = list(moe_cpu_layer_candidates(model.n_layer)) if model.moe and cap > 0 else []
+    if options.initial_cpu_moe is not None and model.moe and cap > 0:
         initial_moe = min(model.n_layer, options.initial_cpu_moe)
         ladder = [initial_moe, *(value for value in ladder if value != initial_moe)]
     configs: list[tuple[str, TrialConfig]] = [("defaults", incumbent)]
     if gpu_available(hardware, llama):
         full = dataclasses.replace(
             incumbent,
-            gpu_layers=min(model.ngl_all, options.max_gpu_layers or model.ngl_all),
+            gpu_layers=cap,
         )
         configs.append(("full_offload", full))
         configs.extend(

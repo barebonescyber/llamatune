@@ -115,6 +115,56 @@ def test_gpu_layer_candidates_zero_ngl_all() -> None:
     assert config.gpu_layer_candidates(0) == (0,)
 
 
+def test_gpu_layer_hard_cap_clamps_candidates_and_dry_run_plan() -> None:
+    gpu = GPUInfo(vendor="nvidia", name="x", vram_mb=24000, method="nvidia-smi")
+    hardware = _hardware(gpus=(gpu,))
+    model = _model()
+    llama = _llama(backends=None)
+    options = dataclasses.replace(_options(), max_gpu_layers=0)
+    incumbent = _default_config(gpu_layers=0)
+
+    assert config.gpu_layer_cap(model, options) == 0
+    assert "gpu_layers" not in config.applicable_dimensions(
+        hardware=hardware,
+        model=model,
+        llama=llama,
+        options=options,
+        incumbent=incumbent,
+    )
+    assert (
+        config.candidates_for(
+            "gpu_layers",
+            hardware=hardware,
+            model=model,
+            llama=llama,
+            options=options,
+            incumbent=incumbent,
+        )
+        == ()
+    )
+
+    plan = config.build_search_plan(
+        hardware=hardware,
+        model=model,
+        llama=llama,
+        options=options,
+        incumbent=incumbent,
+    )
+    assert "gpu_layers" not in plan["dimensions"]
+    assert plan["ncmoe_ladder"] == []
+    assert all(item["config"]["gpu_layers"] == 0 for item in plan["estimates"])
+
+    positive_options = dataclasses.replace(options, max_gpu_layers=10)
+    assert config.candidates_for(
+        "gpu_layers",
+        hardware=hardware,
+        model=model,
+        llama=llama,
+        options=positive_options,
+        incumbent=incumbent,
+    ) == config.gpu_layer_candidates(10)
+
+
 def test_moe_cpu_layer_candidates_fractions_of_n_layer() -> None:
     assert config.moe_cpu_layer_candidates(32) == (0, 8, 16, 24, 32)
 

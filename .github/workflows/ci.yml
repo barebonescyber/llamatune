@@ -125,7 +125,8 @@ jobs:
         run: |
           cd "$RUNNER_TEMP/llamatune-wheel-smoke"
           "venv/bin/python" -I -c \
-            'import llamatune; print(llamatune.__file__)' > module-path.txt
+            'import importlib.metadata, llamatune; assert llamatune.__version__ == importlib.metadata.version("llamatune"); print(llamatune.__file__)' \
+            > module-path.txt
           "venv/bin/llamatune" --help > help.txt
           "venv/bin/llamatune" scan --llama-bin bin --json > scan.json
           set +e
