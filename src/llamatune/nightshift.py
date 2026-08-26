@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import sys
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
 from llamatune._version import __version__
+from llamatune.calibrate import run_calibration
 from llamatune.evidence import (
     EvidenceWriter,
     InterruptState,
@@ -29,6 +30,7 @@ from llamatune.evidence import (
 from llamatune.evidence import (
     utc_iso as _utc_iso,
 )
+from llamatune.session import JournalTailIncomplete, scan_journal_tail
 from llamatune.types import (
     CalibrationResult,
     DiscoveredModel,
@@ -275,13 +277,19 @@ def _session_fingerprint(path: Path) -> str | None:
         return None
 
 
+def _interrupted_by_end(entry: Mapping[str, Any]) -> bool:
+    return entry.get("type") == "session_end" and entry.get("reason") in {
+        "stopped_by_user",
+        "interrupted",
+    }
+
+
 def _interrupted_session(path: Path) -> bool:
-    entries, _corruption = read_journal_lines(path / "journal.jsonl")
-    return any(
-        entry.get("type") == "session_end"
-        and entry.get("reason") in {"stopped_by_user", "interrupted"}
-        for entry in entries
-    )
+    found = scan_journal_tail(path / "journal.jsonl", _interrupted_by_end)
+    if isinstance(found, JournalTailIncomplete):
+        entries, _corruption = read_journal_lines(path / "journal.jsonl")
+        return any(_interrupted_by_end(entry) for entry in entries)
+    return found is not None
 
 
 def _tune_options(
@@ -451,7 +459,7 @@ def run_nightshift(
     from llamatune.discovery import discover_models
     from llamatune.hardware import assess_hardware
     from llamatune.llama import discover_llama
-    from llamatune.registry import build_registry, incomplete_sessions
+    from llamatune.registry import absorb_session, build_registry, incomplete_sessions
     from llamatune.search import resume_tuning, run_tuning
     from llamatune.session import Session
 
@@ -621,8 +629,6 @@ def run_nightshift(
                     result_record: dict[str, Any]
                     post_item_records: list[dict[str, Any]] = []
                     if item.kind == "calibrate":
-                        from llamatune.calibrate import run_calibration
-
                         model = by_fingerprint[item.fingerprint or ""]
                         reference = records[item.reference_fingerprint or ""]
                         try:
@@ -748,9 +754,11 @@ def run_nightshift(
                             tune_failure_models.clear()
                             if item.fingerprint:
                                 tuned_fingerprints.add(item.fingerprint)
-                            records = _context_compatible_records(
-                                build_registry(options.sessions_dir), options.ctx_size
-                            )
+                            if session_dir is not None:
+                                # Fold the just-finished session into the
+                                # registry incrementally; a full rescan is
+                                # unnecessary under strictly serial scheduling.
+                                absorb_session(records, session_dir, ctx_size=options.ctx_size)
                             if item.kind == "tune" and item.fingerprint in records:
                                 representative = by_fingerprint[item.fingerprint]
                                 for sibling in models:
@@ -795,9 +803,9 @@ def run_nightshift(
                 and deepening_changes_profile(options)
             )
             if spare_time:
-                records = _context_compatible_records(
-                    build_registry(options.sessions_dir), options.ctx_size
-                )
+                # ``records`` is maintained incrementally after each finished
+                # item (see absorb_session); it already equals a from-scratch
+                # rebuild under strictly serial scheduling.
                 candidates = deepen_order(models, records)
                 for model in candidates:
                     _journal_interrupts(interrupt_state)

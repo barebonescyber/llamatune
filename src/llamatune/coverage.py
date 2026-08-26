@@ -247,23 +247,43 @@ def _trial_parts(trial: TrialResult | Mapping[str, Any]) -> tuple[TrialConfig, s
 def _responsive_dimensions(
     trials: Iterable[TrialResult | Mapping[str, Any]], *, tau: float
 ) -> tuple[str, ...]:
-    ok = [parts for trial in trials if (parts := _trial_parts(trial))[1] == "ok"]
+    """Return dimensions with an ok pair differing only there beyond 1 + tau.
+
+    Equivalent to the historical pairwise scan but linear in trials: configs
+    parse once, each trial reduces to one value tuple across
+    ``DIMENSION_ORDER``, and trials are grouped per dimension by their
+    all-dims-except-one value signature. Within a group only the best and
+    worst score per differing value can form the extremal pair, so each
+    group collapses to a min/max fold over its distinct values.
+    """
+    usable = [
+        (_config_values(config), score)
+        for config, status, score in (_trial_parts(trial) for trial in trials)
+        if status == "ok" and score is not None and score > 0
+    ]
+    threshold = 1.0 + tau
     responsive: list[str] = []
-    for dim in DIMENSION_ORDER:
-        for left, right in itertools.combinations(ok, 2):
-            a, _, a_score = left
-            b, _, b_score = right
-            if a_score is None or b_score is None or min(a_score, b_score) <= 0:
-                continue
-            differences = [
-                name
-                for name in DIMENSION_ORDER
-                if dimension_value(a, name) != dimension_value(b, name)
-            ]
-            if differences == [dim] and max(a_score, b_score) / min(a_score, b_score) > 1 + tau:
-                responsive.append(dim)
-                break
+    for index in range(len(DIMENSION_ORDER)):
+        groups: dict[tuple[Any, ...], dict[Any, tuple[float, float]]] = {}
+        for values, score in usable:
+            key = values[:index] + values[index + 1 :]
+            per_value = groups.setdefault(key, {})
+            low, high = per_value.get(values[index], (score, score))
+            per_value[values[index]] = (min(low, score), max(high, score))
+        if any(
+            max(high1, high2) / min(low1, low2) > threshold
+            for per_value in groups.values()
+            if len(per_value) > 1
+            for (_, (low1, high1)), (_, (low2, high2)) in itertools.combinations(
+                per_value.items(), 2
+            )
+        ):
+            responsive.append(DIMENSION_ORDER[index])
     return tuple(responsive)
+
+
+def _config_values(config: TrialConfig) -> tuple[Any, ...]:
+    return tuple(dimension_value(config, dim) for dim in DIMENSION_ORDER)
 
 
 def build_ledger(

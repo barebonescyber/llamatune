@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Self, cast
 
 from llamatune._version import __version__
+from llamatune.calibrate import run_calibration
 from llamatune.evidence import (
     EvidenceWriter,
     InterruptState,
@@ -617,7 +618,6 @@ def run_marathon(
                     and (current - last_bracket).total_seconds() < BRACKET_FRESH_MINUTES * 60
                 ):
                     return True
-                from llamatune.calibrate import run_calibration
 
                 bracket_number += 1
                 run.select_bracket(bracket_number)
@@ -700,6 +700,7 @@ def run_marathon(
             ]
             no_change = 0
             failures = 0
+            executed, pruned, journaled_trials = _trial_evidence(session_dirs)
             ledger = build_ledger(
                 enumerate_space(
                     model,
@@ -709,8 +710,9 @@ def run_marathon(
                     champion=champion or default_config,
                     known_placements=(),
                 ),
-                *_trial_evidence(session_dirs)[:2],
-                trials=_trial_evidence(session_dirs)[2],
+                executed,
+                pruned,
+                trials=journaled_trials,
             )
             run.append({"type": "phase", "phase": "rounds"})
             if not bracket("rounds"):
@@ -780,6 +782,12 @@ def run_marathon(
                     continue
                 failures = 0
                 session_dirs.append(outcome.session_dir)
+                # Fold in only the just-finished session's journal: rescanning
+                # every prior session per round made ledger builds O(R^2).
+                delta_executed, delta_pruned, delta_trials = _trial_evidence((outcome.session_dir,))
+                executed |= delta_executed
+                pruned |= delta_pruned
+                journaled_trials.extend(delta_trials)
                 winner = outcome.analysis.get("winner")
                 contender = (
                     TrialConfig.from_dict(winner["config"])
@@ -813,7 +821,6 @@ def run_marathon(
                             True,
                         )
                 no_change = 0 if changed else no_change + 1
-                executed, pruned, trials = _trial_evidence(session_dirs)
                 known = (
                     () if champion is None else ((champion.gpu_layers, champion.moe_cpu_layers),)
                 )
@@ -828,7 +835,7 @@ def run_marathon(
                     ),
                     executed,
                     pruned,
-                    trials=trials,
+                    trials=journaled_trials,
                 )
                 item = {
                     "type": "round_end",
