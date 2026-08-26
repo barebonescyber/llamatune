@@ -173,3 +173,58 @@ def test_rich_reporter_all_event_updates() -> None:
     assert "warning-13" in rendered
     assert "warning-0" not in rendered
     assert live.stopped is True
+
+
+def test_plain_reporter_strips_control_characters_from_strings() -> None:
+    err = io.StringIO()
+    reporter = ui.make_reporter("plain", err=err)
+    assert reporter is not None
+    hostile_name = "\x1b[31mho\x07st\x1b(B\x08evil\u202emodel"
+    reporter.emit(_event("session_start", model_name=hostile_name, session_dir="session"))
+    reporter.emit(_event("warning", message=f"noise\x1b[0m{chr(7)}"))
+    text = err.getvalue()
+    assert "\x1b" not in text
+    assert "\x07" not in text
+    assert "\x08" not in text
+    assert "\u202e" not in text
+    assert "[session] " in text
+    assert "[warning] noise[0m" in text
+
+
+def test_plain_reporter_strips_control_chars_from_labels_and_winner() -> None:
+    err = io.StringIO()
+    reporter = ui.PlainReporter(err)
+    reporter.emit(_event("exec_start", kind="trial", label="ngl=\x1b[31m1"))
+    reporter.emit(_event("exec_end", label="\x1bngl=1", status="o\x07k", wall_s=1.0))
+    reporter.emit(_event("session_end", exit_code=0, winner_trial_id="ab\x1bcd"))
+    text = err.getvalue()
+    assert "\x1b" not in text
+    assert "\x07" not in text
+    assert "[result] ngl=1 — ok" in text
+    assert "winner=abcd" in text
+
+
+def test_rich_reporter_strips_control_characters_from_inserted_values() -> None:
+    reporter = object.__new__(ui.RichReporter)
+    reporter._lines = ["llamatune starting…"]
+    live = _FakeLive()
+    reporter._live = cast(Any, live)
+    events = [
+        _event(
+            "session_start",
+            model_name="\x1b[31mmodel\x07",
+            session_dir="session",
+            stop_hint="stop hint",
+        ),
+        _event("stage", stage="se\x1b[31march"),
+        _event("exec_start", label="tr\x07ial", elapsed_s=0),
+        _event("exec_end", label="trial", status="o\x1bk"),
+        _event("warning", message="noise\x1b[0m"),
+    ]
+    for event in events:
+        reporter.emit(event)
+    rendered = live.updates[-1][0]
+    assert "\x1b" not in rendered
+    assert "\x07" not in rendered
+    assert "[bold][31mmodel[/bold]" in rendered
+    assert "phase: se[31march" in rendered

@@ -55,6 +55,7 @@ from llamatune.types import (
     GpuSample,
     HardwareReport,
     LlamaCppReport,
+    MetricStats,
     ModelReport,
     ProgressEvent,
     Reporter,
@@ -448,11 +449,34 @@ class _Engine:
         self.validated_configs: set[str] = set()
         self.default_probe: dict[str, Any] | None = self._find_stage("default_probe")
 
-        # Populated by _establish_baseline / _seed_incumbent.
-        self.baseline: BaselineResult
-        self.default_config: TrialConfig
-        self.measured_default: TrialConfig
-        self.incumbent_config: TrialConfig
+        # Populated by _establish_baseline / _load_baseline_stage /
+        # _seed_incumbent. Seeded with inert placeholders so attribute
+        # existence never depends on call order; ``baseline.kind`` stays
+        # "unestablished" until real evidence lands (GitHub #20).
+        placeholder = TrialConfig(
+            gpu_layers=0,
+            moe_cpu_layers=0,
+            flash_attn=False,
+            ubatch=512,
+            batch=2048,
+            threads=1,
+            mmap=True,
+            no_kv_offload=False,
+            cache_type_k="f16",
+            cache_type_v="f16",
+        )
+        self.baseline = BaselineResult(
+            runs=0,
+            pp=MetricStats(mean=0.0, stdev=0.0, cv=0.0, n=0),
+            tg=MetricStats(mean=0.0, stdev=0.0, cv=0.0, n=0),
+            noise_floor_cv=0.0,
+            fallback=None,
+            resolved_defaults={},
+            kind="unestablished",
+        )
+        self.default_config = placeholder
+        self.measured_default = placeholder
+        self.incumbent_config = placeholder
         self.incumbent_pp = 0.0
         self.incumbent_tg = 0.0
         self.incumbent_score = 1.0
@@ -1248,8 +1272,7 @@ class _Engine:
         failed, used = None, 0
         limit = 2 * max(1, max(1, self.model.ngl_all).bit_length()) + 4
         baseline_verified = (
-            hasattr(self, "baseline")
-            and self.baseline.kind == "defaults"
+            self.baseline.kind == "defaults"
             and base.trial_id == self.default_config.trial_id
             and base.gpu_layers <= cap
         )
@@ -3017,7 +3040,7 @@ class _Engine:
         return result
 
     def _complete_coverage(self) -> None:
-        if not hasattr(self, "incumbent_config"):
+        if self.baseline.kind == "unestablished":
             return
         applicable = applicable_dimensions(
             hardware=self.hardware,
