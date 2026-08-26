@@ -853,6 +853,353 @@ def _announce_task(
         reporter.err.flush()
 
 
+class _ServerSession:
+    """Owns the llama-server handle lifecycle for one HTTP evaluation side."""
+
+    __slots__ = ("_config", "_resolved", "_run", "_signals", "_timing", "handle")
+
+    def __init__(
+        self,
+        run: QualityRun,
+        resolved: _Resolved,
+        config: TrialConfig | None,
+        timing: Timing,
+        signals: _SignalState,
+    ) -> None:
+        self._run = run
+        self._resolved = resolved
+        self._config = config
+        self._timing = timing
+        self._signals = signals
+        self.handle: ServerHandle | None = None
+
+    def launch(self) -> ServerHandle:
+        """Start the server (two attempts), registering it for signal cleanup."""
+        self.handle = _launch(
+            self._run,
+            _server_argv(self._resolved, self._config),
+            self._resolved.options.server_start_timeout_s,
+            self._timing,
+        )
+        self._signals.handle = self.handle
+        return self.handle
+
+    def relaunch(self) -> bool:
+        """Restart after a crash (single attempt); False when it fails."""
+        try:
+            self.handle = start(
+                self._run,
+                _server_argv(self._resolved, self._config),
+                start_timeout_s=self._resolved.options.server_start_timeout_s,
+                timing=self._timing,
+            )
+        except ServerStartError:
+            return False
+        self._signals.handle = self.handle
+        return True
+
+    def stop(self) -> None:
+        """Stop the server if running and clear signal registration."""
+        if self.handle is not None:
+            self.handle.stop()
+            self.handle = None
+        self._signals.handle = None
+
+
+@dataclasses.dataclass
+class _TaskProgress:
+    """Shared per-side announcement counters across suites and tasks."""
+
+    total: int
+    announced: int = 0
+    keys: set[tuple[str, str]] = dataclasses.field(default_factory=set)
+
+    def announce(
+        self,
+        reporter: Reporter | None,
+        side: str,
+        suite_id: str,
+        task_id: str,
+    ) -> None:
+        """Announce a task the first time any of its repetitions will run."""
+        if (suite_id, task_id) in self.keys:
+            return
+        self.keys.add((suite_id, task_id))
+        self.announced += 1
+        _announce_task(
+            reporter,
+            f"[quality] {side} task {self.announced}/{self.total} {task_id} ({suite_id})",
+            {
+                "side": side,
+                "suite_id": suite_id,
+                "task_id": task_id,
+                "index": self.announced,
+                "total": self.total,
+            },
+        )
+
+
+def _side_progress(
+    suites: Sequence[SuiteSpec],
+    options: QualityOptions,
+    side: str,
+    prior: dict[tuple[str, str, int, str], TaskGrade],
+) -> tuple[_TaskProgress, bool]:
+    """Count pending tasks on one side and report whether any exist."""
+    selected_ids = {
+        (suite.suite_id, str(task["id"]))
+        for suite in suites
+        for task in suite.tasks
+        if _task_selected(str(task["id"]), options.task_filters)
+    }
+    total_tasks = sum(
+        1
+        for suite_id, task_id in selected_ids
+        if any(
+            _task_key(suite_id, task_id, rep, side) not in prior
+            for rep in range(1, options.reps + 1)
+        )
+    )
+    pending = any(
+        _task_selected(str(task["id"]), options.task_filters)
+        and any(
+            _task_key(suite.suite_id, str(task["id"]), rep, side) not in prior
+            for rep in range(1, options.reps + 1)
+        )
+        for suite in suites
+        for task in suite.tasks
+    )
+    return _TaskProgress(total=total_tasks), pending
+
+
+def grade_one_task(
+    run: QualityRun,
+    resolved: _Resolved,
+    suite: SuiteSpec,
+    task: dict[str, Any],
+    side: str,
+    prior: dict[tuple[str, str, int, str], TaskGrade],
+    signals: _SignalState,
+    session: _ServerSession,
+    progress: _TaskProgress,
+    reporter: Reporter | None,
+    relaunch_used: bool,
+) -> tuple[list[TaskGrade], bool, bool, bool]:
+    """Grade every pending repetition of one task against the live server.
+
+    Returns ``(rep_grades, harness_error, abort, relaunch_used)``.
+    """
+    task_id = str(task["id"])
+    rep_grades: list[TaskGrade] = []
+    deferred_exec: list[tuple[int, tuple[str, str, int, str], tuple[str, ...]]] = []
+    needs_exec = resolved.options.exec_enabled and any(
+        isinstance(grader, dict) and grader.get("type") == "exec_python"
+        for grader in task.get("graders", ())
+    )
+    harness_error = False
+    abort = False
+    for rep in range(1, resolved.options.reps + 1):
+        key = _task_key(suite.suite_id, task_id, rep, side)
+        if key in prior:
+            rep_grades.append(prior[key])
+            continue
+        progress.announce(reporter, side, suite.suite_id, task_id)
+        run.append(
+            {
+                "type": "task_start",
+                "suite_id": suite.suite_id,
+                "task_id": task_id,
+                "rep": rep,
+                "side": side,
+            }
+        )
+        ctx_min = task.get("ctx_min")
+        if isinstance(ctx_min, int) and resolved.options.ctx_size < ctx_min:
+            grade = _skipped_grade(
+                task_id,
+                f"ctx_size {resolved.options.ctx_size} is below ctx_min {ctx_min}",
+            )
+            _record_grade(run, suite, task_id, rep, side, grade)
+            prior[key] = grade
+            rep_grades.append(grade)
+            continue
+        current_grade: TaskGrade | None = None
+        while True:
+            try:
+                handle = session.handle if session.handle is not None else session.launch()
+                responses = _drive_task(
+                    run,
+                    handle,
+                    suite,
+                    task,
+                    rep,
+                    side,
+                    resolved.options,
+                )
+                if needs_exec:
+                    deferred_exec.append((rep, key, responses))
+                else:
+                    current_grade = grade_task(task, responses, None)
+            except ServerUnavailableError as exc:
+                run.append(
+                    {
+                        "type": "server_exit",
+                        "suite_id": suite.suite_id,
+                        "reason": strip_control_chars(str(exc)),
+                        "stderr_tail": (
+                            strip_control_chars(session.handle.stderr_tail)
+                            if session.handle
+                            else ""
+                        ),
+                    }
+                )
+                session.stop()
+                if relaunch_used:
+                    current_grade = _error_grade(task_id, "server_unavailable")
+                    harness_error = True
+                    abort = True
+                    break
+                relaunch_used = True
+                if not session.relaunch():
+                    current_grade = _error_grade(task_id, "server_unavailable")
+                    harness_error = True
+                    abort = True
+                    break
+                continue
+            except (ServerProtocolError, OSError, ValueError) as exc:
+                current_grade = _error_grade(task_id, str(exc))
+                harness_error = True
+            break
+        if current_grade is not None:
+            _record_grade(run, suite, task_id, rep, side, current_grade)
+            prior[key] = current_grade
+            rep_grades.append(current_grade)
+        if abort:
+            break
+        if signals.stop_requested:
+            break
+    if abort:
+        deferred_exec.clear()
+        for remaining_rep in range(1, resolved.options.reps + 1):
+            remaining_key = _task_key(suite.suite_id, task_id, remaining_rep, side)
+            if remaining_key in prior:
+                continue
+            grade = _error_grade(task_id, "server_unavailable")
+            _record_grade(run, suite, task_id, remaining_rep, side, grade)
+            prior[remaining_key] = grade
+        rep_grades = [
+            prior[_task_key(suite.suite_id, task_id, rep, side)]
+            for rep in range(1, resolved.options.reps + 1)
+        ]
+    if deferred_exec and not abort:
+        session.stop()
+
+        def exec_runner(code: str) -> Any:
+            return sandbox.run_python(
+                code,
+                timeout_s=resolved.options.request_timeout_s,
+            )
+
+        for rep, key, responses in deferred_exec:
+            try:
+                grade = grade_task(task, responses, exec_runner)
+            except (OSError, RuntimeError, ValueError) as exc:
+                grade = _error_grade(task_id, str(exc))
+                harness_error = True
+            _record_grade(run, suite, task_id, rep, side, grade)
+            prior[key] = grade
+            rep_grades.append(grade)
+    return rep_grades, harness_error, abort, relaunch_used
+
+
+def _evaluate_suite(
+    run: QualityRun,
+    resolved: _Resolved,
+    suite: SuiteSpec,
+    side: str,
+    prior: dict[tuple[str, str, int, str], TaskGrade],
+    signals: _SignalState,
+    session: _ServerSession,
+    progress: _TaskProgress,
+    reporter: Reporter | None,
+) -> tuple[SuiteResult, bool, bool]:
+    """Evaluate one suite on one side; returns (result, harness_error, abort)."""
+    grades: list[TaskGrade] = []
+    relaunch_used = False
+    harness_error = False
+    abort = False
+    tasks = [
+        task
+        for task in suite.tasks
+        if _task_selected(str(task["id"]), resolved.options.task_filters)
+    ]
+    for task_index, task in enumerate(tasks):
+        rep_grades, task_harness_error, abort, relaunch_used = grade_one_task(
+            run,
+            resolved,
+            suite,
+            task,
+            side,
+            prior,
+            signals,
+            session,
+            progress,
+            reporter,
+            relaunch_used,
+        )
+        harness_error = harness_error or task_harness_error
+        if rep_grades:
+            grades.append(combine_repetitions(tuple(rep_grades)))
+        if abort or signals.stop_requested:
+            if abort:
+                for remaining in tasks[task_index + 1 :]:
+                    remaining_id = str(remaining["id"])
+                    remaining_grades: list[TaskGrade] = []
+                    for remaining_rep in range(1, resolved.options.reps + 1):
+                        remaining_key = _task_key(
+                            suite.suite_id,
+                            remaining_id,
+                            remaining_rep,
+                            side,
+                        )
+                        remaining_grade = prior.get(remaining_key)
+                        if remaining_grade is None:
+                            remaining_grade = _error_grade(remaining_id, "server_unavailable")
+                            _record_grade(
+                                run,
+                                suite,
+                                remaining_id,
+                                remaining_rep,
+                                side,
+                                remaining_grade,
+                            )
+                            prior[remaining_key] = remaining_grade
+                        remaining_grades.append(remaining_grade)
+                    grades.append(combine_repetitions(tuple(remaining_grades)))
+            break
+    metrics = aggregate(
+        suite.kind,
+        tuple(grades),
+        exec_enabled=resolved.options.exec_enabled,
+    )
+    result = SuiteResult(
+        suite_id=suite.suite_id,
+        name=suite.name,
+        kind=suite.kind,
+        metrics=metrics,
+        tasks=tuple(grades),
+    )
+    run.append(
+        {
+            "type": "suite_summary",
+            "side": side,
+            "suite_id": suite.suite_id,
+            "metrics": metrics,
+        }
+    )
+    return result, harness_error, abort
+
+
 def _evaluate_http_side(
     run: QualityRun,
     resolved: _Resolved,
@@ -866,262 +1213,26 @@ def _evaluate_http_side(
     suites = tuple(suite for suite in resolved.suites if suite.kind != "perplexity")
     if not suites:
         return (), False, False
-    selected_ids = {
-        (suite.suite_id, str(task["id"]))
-        for suite in suites
-        for task in suite.tasks
-        if _task_selected(str(task["id"]), resolved.options.task_filters)
-    }
-    total_tasks = sum(
-        1
-        for suite_id, task_id in selected_ids
-        if any(
-            _task_key(suite_id, task_id, rep, side) not in prior
-            for rep in range(1, resolved.options.reps + 1)
-        )
-    )
-    announced_tasks = 0
-    announced_keys: set[tuple[str, str]] = set()
-    pending = any(
-        _task_selected(str(task["id"]), resolved.options.task_filters)
-        and any(
-            _task_key(suite.suite_id, str(task["id"]), rep, side) not in prior
-            for rep in range(1, resolved.options.reps + 1)
-        )
-        for suite in suites
-        for task in suite.tasks
-    )
-    handle: ServerHandle | None = None
+    progress, pending = _side_progress(suites, resolved.options, side, prior)
+    session = _ServerSession(run, resolved, config, timing, signals)
     results: list[SuiteResult] = []
     harness_error = False
     abort = False
     try:
         if pending:
-            handle = _launch(
-                run,
-                _server_argv(resolved, config),
-                resolved.options.server_start_timeout_s,
-                timing,
-            )
-            signals.handle = handle
+            session.launch()
         for suite in suites:
-            grades: list[TaskGrade] = []
-            relaunch_used = False
-            tasks = [
-                task
-                for task in suite.tasks
-                if _task_selected(str(task["id"]), resolved.options.task_filters)
-            ]
-            for task_index, task in enumerate(tasks):
-                task_id = str(task["id"])
-                rep_grades: list[TaskGrade] = []
-                deferred_exec: list[tuple[int, tuple[str, str, int, str], tuple[str, ...]]] = []
-                needs_exec = resolved.options.exec_enabled and any(
-                    isinstance(grader, dict) and grader.get("type") == "exec_python"
-                    for grader in task.get("graders", ())
-                )
-                for rep in range(1, resolved.options.reps + 1):
-                    key = _task_key(suite.suite_id, task_id, rep, side)
-                    if key in prior:
-                        rep_grades.append(prior[key])
-                        continue
-                    if (suite.suite_id, task_id) not in announced_keys:
-                        announced_keys.add((suite.suite_id, task_id))
-                        announced_tasks += 1
-                        _announce_task(
-                            reporter,
-                            f"[quality] {side} task {announced_tasks}/{total_tasks}"
-                            f" {task_id} ({suite.suite_id})",
-                            {
-                                "side": side,
-                                "suite_id": suite.suite_id,
-                                "task_id": task_id,
-                                "index": announced_tasks,
-                                "total": total_tasks,
-                            },
-                        )
-                    run.append(
-                        {
-                            "type": "task_start",
-                            "suite_id": suite.suite_id,
-                            "task_id": task_id,
-                            "rep": rep,
-                            "side": side,
-                        }
-                    )
-                    ctx_min = task.get("ctx_min")
-                    if isinstance(ctx_min, int) and resolved.options.ctx_size < ctx_min:
-                        grade = _skipped_grade(
-                            task_id,
-                            f"ctx_size {resolved.options.ctx_size} is below ctx_min {ctx_min}",
-                        )
-                        _record_grade(run, suite, task_id, rep, side, grade)
-                        prior[key] = grade
-                        rep_grades.append(grade)
-                        continue
-                    current_grade: TaskGrade | None = None
-                    while True:
-                        try:
-                            if handle is None:
-                                handle = _launch(
-                                    run,
-                                    _server_argv(resolved, config),
-                                    resolved.options.server_start_timeout_s,
-                                    timing,
-                                )
-                                signals.handle = handle
-                            responses = _drive_task(
-                                run,
-                                handle,
-                                suite,
-                                task,
-                                rep,
-                                side,
-                                resolved.options,
-                            )
-                            if needs_exec:
-                                deferred_exec.append((rep, key, responses))
-                            else:
-                                current_grade = grade_task(task, responses, None)
-                        except ServerUnavailableError as exc:
-                            run.append(
-                                {
-                                    "type": "server_exit",
-                                    "suite_id": suite.suite_id,
-                                    "reason": strip_control_chars(str(exc)),
-                                    "stderr_tail": (
-                                        strip_control_chars(handle.stderr_tail) if handle else ""
-                                    ),
-                                }
-                            )
-                            if handle is not None:
-                                handle.stop()
-                                handle = None
-                                signals.handle = None
-                            if relaunch_used:
-                                current_grade = _error_grade(task_id, "server_unavailable")
-                                harness_error = True
-                                abort = True
-                                break
-                            relaunch_used = True
-                            try:
-                                handle = start(
-                                    run,
-                                    _server_argv(resolved, config),
-                                    start_timeout_s=resolved.options.server_start_timeout_s,
-                                    timing=timing,
-                                )
-                                signals.handle = handle
-                            except ServerStartError:
-                                current_grade = _error_grade(task_id, "server_unavailable")
-                                harness_error = True
-                                abort = True
-                                break
-                            continue
-                        except (ServerProtocolError, OSError, ValueError) as exc:
-                            current_grade = _error_grade(task_id, str(exc))
-                            harness_error = True
-                        break
-                    if current_grade is not None:
-                        _record_grade(run, suite, task_id, rep, side, current_grade)
-                        prior[key] = current_grade
-                        rep_grades.append(current_grade)
-                    if abort:
-                        break
-                    if signals.stop_requested:
-                        break
-                if abort:
-                    deferred_exec.clear()
-                    for remaining_rep in range(1, resolved.options.reps + 1):
-                        remaining_key = _task_key(suite.suite_id, task_id, remaining_rep, side)
-                        if remaining_key in prior:
-                            continue
-                        grade = _error_grade(task_id, "server_unavailable")
-                        _record_grade(run, suite, task_id, remaining_rep, side, grade)
-                        prior[remaining_key] = grade
-                    rep_grades = [
-                        prior[_task_key(suite.suite_id, task_id, rep, side)]
-                        for rep in range(1, resolved.options.reps + 1)
-                    ]
-                if deferred_exec and not abort:
-                    if handle is not None:
-                        handle.stop()
-                        handle = None
-                        signals.handle = None
-
-                    def exec_runner(code: str) -> Any:
-                        return sandbox.run_python(
-                            code,
-                            timeout_s=resolved.options.request_timeout_s,
-                        )
-
-                    for rep, key, responses in deferred_exec:
-                        try:
-                            grade = grade_task(task, responses, exec_runner)
-                        except (OSError, RuntimeError, ValueError) as exc:
-                            grade = _error_grade(task_id, str(exc))
-                            harness_error = True
-                        _record_grade(run, suite, task_id, rep, side, grade)
-                        prior[key] = grade
-                        rep_grades.append(grade)
-                if rep_grades:
-                    grades.append(combine_repetitions(tuple(rep_grades)))
-                if abort or signals.stop_requested:
-                    if abort:
-                        for remaining in tasks[task_index + 1 :]:
-                            remaining_id = str(remaining["id"])
-                            remaining_grades: list[TaskGrade] = []
-                            for remaining_rep in range(1, resolved.options.reps + 1):
-                                remaining_key = _task_key(
-                                    suite.suite_id,
-                                    remaining_id,
-                                    remaining_rep,
-                                    side,
-                                )
-                                remaining_grade = prior.get(remaining_key)
-                                if remaining_grade is None:
-                                    remaining_grade = _error_grade(
-                                        remaining_id, "server_unavailable"
-                                    )
-                                    _record_grade(
-                                        run,
-                                        suite,
-                                        remaining_id,
-                                        remaining_rep,
-                                        side,
-                                        remaining_grade,
-                                    )
-                                    prior[remaining_key] = remaining_grade
-                                remaining_grades.append(remaining_grade)
-                            grades.append(combine_repetitions(tuple(remaining_grades)))
-                    break
-            metrics = aggregate(
-                suite.kind,
-                tuple(grades),
-                exec_enabled=resolved.options.exec_enabled,
-            )
-            result = SuiteResult(
-                suite_id=suite.suite_id,
-                name=suite.name,
-                kind=suite.kind,
-                metrics=metrics,
-                tasks=tuple(grades),
+            result, suite_harness_error, suite_abort = _evaluate_suite(
+                run, resolved, suite, side, prior, signals, session, progress, reporter
             )
             results.append(result)
-            run.append(
-                {
-                    "type": "suite_summary",
-                    "side": side,
-                    "suite_id": suite.suite_id,
-                    "metrics": metrics,
-                }
-            )
+            harness_error = harness_error or suite_harness_error
+            if suite_abort:
+                abort = True
             if abort or signals.stop_requested:
                 break
     finally:
-        if handle is not None:
-            handle.stop()
-        signals.handle = None
+        session.stop()
     return tuple(results), harness_error, abort
 
 
