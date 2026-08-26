@@ -839,6 +839,7 @@ def _announce_task(
     """Emit one concise task-level progress line for interactive reporters."""
     if reporter is None:
         return
+    message = strip_control_chars(message)
     reporter.emit(
         ProgressEvent(
             kind="quality_task",

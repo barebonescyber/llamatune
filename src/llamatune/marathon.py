@@ -34,6 +34,7 @@ from llamatune.evidence import (
 from llamatune.evidence import (
     utc_iso as _utc_iso,
 )
+from llamatune.sanitize import strip_control_chars
 from llamatune.types import (
     CoverageLedger,
     HardwareReport,
@@ -475,6 +476,7 @@ def _announce(
     """Emit one concise progress line for an orchestrator phase or round."""
     if reporter is None:
         return
+    message = strip_control_chars(message)
     from llamatune.types import ProgressEvent
 
     reporter.emit(

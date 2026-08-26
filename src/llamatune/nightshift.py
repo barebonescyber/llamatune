@@ -31,6 +31,7 @@ from llamatune.evidence import (
 from llamatune.evidence import (
     utc_iso as _utc_iso,
 )
+from llamatune.sanitize import strip_control_chars
 from llamatune.session import JournalTailIncomplete, scan_journal_tail
 from llamatune.types import (
     CalibrationResult,
@@ -334,11 +335,12 @@ def _announce_item(reporter: Reporter | None, index: int, total: int, item: Work
     """Emit one concise progress line for an orchestrator work item."""
     if reporter is None:
         return
-    label = (
+    raw_label = (
         Path(str(item.model_path)).stem
         if item.model_path is not None
         else item.fingerprint or "item"
     )
+    label = strip_control_chars(raw_label)
     message = f"[nightshift] item {index}/{total} {item.kind} {label}"
     from llamatune.types import ProgressEvent
 
