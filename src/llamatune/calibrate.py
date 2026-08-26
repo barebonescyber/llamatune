@@ -193,6 +193,17 @@ def run_calibration(
                     runs=0,
                     reason=f"capability_lost:{capability}",
                 )
+    if record.reference_pp <= 0 or record.reference_tg <= 0:
+        field = "pp" if record.reference_pp <= 0 else "tg"
+        return _result(
+            record=record,
+            model=model,
+            llama=llama,
+            threshold=threshold,
+            verdict="error",
+            runs=0,
+            reason=f"invalid_reference:{field}",
+        )
 
     argv = _build_argv(record, model, llama)
     pp_values: list[float] = []

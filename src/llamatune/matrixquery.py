@@ -234,7 +234,15 @@ def _rank_rows(
         ranked.sort(key=lambda row: _quality_tiebreak(row, recommendation_tg), reverse=True)
     elif definition is not None:
         ranked.sort(key=definition.tiebreak_fn, reverse=True)
-    ranked.sort(key=lambda row: metric_fn(row) or 0.0, reverse=not ascending)
+    reverse = not ascending
+
+    def rank_key(row: ResultRow) -> tuple[int, float]:
+        value = metric_fn(row)
+        if value is None:
+            return (1, 0.0)
+        return (0, -value) if reverse else (0, value)
+
+    ranked.sort(key=rank_key)
     return ranked
 
 

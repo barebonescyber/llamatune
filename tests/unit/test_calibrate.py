@@ -443,3 +443,35 @@ def test_run_calibration_executes_fake_bench_end_to_end(
     if speed_scale != 1.0:
         assert result.drift_pp is not None and result.drift_pp > result.threshold
         assert result.drift_tg is not None and result.drift_tg > result.threshold
+
+
+@pytest.mark.parametrize(
+    ("reference_pp", "reference_tg", "field"),
+    [
+        (0.0, 50.0, "pp"),
+        (-10.0, 50.0, "pp"),
+        (100.0, 0.0, "tg"),
+        (100.0, -10.0, "tg"),
+    ],
+)
+def test_non_positive_reference_returns_error_without_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reference_pp: float,
+    reference_tg: float,
+    field: str,
+) -> None:
+    monkeypatch.setattr(
+        executor, "run", lambda *_args, **_kwargs: pytest.fail("executor must not run")
+    )
+    record = _record(tmp_path, reference_pp=reference_pp, reference_tg=reference_tg)
+    result = run_calibration(
+        _Run(tmp_path / "night"), record, _model(tmp_path), _llama(), _options()
+    )
+    assert result.verdict == "error"
+    assert result.reason == f"invalid_reference:{field}"
+    assert result.runs == 0
+    assert result.pp is None
+    assert result.tg is None
+    assert result.drift_pp is None
+    assert result.drift_tg is None
