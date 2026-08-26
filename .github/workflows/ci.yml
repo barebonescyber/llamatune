@@ -37,6 +37,41 @@ jobs:
       - name: Enforce beta-core module coverage
         run: uv run python .github/scripts/check_module_coverage.py coverage.json
 
+  dependency-floor:
+    name: Lowest-direct dependency floor / Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Resolve lowest direct dependencies into a scratch environment
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/floor-env"
+          uv pip install \
+            --python "$RUNNER_TEMP/floor-env/bin/python" \
+            --resolution lowest-direct .
+      - name: Smoke-test the floor versions
+        run: |
+          python_path="$RUNNER_TEMP/floor-env/bin/python"
+          "$python_path" -c 'import importlib.metadata as metadata; print({name: metadata.version(name) for name in ("typer", "gguf", "rich")})'
+          "$python_path" -c 'import llamatune.cli'
+          "$RUNNER_TEMP/floor-env/bin/llamatune" --help > help.txt
+          grep -q "Usage:" help.txt
+          "$python_path" .github/scripts/artifact_smoke.py create-model tiny.gguf
+          "$python_path" - <<'PY'
+          from pathlib import Path
+
+          from gguf import GGUFReader, ReaderField
+
+          field = GGUFReader(Path("tiny.gguf")).get_field("general.architecture")
+          assert isinstance(field, ReaderField)
+          print("floor gguf read OK:", bytes(field.parts[field.data[0]]).decode())
+          PY
+
   quality:
     name: ${{ matrix.os }} / Python ${{ matrix.python }}
     needs: preflight
