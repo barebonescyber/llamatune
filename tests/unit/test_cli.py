@@ -436,6 +436,52 @@ def test_sessions_command_human_output(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert "model=model status=complete exit=0 winner=winner confirmed=True" in result.output
 
 
+def _patched_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "llamatune.session.list_sessions",
+        lambda path: [
+            {
+                "session_dir": "/sessions/a",
+                "model": "model",
+                "status": "complete",
+                "exit_code": 0,
+                "winner_trial_id": "winner",
+                "confirmed": True,
+            }
+        ],
+    )
+
+
+def test_sessions_plain_pipe_output_matches_legacy_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patched_sessions(monkeypatch)
+    monkeypatch.setattr("llamatune.cli._stdout_is_tty", lambda: False)
+
+    result = runner.invoke(app, ["sessions", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert result.stdout == (
+        "/sessions/a model=model status=complete exit=0 winner=winner confirmed=True\n"
+    )
+
+
+def test_sessions_tty_output_renders_rich_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patched_sessions(monkeypatch)
+    monkeypatch.setattr("llamatune.cli._stdout_is_tty", lambda: True)
+    monkeypatch.setenv("COLUMNS", "200")
+
+    result = runner.invoke(app, ["sessions", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "/sessions/a" in result.stdout
+    for header in ("session_dir", "model", "status", "exit", "winner", "confirmed"):
+        assert header in result.stdout
+    assert "\u2502" in result.stdout
+
+
 def test_sessions_command_preserves_windows_drive_path(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[str] = []
 

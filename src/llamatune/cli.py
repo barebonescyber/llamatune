@@ -15,7 +15,7 @@ import json
 import math
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
@@ -148,6 +148,55 @@ def _echo_json(payload: Any) -> None:
     typer.echo(json.dumps(payload, indent=2, sort_keys=True, default=_json_default))
 
 
+def _stdout_is_tty() -> bool:
+    """Report whether stdout is an interactive terminal."""
+    return sys.stdout.isatty()
+
+
+def _render_table(headers: tuple[str, ...], rows: Sequence[Sequence[Any]]) -> None:
+    """Render one aligned table through Rich (TTY callers only)."""
+    from rich.console import Console
+    from rich.table import Table
+
+    table = Table()
+    for header in headers:
+        table.add_column(header, overflow="fold")
+    for row in rows:
+        table.add_row(*(str(cell) for cell in row))
+    Console().print(table)
+
+
+def _plain_row(cells: Sequence[Any]) -> str:
+    return "  ".join(str(cell) for cell in cells)
+
+
+_MATRIX_QUERY_HEADERS = (
+    "rank",
+    "model",
+    "config",
+    "ctx",
+    "depth",
+    "metric",
+    "pp",
+    "tg",
+    "flags",
+    "compat",
+    "evidence",
+)
+_MATRIX_SHOW_HEADERS = (
+    "model",
+    "kinds",
+    "best_pp",
+    "best_tg",
+    "balanced",
+    "max_ctx",
+    "quality",
+    "newest",
+    "stale",
+)
+_SESSIONS_HEADERS = ("session_dir", "model", "status", "exit", "winner", "confirmed")
+
+
 def _matrix_roots(sessions_dirs: list[Path] | None) -> tuple[Path, ...]:
     roots = tuple(sessions_dirs or (Path("./llamatune-sessions"),))
     for root in roots:
@@ -235,30 +284,43 @@ def _matrix_display(value: Any) -> Any:
     return "-" if value is None else value
 
 
+def _matrix_query_cells(payload: dict[str, Any], row: dict[str, Any]) -> tuple[Any, ...]:
+    metrics = row.get("metrics", {})
+    ranking = _matrix_rank_value(payload, row)
+    flags = ("C" if row.get("confirmed") else "-") + ("R" if row.get("replicated") else "-")
+    model = row.get("model_name") or Path(str(row.get("model_path", "-"))).stem
+    if row.get("quant"):
+        model = f"{model} ({row['quant']})"
+    return (
+        row.get("rank", "-"),
+        model,
+        _matrix_config_summary(row.get("config")),
+        _matrix_display(row.get("ctx")),
+        _matrix_display(row.get("depth")),
+        _matrix_display(ranking),
+        _matrix_display(metrics.get("perf.pp")),
+        _matrix_display(metrics.get("perf.tg")),
+        flags,
+        row.get("compat", "unknown"),
+        row.get("evidence_dir", "-"),
+    )
+
+
 def _echo_matrix_query(payload: dict[str, Any]) -> None:
     groups = payload.get("groups", [])
     count = sum(len(group.get("rows", [])) for group in groups)
     if count == 0:
         typer.echo("0 rows")
+    use_table = _stdout_is_tty()
     for group in groups:
         typer.echo(f"hardware: {group.get('hardware_hash', '-')}")
-        typer.echo("rank  model  config  ctx  depth  metric  pp  tg  flags  compat  evidence")
-        for row in group.get("rows", []):
-            metrics = row.get("metrics", {})
-            ranking = _matrix_rank_value(payload, row)
-            flags = ("C" if row.get("confirmed") else "-") + ("R" if row.get("replicated") else "-")
-            model = row.get("model_name") or Path(str(row.get("model_path", "-"))).stem
-            if row.get("quant"):
-                model = f"{model} ({row['quant']})"
-            typer.echo(
-                f"{row.get('rank', '-')}  {model}  "
-                f"{_matrix_config_summary(row.get('config'))}  "
-                f"{_matrix_display(row.get('ctx'))}  {_matrix_display(row.get('depth'))}  "
-                f"{_matrix_display(ranking)}  "
-                f"{_matrix_display(metrics.get('perf.pp'))}  "
-                f"{_matrix_display(metrics.get('perf.tg'))}  "
-                f"{flags}  {row.get('compat', 'unknown')}  {row.get('evidence_dir', '-')}"
-            )
+        rendered = [_matrix_query_cells(payload, row) for row in group.get("rows", [])]
+        if use_table:
+            _render_table(_MATRIX_QUERY_HEADERS, rendered)
+        else:
+            typer.echo(_plain_row(_MATRIX_QUERY_HEADERS))
+            for cells in rendered:
+                typer.echo(_plain_row(cells))
         if group.get("rows"):
             top = group["rows"][0]
             if top.get("kind") == "recommendation":
@@ -329,9 +391,20 @@ def _matrix_show_payload(matrix: Any) -> dict[str, Any]:
 
 @matrix_app.command("build")
 def matrix_build(
-    sessions_dirs: Annotated[list[Path] | None, typer.Option("--sessions-dir")] = None,
-    output: Annotated[Path | None, typer.Option("--output")] = None,
-    json_output: Annotated[bool, typer.Option("--json")] = False,
+    sessions_dirs: Annotated[
+        list[Path] | None,
+        typer.Option("--sessions-dir", help="Sessions root to harvest; repeatable"),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            help="Directory for the results-matrix artifacts [default: <first-root>/matrix]",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print the build summary as JSON on stdout")
+    ] = False,
 ) -> None:
     """Harvest evidence and materialize deterministic matrix artifacts."""
     from llamatune.resultsmatrix import build
@@ -356,24 +429,68 @@ def matrix_build(
 
 @matrix_app.command("query")
 def matrix_query(
-    sessions_dirs: Annotated[list[Path] | None, typer.Option("--sessions-dir")] = None,
-    use_case: Annotated[str | None, typer.Option("--use-case")] = None,
-    sort: Annotated[str | None, typer.Option("--sort")] = None,
-    ascending: Annotated[bool, typer.Option("--ascending")] = False,
-    model: Annotated[str | None, typer.Option("--model")] = None,
-    quant: Annotated[str | None, typer.Option("--quant")] = None,
-    kinds: Annotated[list[str] | None, typer.Option("--kind")] = None,
-    suite: Annotated[str | None, typer.Option("--suite")] = None,
-    ctx: Annotated[int | None, typer.Option("--ctx")] = None,
-    depth: Annotated[int | None, typer.Option("--depth")] = None,
-    min_pp: Annotated[float | None, typer.Option("--min-pp")] = None,
-    min_tg: Annotated[float | None, typer.Option("--min-tg")] = None,
-    confirmed_only: Annotated[bool, typer.Option("--confirmed-only/--include-unconfirmed")] = True,
-    current_only: Annotated[bool, typer.Option("--current-only/--include-superseded")] = True,
-    compat: Annotated[str, typer.Option("--compat")] = "any",
-    llama_bin: Annotated[Path | None, typer.Option("--llama-bin")] = None,
-    limit: Annotated[int, typer.Option("--limit")] = 10,
-    json_output: Annotated[bool, typer.Option("--json")] = False,
+    sessions_dirs: Annotated[
+        list[Path] | None,
+        typer.Option("--sessions-dir", help="Sessions root to harvest; repeatable"),
+    ] = None,
+    use_case: Annotated[
+        str | None,
+        typer.Option("--use-case", help="Rank by a named use case; excludes --sort"),
+    ] = None,
+    sort: Annotated[
+        str | None, typer.Option("--sort", help="Rank by this metric name, descending")
+    ] = None,
+    ascending: Annotated[
+        bool, typer.Option("--ascending", help="Rank ascending instead of descending")
+    ] = False,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Filter by name, path stem, or fingerprint substring"),
+    ] = None,
+    quant: Annotated[
+        str | None, typer.Option("--quant", help="Filter by quantization tag substring")
+    ] = None,
+    kinds: Annotated[
+        list[str] | None, typer.Option("--kind", help="Filter by row kind; repeatable")
+    ] = None,
+    suite: Annotated[str | None, typer.Option("--suite", help="Filter by quality suite id")] = None,
+    ctx: Annotated[int | None, typer.Option("--ctx", help="Minimum validated context size")] = None,
+    depth: Annotated[int | None, typer.Option("--depth", help="Exact KV depth match")] = None,
+    min_pp: Annotated[
+        float | None, typer.Option("--min-pp", help="Minimum prompt-processing throughput")
+    ] = None,
+    min_tg: Annotated[
+        float | None, typer.Option("--min-tg", help="Minimum token-generation throughput")
+    ] = None,
+    confirmed_only: Annotated[
+        bool,
+        typer.Option(
+            "--confirmed-only/--include-unconfirmed",
+            help="Keep only confirmed rows [default: confirmed-only]",
+        ),
+    ] = True,
+    current_only: Annotated[
+        bool,
+        typer.Option(
+            "--current-only/--include-superseded",
+            help="Keep only current rows [default: current-only]",
+        ),
+    ] = True,
+    compat: Annotated[
+        str, typer.Option("--compat", help="Compatibility filter: any or current [default: any]")
+    ] = "any",
+    llama_bin: Annotated[
+        Path | None,
+        typer.Option(
+            "--llama-bin", help="Directory containing llama.cpp binaries for identity probing"
+        ),
+    ] = None,
+    limit: Annotated[
+        int, typer.Option("--limit", help="Maximum ranked rows; 0 means unlimited [default: 10]")
+    ] = 10,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print result rows as JSON on stdout")
+    ] = False,
 ) -> None:
     """Filter and rank freshly harvested matrix rows."""
     if use_case is not None and sort is not None:
@@ -437,8 +554,13 @@ def matrix_query(
 
 @matrix_app.command("show")
 def matrix_show(
-    sessions_dirs: Annotated[list[Path] | None, typer.Option("--sessions-dir")] = None,
-    json_output: Annotated[bool, typer.Option("--json")] = False,
+    sessions_dirs: Annotated[
+        list[Path] | None,
+        typer.Option("--sessions-dir", help="Sessions root to harvest; repeatable"),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print the per-model coverage summary as JSON on stdout")
+    ] = False,
 ) -> None:
     """Show matrix coverage summarized per model."""
     from llamatune.resultsmatrix import harvest
@@ -450,27 +572,41 @@ def matrix_show(
     if not payload["models"]:
         typer.echo("0 rows")
     else:
-        typer.echo("model  kinds  best_pp  best_tg  balanced  max_ctx  quality  newest  stale")
-        for item in payload["models"]:
-            typer.echo(
-                f"{item['model_name'] or item['model_fingerprint']}  "
-                f"{','.join(item['kinds']) or '-'}  "
-                f"{_matrix_display(item['best_pp'])}  "
-                f"{_matrix_display(item['best_tg'])}  "
-                f"{_matrix_display(item['best_balanced'])}  "
-                f"{_matrix_display(item['max_validated_ctx'])}  "
-                f"{','.join(item['quality_suites']) or '-'}  {item['newest_ts']}  "
-                f"{'yes' if item['stale_identity'] else 'no'}"
+        rendered = [
+            (
+                item["model_name"] or item["model_fingerprint"],
+                ",".join(item["kinds"]) or "-",
+                _matrix_display(item["best_pp"]),
+                _matrix_display(item["best_tg"]),
+                _matrix_display(item["best_balanced"]),
+                _matrix_display(item["max_validated_ctx"]),
+                ",".join(item["quality_suites"]) or "-",
+                item["newest_ts"],
+                "yes" if item["stale_identity"] else "no",
             )
+            for item in payload["models"]
+        ]
+        if _stdout_is_tty():
+            _render_table(_MATRIX_SHOW_HEADERS, rendered)
+        else:
+            typer.echo(_plain_row(_MATRIX_SHOW_HEADERS))
+            for cells in rendered:
+                typer.echo(_plain_row(cells))
     for warning in payload["warnings"]:
         typer.echo(f"warning: {warning}", err=True)
 
 
 @matrix_app.command("export")
 def matrix_export(
-    export_format: Annotated[str, typer.Option("--format")],
-    sessions_dirs: Annotated[list[Path] | None, typer.Option("--sessions-dir")] = None,
-    output: Annotated[Path | None, typer.Option("--output")] = None,
+    export_format: Annotated[str, typer.Option("--format", help="Export format: json, csv, or md")],
+    sessions_dirs: Annotated[
+        list[Path] | None,
+        typer.Option("--sessions-dir", help="Sessions root to harvest; repeatable"),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="Write the export to this file instead of stdout"),
+    ] = None,
 ) -> None:
     """Export freshly harvested rows as JSON, CSV, or Markdown."""
     if export_format not in {"json", "csv", "md"}:
@@ -776,29 +912,91 @@ def quality(
         Path | None,
         typer.Argument(help="Path to a GGUF model file", metavar="MODEL"),
     ] = None,
-    llama_bin: Annotated[Path | None, typer.Option("--llama-bin")] = None,
-    sessions_dir: Annotated[Path, typer.Option("--sessions-dir")] = Path("./llamatune-sessions"),
-    config: Annotated[str | None, typer.Option("--config")] = None,
-    config_session: Annotated[Path | None, typer.Option("--config-session")] = None,
-    strict_config: Annotated[bool, typer.Option("--strict-config")] = False,
-    compare_lossless: Annotated[bool, typer.Option("--compare-lossless")] = False,
-    suites: Annotated[list[str] | None, typer.Option("--suite")] = None,
-    task_filters: Annotated[list[str] | None, typer.Option("--tasks")] = None,
-    list_suites: Annotated[bool, typer.Option("--list-suites")] = False,
-    exec_enabled: Annotated[bool, typer.Option("--exec")] = False,
+    llama_bin: Annotated[
+        Path | None, typer.Option("--llama-bin", help="Directory containing llama.cpp binaries")
+    ] = None,
+    sessions_dir: Annotated[
+        Path,
+        typer.Option(
+            "--sessions-dir",
+            help="Parent directory for quality runs [default: ./llamatune-sessions]",
+        ),
+    ] = Path("./llamatune-sessions"),
+    config: Annotated[
+        str | None,
+        typer.Option("--config", help="Evaluated configuration: best or defaults [default: best]"),
+    ] = None,
+    config_session: Annotated[
+        Path | None,
+        typer.Option("--config-session", help="Evaluate the winner recorded in this session"),
+    ] = None,
+    strict_config: Annotated[
+        bool,
+        typer.Option("--strict-config", help="Fail when the best-config lookup misses or is stale"),
+    ] = False,
+    compare_lossless: Annotated[
+        bool,
+        typer.Option(
+            "--compare-lossless",
+            help="Also evaluate the lossless alternate config and report deltas",
+        ),
+    ] = False,
+    suites: Annotated[
+        list[str] | None,
+        typer.Option("--suite", help="Suite name or task-file path; repeatable"),
+    ] = None,
+    task_filters: Annotated[
+        list[str] | None,
+        typer.Option("--tasks", help="Task-id glob filter within selected suites; repeatable"),
+    ] = None,
+    list_suites: Annotated[
+        bool, typer.Option("--list-suites", help="Print bundled suite ids and task counts")
+    ] = False,
+    exec_enabled: Annotated[
+        bool, typer.Option("--exec", help="Enable sandboxed execution of model-generated code")
+    ] = False,
     exec_allow_network: Annotated[
         bool, typer.Option("--exec-allow-network", help="Allow --exec without network isolation")
     ] = False,
-    ctx_size: Annotated[int, typer.Option("--ctx-size")] = 8192,
-    quality_corpus: Annotated[Path | None, typer.Option("--quality-corpus")] = None,
-    reps: Annotated[int, typer.Option("--reps")] = 1,
-    max_tokens: Annotated[int, typer.Option("--max-tokens")] = 1024,
-    request_timeout_s: Annotated[float, typer.Option("--request-timeout")] = 300.0,
-    server_start_timeout_s: Annotated[float, typer.Option("--server-start-timeout")] = 600.0,
-    seed: Annotated[int, typer.Option("--seed")] = 42,
-    resume: Annotated[Path | None, typer.Option("--resume")] = None,
-    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
-    json_output: Annotated[bool, typer.Option("--json")] = False,
+    ctx_size: Annotated[
+        int, typer.Option("--ctx-size", help="Server context window size [default: 8192]")
+    ] = 8192,
+    quality_corpus: Annotated[
+        Path | None,
+        typer.Option(
+            "--quality-corpus",
+            help="Corpus file for the perplexity suite; required when it is selected",
+        ),
+    ] = None,
+    reps: Annotated[
+        int,
+        typer.Option("--reps", help="Repetitions per task; the worst score counts [default: 1]"),
+    ] = 1,
+    max_tokens: Annotated[
+        int, typer.Option("--max-tokens", help="Response token cap per request [default: 1024]")
+    ] = 1024,
+    request_timeout_s: Annotated[
+        float,
+        typer.Option("--request-timeout", help="Per-request timeout in seconds [default: 300]"),
+    ] = 300.0,
+    server_start_timeout_s: Annotated[
+        float,
+        typer.Option(
+            "--server-start-timeout", help="Server readiness timeout in seconds [default: 600]"
+        ),
+    ] = 600.0,
+    seed: Annotated[
+        int, typer.Option("--seed", help="Sampling seed sent with every request [default: 42]")
+    ] = 42,
+    resume: Annotated[
+        Path | None, typer.Option("--resume", help="Continue an interrupted quality run directory")
+    ] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Print the resolved plan without launching a server")
+    ] = False,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print the quality summary as JSON on stdout")
+    ] = False,
 ) -> None:
     """Experimental: evaluate deterministic quality suites for one model/configuration."""
     from llamatune.qualsuites import bundled_suites, load_suite
@@ -1076,7 +1274,11 @@ def tune(
         typer.Option("--batched-trials/--no-batched-trials", help="Batch compatible sweep trials"),
     ] = True,
     ot_search: Annotated[
-        bool, typer.Option("--ot-search", help="Search tensor override placements")
+        bool,
+        typer.Option(
+            "--ot-search",
+            help="Experimental: enable expert tensor-override refinement",
+        ),
     ] = False,
 ) -> None:
     """Find the fastest llama.cpp runtime settings for MODEL."""
@@ -1390,32 +1592,92 @@ def nightshift(
     models_dir: Annotated[
         Path, typer.Argument(help="Directory recursively scanned for GGUF models")
     ],
-    llama_bin: Annotated[Path | None, typer.Option("--llama-bin")] = None,
-    sessions_dir: Annotated[Path, typer.Option("--sessions-dir")] = Path("./llamatune-sessions"),
+    llama_bin: Annotated[
+        Path | None, typer.Option("--llama-bin", help="Directory containing llama.cpp binaries")
+    ] = None,
+    sessions_dir: Annotated[
+        Path,
+        typer.Option(
+            "--sessions-dir",
+            help="Directory for read and created sessions [default: ./llamatune-sessions]",
+        ),
+    ] = Path("./llamatune-sessions"),
     until: Annotated[str | None, typer.Option("--until", help="Local deadline HH:MM")] = None,
-    max_hours: Annotated[float | None, typer.Option("--max-hours")] = None,
+    max_hours: Annotated[
+        float | None, typer.Option("--max-hours", help="Shift duration cap in hours")
+    ] = None,
     profile: Annotated[str, typer.Option("--profile", help="deep or standard")] = "deep",
-    drift_threshold: Annotated[float, typer.Option("--drift-threshold")] = 0.05,
-    calibration_runs: Annotated[int, typer.Option("--calibration-runs")] = 3,
+    drift_threshold: Annotated[
+        float,
+        typer.Option(
+            "--drift-threshold",
+            help="Calibration drift floor for retuning decisions [default: 0.05]",
+        ),
+    ] = 0.05,
+    calibration_runs: Annotated[
+        int,
+        typer.Option(
+            "--calibration-runs", help="Independent invocations per calibration [default: 3]"
+        ),
+    ] = 3,
     duplicates: Annotated[str, typer.Option("--duplicates", help="one or both")] = "one",
-    include: Annotated[list[str] | None, typer.Option("--include")] = None,
-    exclude: Annotated[list[str] | None, typer.Option("--exclude")] = None,
-    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
-    target: Annotated[Target, typer.Option("--target")] = Target.balanced,
-    allow_lossy: Annotated[bool, typer.Option("--allow-lossy")] = False,
+    include: Annotated[
+        list[str] | None,
+        typer.Option("--include", help="Filename glob to keep during discovery; repeatable"),
+    ] = None,
+    exclude: Annotated[
+        list[str] | None,
+        typer.Option("--exclude", help="Filename glob to skip during discovery; repeatable"),
+    ] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Print the shift plan without benchmarking")
+    ] = False,
+    target: Annotated[
+        Target, typer.Option("--target", help="Optimization target for every tune item")
+    ] = Target.balanced,
+    allow_lossy: Annotated[
+        bool,
+        typer.Option("--allow-lossy", help="Experimental: include KV-quantization dimensions"),
+    ] = False,
     ctx_size: Annotated[
         str | None,
         typer.Option("--ctx-size", help="Ascending context sizes to validate (CSV)"),
     ] = None,
-    depth: Annotated[int | None, typer.Option("--depth")] = None,
-    vram_reserve_mb: Annotated[int | None, typer.Option("--vram-reserve-mb")] = None,
-    cooldown_s: Annotated[float | None, typer.Option("--cooldown")] = None,
-    full_hash: Annotated[bool, typer.Option("--full-hash")] = False,
-    budget_trials: Annotated[int | None, typer.Option("--budget-trials")] = None,
-    reps_search: Annotated[int | None, typer.Option("--reps-search")] = None,
-    reps_confirm: Annotated[int | None, typer.Option("--reps-confirm")] = None,
-    baseline_runs: Annotated[int | None, typer.Option("--baseline-runs")] = None,
-    json_output: Annotated[bool, typer.Option("--json")] = False,
+    depth: Annotated[
+        int | None, typer.Option("--depth", help="KV depth used by every tune item")
+    ] = None,
+    vram_reserve_mb: Annotated[
+        int | None, typer.Option("--vram-reserve-mb", help="VRAM safety reserve in MiB")
+    ] = None,
+    cooldown_s: Annotated[
+        float | None, typer.Option("--cooldown", help="Seconds to sleep between invocations")
+    ] = None,
+    full_hash: Annotated[
+        bool, typer.Option("--full-hash", help="Compute the full SHA-256 of each model file")
+    ] = False,
+    budget_trials: Annotated[
+        int | None,
+        typer.Option("--budget-trials", help="Override the profile trial budget per tune item"),
+    ] = None,
+    reps_search: Annotated[
+        int | None,
+        typer.Option("--reps-search", help="Override the llama-bench -r value for search trials"),
+    ] = None,
+    reps_confirm: Annotated[
+        int | None,
+        typer.Option(
+            "--reps-confirm", help="Override the llama-bench -r value for confirmation runs"
+        ),
+    ] = None,
+    baseline_runs: Annotated[
+        int | None,
+        typer.Option(
+            "--baseline-runs", help="Override independent baseline invocations (minimum 3)"
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print the shift summary as JSON on stdout")
+    ] = False,
 ) -> None:
     """Experimental: tune and verify local GGUF models unattended."""
     import re
@@ -1518,34 +1780,115 @@ def nightshift(
 @app.command()
 def marathon(
     model_path: Annotated[Path, typer.Argument(help="GGUF model file")],
-    llama_bin: Annotated[Path | None, typer.Option("--llama-bin")] = None,
-    sessions_dir: Annotated[Path, typer.Option("--sessions-dir")] = Path("./llamatune-sessions"),
+    llama_bin: Annotated[
+        Path | None, typer.Option("--llama-bin", help="Directory containing llama.cpp binaries")
+    ] = None,
+    sessions_dir: Annotated[
+        Path,
+        typer.Option(
+            "--sessions-dir",
+            help="Directory for round sessions and the run [default: ./llamatune-sessions]",
+        ),
+    ] = Path("./llamatune-sessions"),
     until: Annotated[str | None, typer.Option("--until", help="Local deadline HH:MM")] = None,
-    max_hours: Annotated[float | None, typer.Option("--max-hours")] = None,
-    rounds_max: Annotated[int, typer.Option("--rounds-max")] = 6,
-    converge_rounds: Annotated[int, typer.Option("--converge-rounds")] = 2,
-    ab_blocks: Annotated[int, typer.Option("--ab-blocks")] = 5,
-    depth_grid: Annotated[str, typer.Option("--depth-grid")] = "0,8192,32768",
+    max_hours: Annotated[
+        float | None, typer.Option("--max-hours", help="Duration cap in hours")
+    ] = None,
+    rounds_max: Annotated[
+        int, typer.Option("--rounds-max", help="Hard cap on tuning rounds [default: 6]")
+    ] = 6,
+    converge_rounds: Annotated[
+        int,
+        typer.Option(
+            "--converge-rounds",
+            help="No-champion-change rounds required for convergence [default: 2]",
+        ),
+    ] = 2,
+    ab_blocks: Annotated[
+        int,
+        typer.Option("--ab-blocks", help="Interleaved A/B blocks for verification [default: 5]"),
+    ] = 5,
+    depth_grid: Annotated[
+        str,
+        typer.Option(
+            "--depth-grid",
+            help="Ascending distinct KV depths for the matrix (CSV) [default: 0,8192,32768]",
+        ),
+    ] = "0,8192,32768",
     ctx_size: Annotated[
         str | None, typer.Option("--ctx-size", help="Ascending context sizes to validate (CSV)")
     ] = None,
-    matrix_refine: Annotated[bool, typer.Option("--matrix-refine/--no-matrix-refine")] = True,
-    drift_threshold: Annotated[float, typer.Option("--drift-threshold")] = 0.05,
-    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
-    target: Annotated[Target, typer.Option("--target")] = Target.balanced,
-    allow_lossy: Annotated[bool, typer.Option("--allow-lossy")] = False,
-    vram_reserve_mb: Annotated[int | None, typer.Option("--vram-reserve-mb")] = None,
-    cooldown_s: Annotated[float | None, typer.Option("--cooldown")] = None,
-    full_hash: Annotated[bool, typer.Option("--full-hash")] = False,
-    pp: Annotated[int, typer.Option("--pp")] = 512,
-    tg: Annotated[int, typer.Option("--tg")] = 128,
-    quality_corpus: Annotated[Path | None, typer.Option("--quality-corpus")] = None,
-    ot_search: Annotated[bool, typer.Option("--ot-search")] = False,
-    budget_trials: Annotated[int | None, typer.Option("--budget-trials")] = None,
-    reps_search: Annotated[int | None, typer.Option("--reps-search")] = None,
-    reps_confirm: Annotated[int | None, typer.Option("--reps-confirm")] = None,
-    baseline_runs: Annotated[int | None, typer.Option("--baseline-runs")] = None,
-    json_output: Annotated[bool, typer.Option("--json")] = False,
+    matrix_refine: Annotated[
+        bool,
+        typer.Option(
+            "--matrix-refine/--no-matrix-refine",
+            help="Refine candidates inside each matrix cell",
+        ),
+    ] = True,
+    drift_threshold: Annotated[
+        float,
+        typer.Option(
+            "--drift-threshold", help="Bracket drift floor for comparisons [default: 0.05]"
+        ),
+    ] = 0.05,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Print the marathon plan without benchmarking")
+    ] = False,
+    target: Annotated[
+        Target, typer.Option("--target", help="Optimization target for every round")
+    ] = Target.balanced,
+    allow_lossy: Annotated[
+        bool,
+        typer.Option("--allow-lossy", help="Experimental: include KV-quantization dimensions"),
+    ] = False,
+    vram_reserve_mb: Annotated[
+        int | None, typer.Option("--vram-reserve-mb", help="VRAM safety reserve in MiB")
+    ] = None,
+    cooldown_s: Annotated[
+        float | None, typer.Option("--cooldown", help="Seconds to sleep between invocations")
+    ] = None,
+    full_hash: Annotated[
+        bool, typer.Option("--full-hash", help="Compute the full SHA-256 of the model file")
+    ] = False,
+    pp: Annotated[int, typer.Option("--pp", help="Prompt-processing workload size")] = 512,
+    tg: Annotated[int, typer.Option("--tg", help="Token-generation workload size")] = 128,
+    quality_corpus: Annotated[
+        Path | None,
+        typer.Option(
+            "--quality-corpus",
+            help="Experimental: corpus for lossy-KV quality gating",
+        ),
+    ] = None,
+    ot_search: Annotated[
+        bool,
+        typer.Option(
+            "--ot-search",
+            help="Experimental: enable expert tensor-override refinement",
+        ),
+    ] = False,
+    budget_trials: Annotated[
+        int | None,
+        typer.Option("--budget-trials", help="Fix the round-1 trial budget; later rounds escalate"),
+    ] = None,
+    reps_search: Annotated[
+        int | None,
+        typer.Option("--reps-search", help="Override the llama-bench -r value for search trials"),
+    ] = None,
+    reps_confirm: Annotated[
+        int | None,
+        typer.Option(
+            "--reps-confirm", help="Override the llama-bench -r value for confirmation runs"
+        ),
+    ] = None,
+    baseline_runs: Annotated[
+        int | None,
+        typer.Option(
+            "--baseline-runs", help="Override independent baseline invocations (minimum 3)"
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print the marathon summary as JSON on stdout")
+    ] = False,
 ) -> None:
     """Experimental: spend a bounded or convergent window tuning one model."""
     import re
@@ -1666,7 +2009,9 @@ def marathon(
 @app.command("sessions")
 def sessions_cmd(
     sessions_dir: Annotated[Path, typer.Argument(help="Directory containing sessions")],
-    json_output: Annotated[bool, typer.Option("--json")] = False,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print the session list as JSON on stdout")
+    ] = False,
 ) -> None:
     """List complete, in-progress, and corrupt tuning sessions."""
     from llamatune.session import list_sessions
@@ -1674,6 +2019,22 @@ def sessions_cmd(
     rows = list_sessions(sessions_dir)
     if json_output:
         _echo_json(rows)
+        return
+    if _stdout_is_tty():
+        _render_table(
+            _SESSIONS_HEADERS,
+            [
+                (
+                    row["session_dir"],
+                    row.get("model") or "-",
+                    row["status"],
+                    row.get("exit_code"),
+                    row.get("winner_trial_id") or "-",
+                    row.get("confirmed", False),
+                )
+                for row in rows
+            ],
+        )
         return
     for row in rows:
         typer.echo(
@@ -1686,10 +2047,23 @@ def sessions_cmd(
 @app.command("best")
 def best_cmd(
     model_path: Annotated[Path, typer.Argument(help="Path to a GGUF model")],
-    llama_bin: Annotated[Path | None, typer.Option("--llama-bin")] = None,
-    sessions_dir: Annotated[Path, typer.Option("--sessions-dir")] = Path("./llamatune-sessions"),
-    ctx_size: Annotated[int | None, typer.Option("--ctx-size")] = None,
-    json_output: Annotated[bool, typer.Option("--json")] = False,
+    llama_bin: Annotated[
+        Path | None, typer.Option("--llama-bin", help="Directory containing llama.cpp binaries")
+    ] = None,
+    sessions_dir: Annotated[
+        Path,
+        typer.Option(
+            "--sessions-dir",
+            help="Directory containing registry.jsonl [default: ./llamatune-sessions]",
+        ),
+    ] = Path("./llamatune-sessions"),
+    ctx_size: Annotated[
+        int | None,
+        typer.Option("--ctx-size", help="Request a recommendation validated at this context"),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print the lookup result as JSON on stdout")
+    ] = False,
 ) -> None:
     """Look up the best matching confirmed recommendation."""
     from llamatune.config import hardware_signature
@@ -1723,7 +2097,9 @@ def best_cmd(
 @app.command("revalidate")
 def revalidate_cmd(
     session_dir: Annotated[Path, typer.Argument(help="Session directory")],
-    json_output: Annotated[bool, typer.Option("--json")] = False,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print the revalidation analysis as JSON on stdout")
+    ] = False,
 ) -> None:
     """Re-run confirmation for a recorded winner."""
     from llamatune.report import render_revalidation

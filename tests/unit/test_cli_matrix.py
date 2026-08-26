@@ -256,6 +256,96 @@ def test_matrix_human_formatting_helpers_cover_fallbacks() -> None:
     )
 
 
+def test_matrix_query_plain_pipe_output_matches_legacy_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("llamatune.cli._stdout_is_tty", lambda: False)
+    from llamatune.cli import _echo_matrix_query
+
+    payload = {
+        "sort": "perf.tg",
+        "groups": [
+            {
+                "hardware_hash": "first",
+                "rows": [
+                    {
+                        "rank": 1,
+                        "kind": "recommendation",
+                        "model_name": "Model",
+                        "quant": "Q4_K_M",
+                        "config": {"gpu_layers": 12, "flash_attn": True},
+                        "ctx": 8192,
+                        "depth": 0,
+                        "metrics": {"perf.pp": 400.0, "perf.tg": 25.0},
+                        "confirmed": True,
+                        "replicated": True,
+                        "compat": "current",
+                        "evidence_dir": "/evidence/recommendation",
+                    }
+                ],
+            }
+        ],
+        "excluded": {},
+        "warnings": [],
+    }
+
+    _echo_matrix_query(payload)
+    expected = (
+        "hardware: first\n"
+        "rank  model  config  ctx  depth  metric  pp  tg  flags  compat  evidence\n"
+        f"1  Model (Q4_K_M)  ngl=12/ncmoe=-/fa=1/ub=-/b=-/t=-  8192  0  25.0"
+        f"  400.0  25.0  CR  current  /evidence/recommendation\n"
+        f"reproduce: {Path('/evidence/recommendation') / 'recommended.sh'}\n"
+    )
+    assert capsys.readouterr().out == expected
+
+
+def test_matrix_query_tty_output_renders_rich_table(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("llamatune.cli._stdout_is_tty", lambda: True)
+    monkeypatch.setenv("COLUMNS", "200")
+    from llamatune.cli import _echo_matrix_query
+
+    payload = {
+        "sort": "perf.tg",
+        "groups": [
+            {
+                "hardware_hash": "first",
+                "rows": [
+                    {
+                        "rank": 1,
+                        "kind": "recommendation",
+                        "model_name": "Model",
+                        "quant": None,
+                        "config": {},
+                        "ctx": 8192,
+                        "depth": 0,
+                        "metrics": {"perf.pp": 400.0, "perf.tg": 25.0},
+                        "confirmed": False,
+                        "replicated": False,
+                        "compat": "unknown",
+                        "evidence_dir": "/evidence/r",
+                    }
+                ],
+            }
+        ],
+        "excluded": {},
+        "warnings": [],
+    }
+
+    _echo_matrix_query(payload)
+    out = capsys.readouterr().out
+    assert "hardware: first" in out
+    assert "rank" in out
+    assert "1" in out
+    assert "--" in out
+    assert "\u2502" in out
+    assert f"reproduce: {Path('/evidence/r') / 'recommended.sh'}" in out
+
+
 def test_matrix_human_query_renders_rows_groups_and_warnings(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -454,3 +544,35 @@ def test_refresh_is_total_and_reports_failure_via_stderr(
     monkeypatch.setattr("llamatune.resultsmatrix.build", boom)
     refresh(tmp_path)  # must not raise
     assert "warning: results matrix refresh failed: read-only" in capsys.readouterr().err
+
+
+def test_matrix_show_plain_pipe_output_matches_legacy_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_matrix_evidence(tmp_path)
+    monkeypatch.setattr("llamatune.cli._stdout_is_tty", lambda: False)
+
+    result = runner.invoke(app, ["matrix", "show", "--sessions-dir", str(tmp_path)])
+
+    assert result.exit_code == 0
+    lines = result.stdout.splitlines()
+    assert lines[0] == "model  kinds  best_pp  best_tg  balanced  max_ctx  quality  newest  stale"
+    for line in lines[1:]:
+        assert "  " in line
+        assert "\u2502" not in line and "\u250c" not in line
+
+
+def test_matrix_show_tty_output_renders_rich_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_matrix_evidence(tmp_path)
+    monkeypatch.setattr("llamatune.cli._stdout_is_tty", lambda: True)
+    monkeypatch.setenv("COLUMNS", "200")
+
+    result = runner.invoke(app, ["matrix", "show", "--sessions-dir", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "Fixture Q4_K_M" in result.stdout
+    assert "best_pp" in result.stdout
+    assert "best_tg" in result.stdout
+    assert "\u2502" in result.stdout
