@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from typing import Any
 
-from llamatune import recommend
+from llamatune import recommend, report
 from llamatune.types import BaselineResult, LlamaCppReport, MetricStats, ModelReport, TrialConfig
 
 _ALL_CAPS = frozenset({"fa", "mmp", "nkvo", "ctk", "ctv", "ncmoe", "r", "o"})
@@ -369,3 +370,63 @@ class TestRecommendedSh:
             ctx_size=8192,
         )
         assert "-c 8192" in text
+
+    def test_tuned_tb_ot_ts_sm_are_emitted_and_match_export(self) -> None:
+        config = _config(
+            threads_batch=4,
+            ot_spec="exps=CPU",
+            tensor_split=(0.7, 0.3),
+            split_mode="row",
+        )
+        text = recommend.build_recommended_sh(
+            config=config,
+            model=_model(),
+            expected={},
+            confirmed=True,
+            target="balanced",
+            moe=True,
+        )
+        assert "-t 8" in text and "-tb 4" in text
+        assert "-ot exps=CPU" in text
+        assert "-ts 0.7,0.3" in text
+        assert "-sm row" in text
+        # report.runtime_flags precedence: -ot supersedes --n-cpu-moe.
+        assert "--n-cpu-moe" not in text
+
+        recommended = {
+            "target": "balanced",
+            "confirmed": True,
+            "config": config.to_dict(),
+            "model": {"path": str(_model().path)},
+            "expected": {},
+        }
+        meta: dict[str, Any] = {"options": {}}
+        snippet_line = next(
+            line for line in text.splitlines() if line.startswith("# llama-server -m ")
+        )
+        snippet_flags = shlex.split(snippet_line.removeprefix("#"))[3:]
+        expected_flags = [
+            "-ngl",
+            "33",
+            "-b",
+            "2048",
+            "-ub",
+            "512",
+            "-t",
+            "8",
+            "-ot",
+            "exps=CPU",
+            "-tb",
+            "4",
+            "-fa",
+            "on",
+            "-ts",
+            "0.7,0.3",
+            "-sm",
+            "row",
+        ]
+        server_export = shlex.split(
+            report.render_export(recommended, meta, "llama-server").strip()
+        )[3:]
+        cli_export = shlex.split(report.render_export(recommended, meta, "llama-cli").strip())[3:]
+        assert snippet_flags == server_export == cli_export == expected_flags
