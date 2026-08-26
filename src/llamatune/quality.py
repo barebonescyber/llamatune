@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import fnmatch
+import hashlib
 import importlib
 import json
 import math
@@ -16,8 +17,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Self, cast
 
-from llamatune import executor
+# The sandbox module is called through its module object so substitution of
+# ``sandbox.run_python`` / ``sandbox.describe_isolation`` remains possible;
+# only --exec paths touch it at runtime.
+from llamatune import executor, sandbox
 from llamatune._version import __version__
+from llamatune.bench import build_perplexity_argv, parse_perplexity_output
 from llamatune.config import hardware_signature
 from llamatune.evidence import (
     EvidenceWriter,
@@ -34,14 +39,25 @@ from llamatune.evidence import (
 from llamatune.hardware import assess_hardware
 from llamatune.llama import LlamaDiscoveryError, discover_llama
 from llamatune.model import ModelInspectionError, inspect_model
+from llamatune.qualityreport import render as _render_report
+from llamatune.qualscore import (
+    aggregate,
+    combine_repetitions,
+    extract_call,
+    grade_task,
+    replay_agentic,
+)
 from llamatune.qualserver import (
+    REAL_TIMING,
     ServerHandle,
     ServerProtocolError,
     ServerStartError,
     ServerUnavailableError,
+    Timing,
     start,
 )
 from llamatune.qualsuites import SuiteSpec, build_haystack, load_suite
+from llamatune.registry import lookup
 from llamatune.types import (
     HardwareReport,
     LlamaCppReport,
@@ -78,8 +94,6 @@ def _component(value: str) -> str:
         safe = "item"
     if safe == value:
         return safe
-    import hashlib
-
     return f"{safe}-{hashlib.sha256(value.encode()).hexdigest()[:8]}"
 
 
@@ -268,6 +282,27 @@ class _ForcedInterrupt(BaseException):
     pass
 
 
+class _RunTiming:
+    """Virtual-time :class:`Timing` driven by an injected test clock.
+
+    ``monotonic`` reads the injected tick; ``sleep`` advances a virtual offset
+    instead of blocking the real event loop, so readiness polling consumes
+    simulated time deterministically.
+    """
+
+    __slots__ = ("_offset", "_tick")
+
+    def __init__(self, tick: Callable[[], float]) -> None:
+        self._tick = tick
+        self._offset = 0.0
+
+    def monotonic(self) -> float:
+        return self._tick() + self._offset
+
+    def sleep(self, seconds: float) -> None:
+        self._offset += max(0.0, seconds)
+
+
 @dataclass(slots=True)
 class _SignalState:
     count: int = 0
@@ -375,8 +410,6 @@ def _resolve_config(
         )
     if options.config_mode != "best":
         raise ValueError(f"unknown config mode: {options.config_mode}")
-    from llamatune.registry import lookup
-
     result = lookup(
         options.sessions_dir / "registry.jsonl",
         model,
@@ -684,8 +717,6 @@ def _drive_task(
                 messages.append({"role": "assistant", "content": response})
                 turn_number += 1
             elif "tool_result" in step:
-                from llamatune.qualscore import extract_call
-
                 call = extract_call(responses[-1]) if responses else None
                 expected = step.get("expect", {})
                 expected_tool = expected.get("tool") if isinstance(expected, dict) else None
@@ -729,8 +760,6 @@ def _drive_task(
         responses.append(response)
         if suite.kind != "agentic":
             break
-        from llamatune.qualscore import replay_agentic
-
         replay = replay_agentic(task, tuple(responses))
         if replay.get("done"):
             break
@@ -784,11 +813,16 @@ def _record_grade(
     )
 
 
-def _launch(run: QualityRun, argv: tuple[str, ...], timeout_s: float) -> ServerHandle:
+def _launch(
+    run: QualityRun,
+    argv: tuple[str, ...],
+    timeout_s: float,
+    timing: Timing,
+) -> ServerHandle:
     errors: list[str] = []
     for _ in range(2):
         try:
-            return start(run, argv, start_timeout_s=timeout_s)
+            return start(run, argv, start_timeout_s=timeout_s, timing=timing)
         except ServerStartError as exc:
             errors.append(str(exc))
     raise ServerStartError("; ".join(errors))
@@ -801,9 +835,8 @@ def _evaluate_http_side(
     side: str,
     prior: dict[tuple[str, str, int, str], TaskGrade],
     signals: _SignalState,
+    timing: Timing,
 ) -> tuple[tuple[SuiteResult, ...], bool, bool]:
-    from llamatune.qualscore import aggregate, combine_repetitions, grade_task
-
     suites = tuple(suite for suite in resolved.suites if suite.kind != "perplexity")
     if not suites:
         return (), False, False
@@ -826,6 +859,7 @@ def _evaluate_http_side(
                 run,
                 _server_argv(resolved, config),
                 resolved.options.server_start_timeout_s,
+                timing,
             )
             signals.handle = handle
         for suite in suites:
@@ -876,6 +910,7 @@ def _evaluate_http_side(
                                     run,
                                     _server_argv(resolved, config),
                                     resolved.options.server_start_timeout_s,
+                                    timing,
                                 )
                                 signals.handle = handle
                             responses = _drive_task(
@@ -915,6 +950,7 @@ def _evaluate_http_side(
                                     run,
                                     _server_argv(resolved, config),
                                     start_timeout_s=resolved.options.server_start_timeout_s,
+                                    timing=timing,
                                 )
                                 signals.handle = handle
                             except ServerStartError:
@@ -953,10 +989,9 @@ def _evaluate_http_side(
                         handle.stop()
                         handle = None
                         signals.handle = None
-                    from llamatune.sandbox import run_python
 
                     def exec_runner(code: str) -> Any:
-                        return run_python(
+                        return sandbox.run_python(
                             code,
                             timeout_s=resolved.options.request_timeout_s,
                         )
@@ -1043,8 +1078,6 @@ def _perplexity_result(
     if resolved.llama.perplexity_path is None or resolved.options.quality_corpus is None:
         raise RuntimeError("perplexity suite was not fully resolved")
     directory = run.perplexity_dir(side)
-    from llamatune.bench import build_perplexity_argv, parse_perplexity_output
-
     argv = build_perplexity_argv(
         perplexity_path=resolved.llama.perplexity_path,
         model_path=resolved.model.path,
@@ -1208,9 +1241,7 @@ def _phase4(
         warnings.append("lossy cache measurably degrades quality on this machine")
     summary = _summary(run, resolved, evaluated, comparison, warnings, exec_isolation)
     run.write_json("quality.json", summary)
-    from llamatune.qualityreport import render
-
-    run.write_text("quality-report.md", render(summary))
+    run.write_text("quality-report.md", _render_report(summary))
     run.append({"type": "quality_end", "exit_code": exit_code})
     _refresh_matrix(resolved.options.sessions_dir, exit_code)
     return QualityOutcome(run_dir=run.dir, summary=summary, exit_code=exit_code)
@@ -1266,9 +1297,7 @@ def _dry_run(resolved: _Resolved) -> QualityOutcome:
         "warnings": list(resolved.warnings),
     }
     if resolved.options.exec_enabled:
-        from llamatune.sandbox import describe_isolation
-
-        plan["exec_isolation"] = describe_isolation().summary
+        plan["exec_isolation"] = sandbox.describe_isolation().summary
     return QualityOutcome(run_dir=Path(), summary=plan, exit_code=0)
 
 
@@ -1348,9 +1377,7 @@ def _execute(
     warnings = list(resolved.warnings)
     exec_isolation: str | None = None
     if resolved.options.exec_enabled:
-        from llamatune.sandbox import describe_isolation
-
-        report = describe_isolation()
+        report = sandbox.describe_isolation()
         exec_isolation = report.summary
         warnings.extend(report.warnings)
         if report.warnings:
@@ -1363,9 +1390,9 @@ def _execute(
     comparison = None
     harness_error = False
     interrupted = False
-    from llamatune import qualserver as qualserver_module
-
-    previous_clock = qualserver_module._swap_monotonic(now_fn) if now_fn is not None else None
+    timing: Timing = (
+        _RunTiming(cast(Callable[[], float], now_fn)) if now_fn is not None else REAL_TIMING
+    )
     try:
         evaluated, failed, abort = _evaluate_http_side(
             run,
@@ -1374,6 +1401,7 @@ def _execute(
             "evaluated",
             prior,
             signals,
+            timing,
         )
         harness_error |= failed
         if not abort and not signals.stop_requested:
@@ -1389,6 +1417,7 @@ def _execute(
                 "lossless",
                 prior,
                 signals,
+                timing,
             )
             harness_error |= failed
             if not abort:
@@ -1410,8 +1439,6 @@ def _execute(
         warnings.append(str(exc))
         return _phase4(run, resolved, evaluated, comparison, warnings, 3, exec_isolation)
     finally:
-        if previous_clock is not None:
-            qualserver_module._swap_monotonic(previous_clock)
         if signals.handle is not None:
             signals.handle.stop()
             signals.handle = None

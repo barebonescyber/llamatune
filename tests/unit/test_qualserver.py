@@ -31,12 +31,56 @@ def _fake_server_argv() -> tuple[str, ...]:
     return (sys.executable, str(script), "-m", "fixture.gguf", "-c", "1024", "--seed", "7")
 
 
+class _FakeTiming:
+    """Injected :class:`qualserver.Timing` double with optional virtual advance."""
+
+    def __init__(self, *, advance_on_sleep: bool = True) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+        self._advance_on_sleep = advance_on_sleep
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        if self._advance_on_sleep:
+            self.now += seconds
+
+
 def test_endpoint_is_literal_loopback_and_replaces_port() -> None:
-    argv = qualserver._endpoint_argv(("server", "--host", "127.0.0.1", "--port", "0"), 42)
-    assert argv == ("server", "--host", "127.0.0.1", "--port", "42")
+    argv = qualserver._endpoint_argv(
+        (
+            "server",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--api-key",
+            "caller-secret",
+        ),
+        42,
+        "our-key",
+    )
+    assert argv == ("server", "--host", "127.0.0.1", "--port", "42", "--api-key", "our-key")
 
     with pytest.raises(ValueError, match=r"literal 127\.0\.0\.1"):
-        qualserver._endpoint_argv(("server", "--host", "localhost"), 42)
+        qualserver._endpoint_argv(("server", "--host", "localhost"), 42, "k")
+
+    with pytest.raises(ValueError, match=r"--api-key requires a value"):
+        qualserver._endpoint_argv(("server", "--api-key"), 42, "k")
+
+
+def test_redaction_hides_every_api_key_value() -> None:
+    command = ("srv", "--api-key", "a", "x", "--api-key", "b")
+    assert qualserver._redact_api_key(command) == [
+        "srv",
+        "--api-key",
+        qualserver._REDACTED_API_KEY,
+        "x",
+        "--api-key",
+        qualserver._REDACTED_API_KEY,
+    ]
 
 
 def test_real_fake_server_chat_and_idempotent_stop(
@@ -88,11 +132,12 @@ def test_malformed_and_oversized_responses_are_bounded(
         def read1(self, amount: int) -> bytes:
             return b"x" * amount
 
-    # A frozen clock keeps the read well within its deadline so the 8 MiB size
-    # cap — not the wall deadline — is what rejects the oversized body.
-    monkeypatch.setattr(qualserver, "_monotonic", lambda: 0.0)
+    # A frozen injected clock keeps the read well within its deadline so the
+    # 8 MiB size cap — not the wall deadline — is what rejects the body.
     with pytest.raises(qualserver.ServerProtocolError, match="8 MiB"):
-        qualserver._read_bounded_body(None, cast(Any, _OversizedResponse()), deadline=1.0)
+        qualserver._read_bounded_body(
+            None, cast(Any, _OversizedResponse()), deadline=1.0, timing=_FakeTiming()
+        )
 
     stream = io.BytesIO(b"a" * 8192 + b"TAIL")
     capture = qualserver._Capture(stream, 16)
@@ -150,26 +195,124 @@ def test_readiness_uses_injected_clock_without_sleep(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     process = _FakeProcess()
-    clock = [0.0]
-    sleeps: list[float] = []
+    timing = _FakeTiming()
     monkeypatch.setattr(qualserver, "_free_loopback_port", lambda: 12345)
-    monkeypatch.setattr(executor, "_spawn", lambda *args, **kwargs: (process, object()))
-    monkeypatch.setattr(executor, "_terminate_group", lambda proc, control: proc.kill())
-    monkeypatch.setattr(executor, "_close_process_control", lambda control: None)
-    monkeypatch.setattr(qualserver, "_health", lambda port, timeout: False)
-    monkeypatch.setattr(qualserver, "_monotonic", lambda: clock[0])
-
-    def advance(seconds: float) -> None:
-        sleeps.append(seconds)
-        clock[0] += seconds
-
-    monkeypatch.setattr(qualserver, "_sleep", advance)
+    monkeypatch.setattr(executor, "spawn_supervised", lambda *args, **kwargs: (process, object()))
+    monkeypatch.setattr(executor, "terminate_group", lambda proc, control: proc.kill())
+    monkeypatch.setattr(executor, "close_process_control", lambda control: None)
+    monkeypatch.setattr(qualserver, "_health", lambda port, timeout, key, timing: None)
 
     with pytest.raises(qualserver.ServerStartError, match="startup timeout"):
-        qualserver.start(_run(tmp_path), ("server",), start_timeout_s=5.0)
+        qualserver.start(_run(tmp_path), ("server",), start_timeout_s=5.0, timing=timing)
 
-    assert sleeps == [2.0, 2.0, 1.0]
+    assert timing.sleeps == [2.0, 2.0, 1.0]
     assert process.waited
+
+
+def test_start_retries_on_interloper_rejection_then_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A peer that answers /health with 401 burns attempts on fresh ports."""
+    processes = [_FakeProcess() for _ in range(qualserver._MAX_START_ATTEMPTS)]
+    spawned: list[int] = []
+    timing = _FakeTiming()
+    ports = iter(range(20000, 20100))
+
+    def spawn(argv: Any, **kwargs: Any) -> tuple[subprocess.Popen[bytes], object]:
+        del kwargs
+        spawned.append(int(argv[argv.index("--port") + 1]))
+        process = processes[len(spawned) - 1]
+        return cast(subprocess.Popen[bytes], process), object()
+
+    monkeypatch.setattr(qualserver, "_free_loopback_port", lambda: next(ports))
+    monkeypatch.setattr(executor, "spawn_supervised", spawn)
+    monkeypatch.setattr(executor, "terminate_group", lambda proc, control: proc.kill())
+    monkeypatch.setattr(executor, "close_process_control", lambda control: None)
+
+    statuses = iter([401] * qualserver._MAX_START_ATTEMPTS)
+    monkeypatch.setattr(
+        qualserver,
+        "_health",
+        lambda port, timeout, key, timing: next(statuses),
+    )
+
+    run = _run(tmp_path)
+    with pytest.raises(qualserver.ServerStartError, match="credentials"):
+        qualserver.start(run, ("server",), start_timeout_s=30.0, timing=timing)
+
+    assert len(spawned) == qualserver._MAX_START_ATTEMPTS
+    assert len(set(spawned)) == len(spawned)  # every attempt used a fresh port
+    assert all(process.waited for process in processes)  # interlopers reaped between tries
+
+
+def test_start_recovers_from_lost_bind_race_with_fresh_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """First child dies instantly (bind race lost); the second becomes ready."""
+    loser = _FakeProcess()
+    winner = _FakeProcess()
+    spawned: list[list[str]] = []
+    timing = _FakeTiming()
+
+    def spawn(argv: Any, **kwargs: Any) -> tuple[subprocess.Popen[bytes], object]:
+        del kwargs
+        spawned.append([str(part) for part in argv])
+        process = loser if len(spawned) == 1 else winner
+        if len(spawned) == 1:
+            process.returncode = 1  # exited during startup before first poll
+            process.poll = lambda: 1  # type: ignore[method-assign]
+        return cast(subprocess.Popen[bytes], process), object()
+
+    monkeypatch.setattr(qualserver, "_free_loopback_port", lambda: 12345)
+    monkeypatch.setattr(executor, "spawn_supervised", spawn)
+    monkeypatch.setattr(executor, "terminate_group", lambda proc, control: proc.kill())
+    monkeypatch.setattr(executor, "close_process_control", lambda control: None)
+    monkeypatch.setattr(qualserver, "_health", lambda port, timeout, key, timing: 200)
+
+    run = _run(tmp_path)
+    handle = qualserver.start(run, ("server",), start_timeout_s=5.0, timing=timing)
+    try:
+        assert handle.alive
+        assert len(spawned) == 2
+        ready = [entry for entry in run.entries if entry.get("type") == "server_ready"]
+        assert [(entry["launch"], entry["port"]) for entry in ready] == [(1, 12345)]
+    finally:
+        handle.stop()
+
+
+def test_start_evidence_redacts_the_per_launch_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process = _FakeProcess()
+    commands: list[tuple[str, ...]] = []
+    timing = _FakeTiming()
+
+    def spawn(argv: Any, **kwargs: Any) -> tuple[subprocess.Popen[bytes], object]:
+        del kwargs
+        commands.append(tuple(str(part) for part in argv))
+        return cast(subprocess.Popen[bytes], process), object()
+
+    monkeypatch.setattr(qualserver, "_free_loopback_port", lambda: 12345)
+    monkeypatch.setattr(executor, "spawn_supervised", spawn)
+    monkeypatch.setattr(executor, "terminate_group", lambda proc, control: proc.kill())
+    monkeypatch.setattr(executor, "close_process_control", lambda control: None)
+    monkeypatch.setattr(qualserver, "_health", lambda port, timeout, key, timing: 200)
+
+    run = _run(tmp_path)
+    handle = qualserver.start(run, ("server",), start_timeout_s=5.0, timing=timing)
+    handle.stop()
+
+    command_json = json.loads((run.dir / "server" / "1" / "command.json").read_text())
+    journal_argv = next(
+        entry["argv"] for entry in run.entries if entry.get("type") == "server_start"
+    )
+    secret = commands[0][commands[0].index("--api-key") + 1]
+    assert secret and "--api-key" in commands[0]
+    for recorded in (command_json["argv"], journal_argv):
+        assert "--api-key" in recorded
+        assert recorded.index("--api-key") < len(recorded) - 1
+        assert recorded[recorded.index("--api-key") + 1] == qualserver._REDACTED_API_KEY
+        assert secret not in recorded
 
 
 def test_post_spawn_journal_failure_always_reaps_and_closes(
@@ -178,11 +321,11 @@ def test_post_spawn_journal_failure_always_reaps_and_closes(
     process = _FakeProcess()
     closed: list[object] = []
     monkeypatch.setattr(qualserver, "_free_loopback_port", lambda: 12345)
-    monkeypatch.setattr(executor, "_spawn", lambda *args, **kwargs: (process, object()))
-    monkeypatch.setattr(executor, "_terminate_group", lambda proc, control: proc.kill())
+    monkeypatch.setattr(executor, "spawn_supervised", lambda *args, **kwargs: (process, object()))
+    monkeypatch.setattr(executor, "terminate_group", lambda proc, control: proc.kill())
     monkeypatch.setattr(
         executor,
-        "_close_process_control",
+        "close_process_control",
         lambda control: closed.append(control),
     )
     run = _run(tmp_path)
@@ -212,8 +355,8 @@ def test_stop_reaps_after_wait_timeout(tmp_path: Path, monkeypatch: pytest.Monke
     capture_err = qualserver._Capture(io.BytesIO(), 10)
     capture_out.start()
     capture_err.start()
-    monkeypatch.setattr(executor, "_terminate_group", lambda proc, control: None)
-    monkeypatch.setattr(executor, "_close_process_control", lambda control: None)
+    monkeypatch.setattr(executor, "terminate_group", lambda proc, control: None)
+    monkeypatch.setattr(executor, "close_process_control", lambda control: None)
     handle = qualserver.ServerHandle(
         run=_run(tmp_path),
         launch_number=1,
@@ -239,8 +382,8 @@ def test_stop_can_retry_after_interrupted_log_persistence(
     capture_err = qualserver._Capture(io.BytesIO(b"err"), 10)
     capture_out.start()
     capture_err.start()
-    monkeypatch.setattr(executor, "_terminate_group", lambda proc, control: proc.kill())
-    monkeypatch.setattr(executor, "_close_process_control", lambda control: None)
+    monkeypatch.setattr(executor, "terminate_group", lambda proc, control: proc.kill())
+    monkeypatch.setattr(executor, "close_process_control", lambda control: None)
     run = _run(tmp_path)
     original_write = run.write_text
     failures = 0
@@ -273,11 +416,8 @@ def test_stop_can_retry_after_interrupted_log_persistence(
     assert (run.dir / "server" / "1" / "stderr.log").read_text() == "err"
 
 
-def test_body_read_rejects_trickle_and_deadline_is_not_reset(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clock = [0.0]
-    monkeypatch.setattr(qualserver, "_monotonic", lambda: clock[0])
+def test_body_read_rejects_trickle_and_deadline_is_not_reset() -> None:
+    timing = _FakeTiming()
 
     class _Trickle:
         def __init__(self) -> None:
@@ -285,22 +425,21 @@ def test_body_read_rejects_trickle_and_deadline_is_not_reset(
 
         def read1(self, amount: int) -> bytes:
             self.reads += 1
-            clock[0] += 0.05  # each chunk advances the fake wall clock
+            timing.now += 0.05  # each chunk advances the fake wall clock
             return b"x"  # a byte per chunk, forever — never EOF
 
     response = _Trickle()
 
     with pytest.raises(qualserver.ServerUnavailableError, match="deadline"):
-        qualserver._read_bounded_body(None, cast(Any, response), deadline=1.0)
+        qualserver._read_bounded_body(None, cast(Any, response), deadline=1.0, timing=timing)
 
     # The absolute 1 s deadline is not reset by frequent chunks: ~20 chunks of
     # 0.05 s advance the clock past it, far below the 8 MiB size cap.
     assert response.reads == 20
 
 
-def test_body_read_tightens_socket_to_shrinking_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    clock = [0.0]
-    monkeypatch.setattr(qualserver, "_monotonic", lambda: clock[0])
+def test_body_read_tightens_socket_to_shrinking_budget() -> None:
+    timing = _FakeTiming()
 
     class _RecordingSock:
         def __init__(self) -> None:
@@ -314,11 +453,13 @@ def test_body_read_tightens_socket_to_shrinking_budget(monkeypatch: pytest.Monke
             self._chunks = [b"aa", b"bb", b""]
 
         def read1(self, amount: int) -> bytes:
-            clock[0] += 0.25  # each recv consumes wall-clock budget
+            timing.now += 0.25  # each recv consumes wall-clock budget
             return self._chunks.pop(0)
 
     sock = _RecordingSock()
-    body = qualserver._read_bounded_body(cast(Any, sock), cast(Any, _Body()), deadline=2.0)
+    body = qualserver._read_bounded_body(
+        cast(Any, sock), cast(Any, _Body()), deadline=2.0, timing=timing
+    )
 
     assert body == b"aabb"
     # The socket owned by the response is tightened to the decreasing budget
@@ -326,8 +467,8 @@ def test_body_read_tightens_socket_to_shrinking_budget(monkeypatch: pytest.Monke
     assert sock.timeouts == [2.0, 1.75, 1.5]
 
 
-def test_body_read_returns_full_body_within_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(qualserver, "_monotonic", lambda: 0.0)  # frozen: always within deadline
+def test_body_read_returns_full_body_within_deadline() -> None:
+    timing = _FakeTiming()  # frozen: always within deadline
 
     class _Finite:
         def __init__(self, body: bytes) -> None:
@@ -337,7 +478,9 @@ def test_body_read_returns_full_body_within_deadline(monkeypatch: pytest.MonkeyP
             head, self._body = self._body[:amount], self._body[amount:]
             return head
 
-    body = qualserver._read_bounded_body(None, cast(Any, _Finite(b"hello world")), deadline=1.0)
+    body = qualserver._read_bounded_body(
+        None, cast(Any, _Finite(b"hello world")), deadline=1.0, timing=timing
+    )
     assert body == b"hello world"
 
 
@@ -346,9 +489,11 @@ class _DeadlineConnection:
 
     instances: ClassVar[list[_DeadlineConnection]] = []
 
-    def __init__(self, clock: list[float]) -> None:
+    def __init__(self, clock: _FakeTiming) -> None:
         self.sock = None
         self.closed = False
+        self.response: Any = None
+        self.captured_headers: dict[str, str] | None = None
         self._clock = clock
         _DeadlineConnection.instances.append(self)
 
@@ -362,7 +507,8 @@ class _DeadlineConnection:
         body: bytes | None = None,
         headers: dict[str, str] | None = None,
     ) -> None:
-        del method, url, body, headers
+        del method, url, body
+        self.captured_headers = dict(headers or {})
 
     def getresponse(self) -> Any:
         clock = self._clock
@@ -374,44 +520,74 @@ class _DeadlineConnection:
 
 
 class _TricklingResponse:
-    def __init__(self, clock: list[float]) -> None:
+    def __init__(self, clock: _FakeTiming) -> None:
         self.status = 200
         self.closed = False
         self._clock = clock
 
     def read1(self, amount: int) -> bytes:
-        self._clock[0] += 0.5
+        self._clock.now += 0.5
         return b"x"  # trickle forever
 
     def close(self) -> None:
         self.closed = True
 
 
-def _patch_deadline_connection(monkeypatch: pytest.MonkeyPatch, clock: list[float]) -> None:
+def _patch_deadline_connection(monkeypatch: pytest.MonkeyPatch, clock: _FakeTiming) -> None:
     _DeadlineConnection.instances = []
-    monkeypatch.setattr(qualserver, "_monotonic", lambda: clock[0])
     monkeypatch.setattr(
         http.client, "HTTPConnection", lambda *args, **kwargs: _DeadlineConnection(clock)
     )
 
 
 def test_health_rejects_trickling_body_within_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
-    clock = [0.0]
-    _patch_deadline_connection(monkeypatch, clock)
+    timing = _FakeTiming()
+    _patch_deadline_connection(monkeypatch, timing)
 
     # A trickling /health body advances the clock past the 1 s poll budget;
-    # readiness treats it as not-ready instead of blocking indefinitely.
-    assert qualserver._health(12345, 1.0) is False
+    # readiness treats it as not-ready (None) instead of blocking indefinitely.
+    assert qualserver._health(12345, 1.0, "secret", timing) is None
     connection = _DeadlineConnection.instances[-1]
     assert connection.closed is True
     assert connection.response.closed is True  # response-owned socket released
 
 
+def test_health_sends_bearer_key_and_reports_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    timing = _FakeTiming()
+
+    class _FiniteResponse:
+        status = 200
+        closed = False
+
+        def read1(self, amount: int) -> bytes:
+            del amount
+            return b""
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _FiniteConnection(_DeadlineConnection):
+        def __init__(self) -> None:
+            super().__init__(timing)
+
+        def getresponse(self) -> Any:
+            self.response = _FiniteResponse()
+            return self.response
+
+    _DeadlineConnection.instances = []
+    monkeypatch.setattr(http.client, "HTTPConnection", lambda *args, **kwargs: _FiniteConnection())
+
+    assert qualserver._health(12345, 1.0, "secret", timing) == 200
+    connection = _DeadlineConnection.instances[-1]
+    assert connection.captured_headers is not None
+    assert connection.captured_headers["Authorization"] == "Bearer secret"
+
+
 def test_chat_deadline_closes_connection_and_leaves_no_worker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    clock = [0.0]
-    _patch_deadline_connection(monkeypatch, clock)
+    timing = _FakeTiming()
+    _patch_deadline_connection(monkeypatch, timing)
 
     process = _FakeProcess()  # returncode None -> handle.alive is True
     handle = qualserver.ServerHandle(
@@ -423,6 +599,8 @@ def test_chat_deadline_closes_connection_and_leaves_no_worker(
         control=object(),
         stdout_capture=qualserver._Capture(io.BytesIO(), 10),
         stderr_capture=qualserver._Capture(io.BytesIO(), 10),
+        api_key="secret",
+        timing=timing,
     )
     threads_before = threading.active_count()
 
@@ -436,18 +614,17 @@ def test_chat_deadline_closes_connection_and_leaves_no_worker(
 
     connection = _DeadlineConnection.instances[-1]
     assert connection.closed is True
+    assert connection.response.closed is True
+    assert connection.captured_headers is not None
+    assert connection.captured_headers["Authorization"] == "Bearer secret"
     # The Connection: close response owns the socket and cannot be reached via
     # connection.close(); it must be closed explicitly on the deadline path.
-    assert connection.response.closed is True
     assert threading.active_count() == threads_before
 
 
-def test_request_within_deadline_closes_response_on_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clock = [0.0]
-    monkeypatch.setattr(qualserver, "_monotonic", lambda: clock[0])
-    response = _TricklingResponse(clock)
+def test_request_within_deadline_closes_response_on_failure() -> None:
+    timing = _FakeTiming()
+    response = _TricklingResponse(timing)
 
     class _Connection:
         sock = None
@@ -462,7 +639,9 @@ def test_request_within_deadline_closes_response_on_failure(
             return response
 
     with pytest.raises(qualserver.ServerUnavailableError, match="deadline"):
-        qualserver._request_within_deadline(cast(Any, _Connection()), "GET", "/health", 1.0)
+        qualserver._request_within_deadline(
+            cast(Any, _Connection()), "GET", "/health", 1.0, timing=timing
+        )
 
     assert response.closed is True
 

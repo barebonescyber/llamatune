@@ -69,6 +69,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("-m", dest="model")
     parser.add_argument("-c", dest="ctx", type=int)
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--api-key")
     # Accept the complete quality config-to-server flag surface.  These
     # values do not alter fixture behavior, but spelling them out prevents
     # argparse from treating multi-character short options such as ``-ctk``
@@ -106,6 +107,20 @@ def main() -> int:
         def log_message(self, message_format: str, *values: object) -> None:
             del message_format, values
 
+        def _authorized(self) -> bool:
+            if not args.api_key:
+                return True
+            header = self.headers.get("Authorization", "")
+            return header == f"Bearer {args.api_key}"
+
+        def _reject(self) -> None:
+            body = b'{"error":{"message":"Invalid API key"}}'
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def _body(self) -> dict[str, Any] | None:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -118,6 +133,9 @@ def main() -> int:
         def do_GET(self) -> None:
             if self.path != "/health":
                 self.send_error(404)
+                return
+            if not self._authorized():
+                self._reject()
                 return
             if never_ready or time.monotonic() - started < ready_delay:
                 self.send_error(503)
@@ -133,6 +151,9 @@ def main() -> int:
             nonlocal completions
             if self.path != "/v1/chat/completions":
                 self.send_error(404)
+                return
+            if not self._authorized():
+                self._reject()
                 return
             payload = self._body()
             if payload is None:
