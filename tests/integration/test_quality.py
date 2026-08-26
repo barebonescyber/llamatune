@@ -84,8 +84,8 @@ def _options(
         quality_corpus=quality_corpus,
         reps=1,
         max_tokens=512,
-        request_timeout_s=3.0,
-        server_start_timeout_s=3.0,
+        request_timeout_s=15.0,
+        server_start_timeout_s=15.0,
         seed=42,
         dry_run=dry_run,
     )

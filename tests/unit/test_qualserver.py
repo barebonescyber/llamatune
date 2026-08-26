@@ -720,3 +720,19 @@ def test_chat_enforces_hard_deadline_against_connection_close_stall(tmp_path: Pa
     # timeout_s + static-socket-timeout overrun the unbounded read would incur,
     # and comfortably under one second.
     assert elapsed < timeout_s + 0.15
+
+
+def test_new_api_key_never_starts_with_hyphen() -> None:
+    """A leading '-' would be parsed as an option flag, not a key value."""
+    for _ in range(1000):
+        key = qualserver._new_api_key()
+        assert key.startswith("llamatune-")
+        assert not key.startswith("-")
+        assert len(key) > len("llamatune-")
+
+
+def test_endpoint_argv_accepts_leading_hyphen_key() -> None:
+    """Keys that look like flags stay single argv elements after normalization."""
+    command = qualserver._endpoint_argv(("llama-server",), 12345, "llamatune--not-a-flag")
+    index = command.index("--api-key")
+    assert command[index + 1] == "llamatune--not-a-flag"

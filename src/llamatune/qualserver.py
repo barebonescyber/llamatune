@@ -487,6 +487,16 @@ def _await_ready(
     )
 
 
+def _new_api_key() -> str:
+    """Return a random API key that is safe to pass as one argv element.
+
+    The prefix guarantees the first character is never ``-``.  A leading
+    hyphen makes argparse-class parsers read the key as an option flag, which
+    breaks server startup (observed with bare ``secrets.token_urlsafe``).
+    """
+    return "llamatune-" + secrets.token_urlsafe(32)
+
+
 def start(
     run: QualityRun,
     argv: tuple[str, ...],
@@ -515,7 +525,7 @@ def start(
         raise ValueError("start_timeout_s must be positive")
     launch_number = run._allocate_server_launch()
     env = executor.build_child_env()
-    api_key = secrets.token_urlsafe(32)
+    api_key = _new_api_key()
     deadline = timing.monotonic() + start_timeout_s
     attempts = 0
     while True:
