@@ -2841,3 +2841,70 @@ def test_thermal_cooldown_honors_clock_throttle_while_gpu_is_cool(
     assert len(pauses) == 6
     assert all(entry["reason"] == "throttle" for entry in pauses)
     assert pauses[-1]["cap_reached"] is True
+
+
+def test_hill_climb_moe_patience_counts_only_executed_misses_on_resume(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    model = dataclasses.replace(model, moe=True, n_layer=40, ngl_all=41, expert_count=8)
+    incumbent = dataclasses.replace(_envelope_config(20), moe_cpu_layers=10)
+    better_cached = dataclasses.replace(incumbent, moe_cpu_layers=11)
+    worse_cached = dataclasses.replace(incumbent, moe_cpu_layers=13)
+
+    def journal_trial(trial_cfg: TrialConfig, pp: float, tg: float, score: float) -> None:
+        session.append(
+            {
+                "type": "trial",
+                "trial_id": trial_cfg.trial_id,
+                "config": trial_cfg.to_dict(),
+                "status": "ok",
+                "pp_mean": pp,
+                "tg_mean": tg,
+                "score": score,
+                "dim": "joint_refine",
+            }
+        )
+
+    journal_trial(better_cached, 200.0, 40.0, 2.0)
+    journal_trial(worse_cached, 50.0, 10.0, 0.5)
+
+    engine = search._Engine(session, hw, model, llama, options)
+    resume_executed = engine.executed_count
+    baseline_metric = MetricStats(mean=100.0, stdev=0.0, cv=0.0, n=3)
+    tg_metric = MetricStats(mean=20.0, stdev=0.0, cv=0.0, n=3)
+    engine.baseline = BaselineResult(
+        runs=3,
+        pp=baseline_metric,
+        tg=tg_metric,
+        noise_floor_cv=0.01,
+        fallback=None,
+        resolved_defaults=incumbent.to_dict(),
+    )
+    engine._set_incumbent(incumbent, 100.0, 20.0, 1.0)
+
+    executed: list[TrialConfig] = []
+
+    def execute(trial_cfg: TrialConfig, dim: str) -> search._Trial:
+        assert dim == "joint_refine"
+        executed.append(trial_cfg)
+        engine.executed_count += 1
+        if trial_cfg == dataclasses.replace(incumbent, moe_cpu_layers=12):
+            return search._Trial("ok", 400.0, 80.0, 4.0)
+        return search._Trial("ok", 100.0, 20.0, 0.1)
+
+    monkeypatch.setattr(engine, "_execute_trial", execute)
+
+    engine._hill_climb_moe(direction=1)
+
+    assert executed == [
+        dataclasses.replace(incumbent, moe_cpu_layers=12),
+        dataclasses.replace(incumbent, moe_cpu_layers=14),
+    ]
+    assert worse_cached not in executed
+    assert engine.executed_count == resume_executed + 2
+    assert engine.incumbent_config == dataclasses.replace(incumbent, moe_cpu_layers=12)
+    assert engine.incumbent_score == pytest.approx(4.0)
