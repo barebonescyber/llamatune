@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import os
+import signal
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -241,6 +243,52 @@ def test_one_failed_model_does_not_prevent_the_next_model(
     assert [item["outcome"] for item in outcome.summary["items"]] == ["failed", "failed"]
 
 
+def test_circuit_breaker_stop_maps_to_exit_one_not_four(
+    tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_report = inspect_model(tiny_gguf)
+    models = [
+        DiscoveredModel(
+            path=tiny_gguf,
+            report=first_report,
+            shard_paths=(),
+            group_key=None,
+            representative=True,
+        )
+    ]
+    for index in range(2):
+        path = tmp_path / f"extra-{index}.gguf"
+        path.write_bytes(tiny_gguf.read_bytes() + b"x" * (index + 1))
+        report = dataclasses.replace(
+            first_report,
+            path=path,
+            fingerprint=format(index, "064x"),
+            size_bytes=path.stat().st_size,
+        )
+        models.append(
+            DiscoveredModel(
+                path=path, report=report, shard_paths=(), group_key=None, representative=True
+            )
+        )
+    _patch_foundation(monkeypatch, tmp_path, models[0])
+    monkeypatch.setattr(discovery, "discover_models", lambda *_args, **_kwargs: tuple(models))
+    monkeypatch.setattr(
+        search,
+        "run_tuning",
+        lambda session, *_args, **_kwargs: TuneOutcome(
+            session_dir=session.dir, analysis={}, exit_code=3
+        ),
+    )
+    outcome = run_nightshift(_options(tmp_path, tmp_path))
+    assert outcome.exit_code == 1
+    assert [item["outcome"] for item in outcome.summary["items"]] == [
+        "failed",
+        "failed",
+        "failed",
+    ]
+    assert any("circuit breaker" in warning for warning in outcome.summary["warnings"])
+
+
 def test_consistent_calibration_does_not_retune(
     tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -420,6 +468,40 @@ def test_stopped_session_journal_translates_to_nightshift_exit_four(
     outcome = run_nightshift(_options(tmp_path, tmp_path))
     assert outcome.exit_code == 4
     assert outcome.summary["items"][0]["outcome"] == "interrupted"
+
+
+def test_user_signal_with_unfinished_plan_maps_to_exit_four(
+    tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_report = inspect_model(tiny_gguf)
+    second_path = tmp_path / "second.gguf"
+    second_path.write_bytes(tiny_gguf.read_bytes() + b"different")
+    second_report = dataclasses.replace(
+        first_report, path=second_path, fingerprint="f" * 64, size_bytes=second_path.stat().st_size
+    )
+    models = (
+        DiscoveredModel(
+            path=tiny_gguf, report=first_report, shard_paths=(), group_key=None, representative=True
+        ),
+        DiscoveredModel(
+            path=second_path,
+            report=second_report,
+            shard_paths=(),
+            group_key=None,
+            representative=True,
+        ),
+    )
+    _patch_foundation(monkeypatch, tmp_path, models[0])
+    monkeypatch.setattr(discovery, "discover_models", lambda *_args, **_kwargs: models)
+
+    def interrupted(session: Any, *_args: object, **_kwargs: object) -> TuneOutcome:
+        os.kill(os.getpid(), signal.SIGINT)
+        return TuneOutcome(session_dir=session.dir, analysis={}, exit_code=1)
+
+    monkeypatch.setattr(search, "run_tuning", interrupted)
+    outcome = run_nightshift(_options(tmp_path, tmp_path))
+    assert outcome.exit_code == 4
+    assert len(outcome.summary["items"]) == 1
 
 
 def test_identical_deepening_profile_is_skipped(
