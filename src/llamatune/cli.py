@@ -598,7 +598,9 @@ def matrix_show(
 
 @matrix_app.command("export")
 def matrix_export(
-    export_format: Annotated[str, typer.Option("--format", help="Export format: json, csv, or md")],
+    export_format: Annotated[
+        str | None, typer.Option("--format", help="Export format: json, csv, or md")
+    ] = None,
     sessions_dirs: Annotated[
         list[Path] | None,
         typer.Option("--sessions-dir", help="Sessions root to harvest; repeatable"),
@@ -607,9 +609,17 @@ def matrix_export(
         Path | None,
         typer.Option("--output", help="Write the export to this file instead of stdout"),
     ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Alias for --format json")] = False,
 ) -> None:
     """Export freshly harvested rows as JSON, CSV, or Markdown."""
-    if export_format not in {"json", "csv", "md"}:
+    if json_output and export_format is not None:
+        typer.echo("error: pass either --json or --format", err=True)
+        raise typer.Exit(code=2)
+    resolved_format = "json" if json_output else export_format
+    if resolved_format is None:
+        typer.echo("error: one of --format or --json is required", err=True)
+        raise typer.Exit(code=2)
+    if resolved_format not in {"json", "csv", "md"}:
         typer.echo("error: --format must be json, csv, or md", err=True)
         raise typer.Exit(code=2)
     roots = _matrix_roots(sessions_dirs)
@@ -618,7 +628,7 @@ def matrix_export(
     from llamatune.resultsmatrix import harvest
 
     matrix = harvest(roots)
-    if export_format == "json":
+    if resolved_format == "json":
         text = (
             json.dumps(_matrix_document(matrix), indent=2, sort_keys=True, default=_json_default)
             + "\n"
@@ -889,6 +899,7 @@ def scan(
     except LlamaDiscoveryError as exc:
         llama_error = str(exc)
 
+    exit_code = 3 if llama_error is not None else 0
     if json_output:
         payload = {
             "hardware": dataclasses.asdict(hardware),
@@ -896,13 +907,14 @@ def scan(
             "llama_error": llama_error,
         }
         _echo_json(payload)
-        return
+        raise typer.Exit(code=exit_code)
 
     _print_hardware_human(hardware)
     if llama_report is not None:
         _print_llama_human(llama_report)
     else:
         typer.echo(f"llama-bench: NOT FOUND ({llama_error})")
+    raise typer.Exit(code=exit_code)
 
 
 @app.command()
@@ -959,8 +971,12 @@ def quality(
         bool, typer.Option("--exec-allow-network", help="Allow --exec without network isolation")
     ] = False,
     ctx_size: Annotated[
-        int, typer.Option("--ctx-size", help="Server context window size [default: 8192]")
-    ] = 8192,
+        str,
+        typer.Option(
+            "--ctx-size",
+            help="Server context window size; CSV accepted, first value applies [default: 8192]",
+        ),
+    ] = "8192",
     quality_corpus: Annotated[
         Path | None,
         typer.Option(
@@ -997,9 +1013,18 @@ def quality(
     json_output: Annotated[
         bool, typer.Option("--json", help="Print the quality summary as JSON on stdout")
     ] = False,
+    progress: Annotated[
+        ProgressMode, typer.Option("--progress", help="Progress renderer")
+    ] = ProgressMode.auto,
+    tui: Annotated[bool, typer.Option("--tui", help="Force the Rich live dashboard")] = False,
+    quiet: Annotated[bool, typer.Option("--quiet", help="Disable progress output")] = False,
 ) -> None:
     """Experimental: evaluate deterministic quality suites for one model/configuration."""
     from llamatune.qualsuites import bundled_suites, load_suite
+
+    if tui and quiet:
+        typer.echo("error: --tui and --quiet are mutually exclusive", err=True)
+        raise typer.Exit(code=2)
 
     if list_suites:
         try:
@@ -1038,10 +1063,14 @@ def quality(
         ):
             typer.echo("error: --resume is mutually exclusive with new-run options", err=True)
             raise typer.Exit(code=2)
+        effective_progress = (
+            ProgressMode.none if json_output and progress == ProgressMode.auto else progress
+        )
+        reporter = _make_reporter(effective_progress, tui=tui, quiet=quiet)
         from llamatune.quality import resume_quality
 
         try:
-            outcome = resume_quality(resume, llama_bin=llama_bin)
+            outcome = resume_quality(resume, llama_bin=llama_bin, reporter=reporter)
         except ValueError as exc:
             typer.echo(f"error: {exc}", err=True)
             raise typer.Exit(code=2) from exc
@@ -1054,6 +1083,11 @@ def quality(
     if model_path is None:
         typer.echo("error: MODEL is required unless --resume or --list-suites is used", err=True)
         raise typer.Exit(code=2)
+    try:
+        ctx_size_value, _ctx_ladder_value = _parse_ctx_ladder(ctx_size)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from None
     if config not in {None, "best", "defaults"}:
         typer.echo("error: --config must be best or defaults", err=True)
         raise typer.Exit(code=2)
@@ -1063,7 +1097,7 @@ def quality(
     if not 1 <= reps <= 5:
         typer.echo("error: --reps must be between 1 and 5", err=True)
         raise typer.Exit(code=2)
-    if ctx_size <= 0 or max_tokens <= 0:
+    if ctx_size_value is None or ctx_size_value <= 0 or max_tokens <= 0:
         typer.echo("error: --ctx-size and --max-tokens must be positive", err=True)
         raise typer.Exit(code=2)
     if (
@@ -1121,6 +1155,10 @@ def quality(
     from llamatune.quality import run_quality
     from llamatune.types import QualityOptions
 
+    effective_progress = (
+        ProgressMode.none if json_output and progress == ProgressMode.auto else progress
+    )
+    reporter = _make_reporter(effective_progress, tui=tui, quiet=quiet)
     options = QualityOptions(
         model_path=model_path,
         llama_bin=llama_bin,
@@ -1132,7 +1170,7 @@ def quality(
         suites=selected,
         task_filters=tuple(task_filters or ()),
         exec_enabled=exec_enabled,
-        ctx_size=ctx_size,
+        ctx_size=ctx_size_value,
         quality_corpus=quality_corpus,
         reps=reps,
         max_tokens=max_tokens,
@@ -1142,7 +1180,7 @@ def quality(
         dry_run=dry_run,
     )
     try:
-        outcome = run_quality(options)
+        outcome = run_quality(options, reporter=reporter)
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
@@ -1465,7 +1503,7 @@ def tune(
             options=options,
             argv=sys.argv,
         )
-    except (OSError, SessionPathError) as exc:
+    except SessionPathError as exc:
         _emit_startup_failure(
             f"could not create session directory under {sessions_dir}: {exc}",
             exit_code=2,
@@ -1473,6 +1511,14 @@ def tune(
             json_output=json_output,
         )
         raise typer.Exit(code=2) from exc
+    except OSError as exc:
+        _emit_startup_failure(
+            f"could not create session directory under {sessions_dir}: {exc}",
+            exit_code=3,
+            stage="session_creation",
+            json_output=json_output,
+        )
+        raise typer.Exit(code=3) from exc
 
     calibration = None
     calibration_path = sessions_dir / "calibration.json"
@@ -1569,14 +1615,22 @@ def report_cmd(
 
 @app.command("export")
 def export_cmd(
+    ctx: typer.Context,
     session_dir: Annotated[Path, typer.Argument(help="Session directory")],
     export_format: Annotated[
         str, typer.Option("--format", help="llama-server, llama-cli, systemd, llama-swap, or json")
     ] = "llama-server",
+    json_output: Annotated[bool, typer.Option("--json", help="Alias for --format json")] = False,
 ) -> None:
     """Export a confirmed recommendation in a ready-to-use format."""
     from llamatune.report import render_export
 
+    if json_output:
+        source = ctx.get_parameter_source("export_format")
+        if source is not None and source.name == "COMMANDLINE":
+            typer.echo("error: pass either --json or --format", err=True)
+            raise typer.Exit(code=2)
+        export_format = "json"
     try:
         recommended = _load_json(session_dir / "recommended.json")
         session_meta = _load_json(session_dir / "session.json")
@@ -1678,6 +1732,18 @@ def nightshift(
     json_output: Annotated[
         bool, typer.Option("--json", help="Print the shift summary as JSON on stdout")
     ] = False,
+    progress: Annotated[
+        ProgressMode, typer.Option("--progress", help="Progress renderer")
+    ] = ProgressMode.auto,
+    tui: Annotated[bool, typer.Option("--tui", help="Force the Rich live dashboard")] = False,
+    quiet: Annotated[bool, typer.Option("--quiet", help="Disable progress output")] = False,
+    follow_symlinks: Annotated[
+        bool,
+        typer.Option(
+            "--follow-symlinks",
+            help="Follow symlinks when scanning the models directory. [default: False]",
+        ),
+    ] = False,
 ) -> None:
     """Experimental: tune and verify local GGUF models unattended."""
     import re
@@ -1686,6 +1752,8 @@ def nightshift(
     from llamatune.types import NightshiftOptions
 
     error: str | None = None
+    if tui and quiet:
+        error = "--tui and --quiet are mutually exclusive"
     if until is not None:
         match = re.fullmatch(r"(\d{2}):(\d{2})", until)
         if match is None or int(match.group(1)) > 23 or int(match.group(2)) > 59:
@@ -1753,7 +1821,11 @@ def nightshift(
         baseline_runs=baseline_runs,
         depth=depth,
     )
-    outcome = run_nightshift(options)
+    effective_progress = (
+        ProgressMode.none if json_output and progress == ProgressMode.auto else progress
+    )
+    reporter = _make_reporter(effective_progress, tui=tui, quiet=quiet)
+    outcome = run_nightshift(options, reporter=reporter, follow_symlinks=follow_symlinks)
     if json_output:
         _echo_json(outcome.summary)
     else:
@@ -1889,11 +1961,18 @@ def marathon(
     json_output: Annotated[
         bool, typer.Option("--json", help="Print the marathon summary as JSON on stdout")
     ] = False,
+    progress: Annotated[
+        ProgressMode, typer.Option("--progress", help="Progress renderer")
+    ] = ProgressMode.auto,
+    tui: Annotated[bool, typer.Option("--tui", help="Force the Rich live dashboard")] = False,
+    quiet: Annotated[bool, typer.Option("--quiet", help="Disable progress output")] = False,
 ) -> None:
     """Experimental: spend a bounded or convergent window tuning one model."""
     import re
 
     error: str | None = None
+    if tui and quiet:
+        error = "--tui and --quiet are mutually exclusive"
     if until is not None:
         match = re.fullmatch(r"(\d{2}):(\d{2})", until)
         if match is None or int(match.group(1)) > 23 or int(match.group(2)) > 59:
@@ -1985,7 +2064,11 @@ def marathon(
         reps_confirm=reps_confirm,
         baseline_runs=baseline_runs,
     )
-    outcome = run_marathon(options)
+    effective_progress = (
+        ProgressMode.none if json_output and progress == ProgressMode.auto else progress
+    )
+    reporter = _make_reporter(effective_progress, tui=tui, quiet=quiet)
+    outcome = run_marathon(options, reporter=reporter)
     if json_output:
         _echo_json(outcome.summary)
     elif dry_run:
@@ -2008,7 +2091,18 @@ def marathon(
 
 @app.command("sessions")
 def sessions_cmd(
-    sessions_dir: Annotated[Path, typer.Argument(help="Directory containing sessions")],
+    ctx: typer.Context,
+    sessions_dir_arg: Annotated[
+        Path | None,
+        typer.Argument(help="Directory containing sessions (legacy positional form)"),
+    ] = None,
+    sessions_dir: Annotated[
+        Path,
+        typer.Option(
+            "--sessions-dir",
+            help="Directory containing sessions [default: ./llamatune-sessions]",
+        ),
+    ] = Path("./llamatune-sessions"),
     json_output: Annotated[
         bool, typer.Option("--json", help="Print the session list as JSON on stdout")
     ] = False,
@@ -2016,7 +2110,13 @@ def sessions_cmd(
     """List complete, in-progress, and corrupt tuning sessions."""
     from llamatune.session import list_sessions
 
-    rows = list_sessions(sessions_dir)
+    source = ctx.get_parameter_source("sessions_dir")
+    option_given = source is not None and source.name == "COMMANDLINE"
+    if sessions_dir_arg is not None and option_given:
+        typer.echo("error: pass the sessions directory once", err=True)
+        raise typer.Exit(code=2)
+    root = sessions_dir_arg if sessions_dir_arg is not None else sessions_dir
+    rows = list_sessions(root)
     if json_output:
         _echo_json(rows)
         return
@@ -2058,14 +2158,23 @@ def best_cmd(
         ),
     ] = Path("./llamatune-sessions"),
     ctx_size: Annotated[
-        int | None,
-        typer.Option("--ctx-size", help="Request a recommendation validated at this context"),
+        str | None,
+        typer.Option(
+            "--ctx-size",
+            help="Request a recommendation validated at this context; CSV accepted, "
+            "first value applies",
+        ),
     ] = None,
     json_output: Annotated[
         bool, typer.Option("--json", help="Print the lookup result as JSON on stdout")
     ] = False,
 ) -> None:
     """Look up the best matching confirmed recommendation."""
+    try:
+        ctx_size_value, _ctx_ladder_value = _parse_ctx_ladder(ctx_size)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from None
     from llamatune.config import hardware_signature
     from llamatune.hardware import assess_hardware
     from llamatune.llama import LlamaDiscoveryError, discover_llama
@@ -2085,7 +2194,7 @@ def best_cmd(
         model,
         llama,
         hardware_signature(hardware),
-        ctx_size=ctx_size,
+        ctx_size=ctx_size_value,
     )
     if json_output:
         _echo_json(result)
@@ -2133,6 +2242,9 @@ def calibrate_cmd(
     sessions_dir: Annotated[
         Path, typer.Option("--sessions-dir", help="Directory containing sessions")
     ] = Path("./llamatune-sessions"),
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print the calibration result as JSON on stdout")
+    ] = False,
 ) -> None:
     """Experimental: fit VRAM estimator correction factors from observed sessions."""
     try:
@@ -2151,6 +2263,9 @@ def calibrate_cmd(
             err=True,
         )
         raise typer.Exit(code=3) from exc
+    if json_output:
+        _echo_json(result)
+        return
     typer.echo(
         "experimental calibration written: "
         f"samples={result['samples']} weights={result['weights_scale']:.4f} "

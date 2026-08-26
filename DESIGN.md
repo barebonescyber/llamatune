@@ -101,20 +101,38 @@ for machine-readable output on stdout (human text otherwise).
 - `llamatune resume SESSION_DIR [--json] [--progress ...] [--tui] [--quiet]` — re-validates identity, skips
   journaled trials, continues within the recorded budgets.
 - `llamatune report SESSION_DIR` — regenerate `report.md` from evidence.
+- `llamatune nightshift MODELS_DIR [--json] [--progress ...] [--tui] [--quiet]
+  [--follow-symlinks]` and `llamatune marathon MODEL [--json] [--progress ...]
+  [--tui] [--quiet]` accept the same progress trio as `tune`; per-item or
+  per-phase lines go to stderr in plain mode, structured events in JSON mode,
+  and nothing when quiet. `--follow-symlinks` opts Night Shift's model
+  discovery into following symbolic directories (default: skip them).
 - `export`, `sessions`, `best`, `revalidate`, and `calibrate` provide runtime
   export, registry lookup/reconfirmation, and advisory estimator calibration.
+  `sessions` takes `--sessions-dir` (default `./llamatune-sessions`); the
+  legacy positional path still works. Passing both forms is an error.
+  `calibrate --json`, `export --json`, and `matrix export --json` emit JSON on
+  stdout; on the exports, `--json` is an alias of `--format json` and the two
+  options are mutually exclusive. `quality` and `best` accept `--ctx-size` as
+  a CSV list like `tune` and apply its first value.
 
 Exit codes: `0` success with a confirmed improvement (or scan/report
-success); `1` tuning completed but no confirmed improvement over defaults,
-or the nightshift circuit breaker stopped the shift after repeated tune
-failures (evidence and a defaults-recommendation are still written); `2`
-usage or configuration error; `3` environment error (missing/unusable
-llama-bench, unreadable model); `4` interrupted by a user signal mid-run;
-the session stays resumable.
+success); `1` completed with a valid negative result — per command:
+`tune`/`resume` finished but no confirmed improvement over defaults;
+`nightshift` stopped by its circuit breaker after repeated tune failures
+(evidence and defaults recommendations are still written); `marathon`
+round failures or an unreplicated final champion; `quality` harness task
+errors; `best` no matching current record for the request; `2` usage or
+configuration error; `3` environment error — missing/unusable llama-bench,
+unreadable model, session directory that cannot be created (for example no
+space), or a `scan` whose llama.cpp toolchain probe failed; `4` interrupted
+by a user signal mid-run; the session stays resumable.
 
 An exit-3 tuning outcome is rendered as `tuning did not start`, with its
 failure stage, reason, and session evidence path. It is never described as a
-completed search with no confirmed improvement.
+completed search with no confirmed improvement. `scan` prints its hardware
+report plus `llama-bench: NOT FOUND` (or the same shape under `--json`) and
+exits 3 so scripts can distinguish a missing toolchain from success.
 
 For `tune`, `resume`, and `revalidate`, a `--json` failure before a result
 analysis exists emits an object with `status: "failed"`, `exit_code`,

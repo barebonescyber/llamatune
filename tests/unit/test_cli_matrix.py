@@ -576,3 +576,42 @@ def test_matrix_show_tty_output_renders_rich_table(
     assert "best_pp" in result.stdout
     assert "best_tg" in result.stdout
     assert "\u2502" in result.stdout
+
+
+def test_matrix_export_json_alias_matches_format_json(tmp_path: Path) -> None:
+    write_matrix_evidence(tmp_path)
+
+    aliased = runner.invoke(app, ["matrix", "export", "--sessions-dir", str(tmp_path), "--json"])
+    assert aliased.exit_code == 0
+    assert json.loads(aliased.stdout)["row_count"] > 0
+
+    explicit = runner.invoke(
+        app, ["matrix", "export", "--sessions-dir", str(tmp_path), "--format", "json"]
+    )
+    assert explicit.exit_code == 0
+    assert json.loads(explicit.stdout) == json.loads(aliased.stdout)
+
+
+def test_matrix_export_rejects_json_with_explicit_format(tmp_path: Path) -> None:
+    write_matrix_evidence(tmp_path)
+    result = runner.invoke(
+        app, ["matrix", "export", "--sessions-dir", str(tmp_path), "--json", "--format", "csv"]
+    )
+    assert result.exit_code == 2
+    assert "pass either --json or --format" in result.stderr
+
+
+def test_matrix_export_without_format_or_json_exits_2(tmp_path: Path) -> None:
+    write_matrix_evidence(tmp_path)
+    result = runner.invoke(app, ["matrix", "export", "--sessions-dir", str(tmp_path)])
+    assert result.exit_code == 2
+    assert "one of --format or --json is required" in result.stderr
+
+
+def test_matrix_export_invalid_format_still_exits_2(tmp_path: Path) -> None:
+    write_matrix_evidence(tmp_path)
+    result = runner.invoke(
+        app, ["matrix", "export", "--sessions-dir", str(tmp_path), "--format", "yaml"]
+    )
+    assert result.exit_code == 2
+    assert "--format must be json, csv, or md" in result.stderr

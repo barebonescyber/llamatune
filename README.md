@@ -391,9 +391,13 @@ and confirmation—not only final trial records.
 ### List sessions
 
 ```bash
-uv run llamatune sessions ./llamatune-sessions
-uv run llamatune sessions ./llamatune-sessions --json
+uv run llamatune sessions --sessions-dir ./llamatune-sessions
+uv run llamatune sessions --sessions-dir ./llamatune-sessions --json
 ```
+
+`--sessions-dir` defaults to `./llamatune-sessions`. The older positional form
+(`llamatune sessions ./llamatune-sessions`) still works; pass the directory
+only once.
 
 ### Regenerate a report
 
@@ -411,6 +415,9 @@ uv run llamatune export ./llamatune-sessions/SESSION_DIRECTORY --format llama-sw
 uv run llamatune export ./llamatune-sessions/SESSION_DIRECTORY --format json
 ```
 
+`--json` is an alias of `--format json`. Pass either `--json` or `--format`, not both.
+Without either, the export defaults to `--format llama-server`.
+
 ### Look up the best compatible result
 
 ```bash
@@ -421,7 +428,8 @@ uv run llamatune best /path/to/model.gguf \
 ```
 
 The lookup checks the model, hardware, llama.cpp identity, and requested context. An older
-or undersized result is reported as stale instead of being returned as current.
+or undersized result is reported as stale instead of being returned as current. Like
+`tune` and `quality`, `--ctx-size` accepts a comma-separated list and uses its first value.
 
 ### Revalidate and calibrate
 
@@ -436,6 +444,8 @@ Fit conservative VRAM correction factors from completed sessions:
 ```bash
 uv run llamatune calibrate --sessions-dir ./llamatune-sessions
 ```
+
+Add `--json` to print the fitted correction factors as JSON on stdout.
 
 Calibration is experimental during the initial public beta. It writes `calibration.json`;
 later searches load it automatically when valid.
@@ -481,6 +491,12 @@ uv run llamatune nightshift ./models \
 - `--include` and `--exclude` filter model names.
 - `--duplicates one|both` controls duplicate-layout handling.
 - `--drift-threshold` and `--calibration-runs` control revalidation/calibration behavior.
+- `--follow-symlinks` follows symbolic directories while scanning the models directory.
+  By default symlinks pointing outside the tree are skipped. [default: False]
+- `--progress auto|plain|rich|json`, `--tui`, and `--quiet` work like `tune`. Plain mode
+  prints one concise line per work item to stderr, for example
+  `[nightshift] item 2/7 tune Qwen3-4B`; quiet suppresses it; JSON mode emits structured
+  events on stderr only, keeping stdout pure.
 - Spare-time deepening runs at most once per eligible model and is skipped when explicit
   overrides make its resolved profile identical to the initial tune.
 
@@ -508,6 +524,10 @@ or `--rounds-max` is reached, so it is never unbounded. Night Shift distributes 
 across a model directory, while Marathon spends the window exhaustively on one model.
 Use `--dry-run` to inspect the resolved work without benchmarking.
 
+Marathon accepts `--progress auto|plain|rich|json`, `--tui`, and `--quiet` like `tune`.
+Plain mode prints phase and round lines to stderr, for example `[marathon] round 2/6
+budget=360`; quiet suppresses them.
+
 Each run writes `marathon.json` and `marathon-report.md` beneath
 `SESSION_DIR/marathon/<model-and-run-id>/`; ordinary tuning-round evidence remains in the
 top-level sessions directory.
@@ -525,6 +545,9 @@ uv run llamatune matrix show --sessions-dir ./llamatune-sessions
 uv run llamatune matrix query --sessions-dir ./llamatune-sessions --use-case max-tg
 uv run llamatune matrix export --sessions-dir ./llamatune-sessions --format csv
 ```
+
+On `matrix export`, `--json` is an alias of `--format json`; pass one of `--format` or
+`--json`. Unlike the session `export` command, `matrix export` has no default format.
 
 To select a result compatible with the machine and llama.cpp build being used now, probe
 that build and request only current matches:
@@ -571,6 +594,12 @@ falls back to llama.cpp defaults; `--strict-config` rejects that fallback.
 KV-cache recommendation, add `--compare-lossless` to run the evaluated and lossless
 configurations serially and report per-suite deltas. Select `perplexity` only with a local
 `--quality-corpus PATH`.
+
+Quality runs accept `--progress auto|plain|rich|json`, `--tui`, and `--quiet` like `tune`.
+In plain mode each started task prints one concise line to stderr, for example
+`[quality] evaluated task 3/20 clamp (coding@1+abc)`; quiet suppresses these lines and
+JSON mode keeps stdout clean. `--ctx-size` accepts a comma-separated list like `tune`;
+the first value sets the server context window.
 
 ### `quality --exec` trust boundary
 
@@ -648,13 +677,15 @@ Session evidence is designed to be auditable and resumable; avoid editing it man
 | Code | Meaning |
 |---:|---|
 | `0` | Confirmed improvement, or successful non-tuning command |
-| `1` | Tuning completed but no improvement was confirmed over measured defaults, or the nightshift circuit breaker stopped the shift |
+| `1` | Valid negative result; per command: `tune`/`resume` no improvement confirmed over measured defaults, `nightshift` circuit breaker stopped the shift, `marathon` round failures or an unreplicated champion, `quality` harness task errors, `best` no matching current record |
 | `2` | Usage or configuration error |
-| `3` | Environment/model/baseline error; tuning could not start or complete normally |
+| `3` | Environment/model/baseline error: tuning could not start or complete normally, session storage is unwritable (for example full disk), or `scan` found no usable llama.cpp toolchain |
 | `4` | Interrupted by a user signal mid-run; rerun the command to resume |
 
 Exit code `1` is a valid result: defaults were optimal within measured noise, and the
-session still contains recommendation and evidence files.
+session still contains recommendation and evidence files. Exit code `3` from `scan`
+keeps printing the hardware report and the `llama-bench: NOT FOUND` line (or the same
+shape under `--json`) so scripts can detect a missing toolchain.
 
 ## Troubleshooting
 
