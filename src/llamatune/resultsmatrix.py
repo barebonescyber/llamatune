@@ -3,22 +3,28 @@
 from __future__ import annotations
 
 import hashlib
-import importlib
 import json
 import os
 import re
 import tempfile
 import warnings
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import typer
 
 from llamatune.config import hardware_signature
 from llamatune.evidence import PathEscapeError, confined_path, read_journal_lines
-from llamatune.types import GPUInfo, HardwareReport, ResultRow, ResultsMatrix, TrialConfig
+from llamatune.types import (
+    GPUInfo,
+    HardwareReport,
+    MatrixBuildSummary,
+    ResultRow,
+    ResultsMatrix,
+    TrialConfig,
+)
 
 _SCHEMA_VERSION = 1
 REFRESH_EXIT_CODES = frozenset({0, 1, 4})
@@ -630,7 +636,7 @@ def _reference_config(root: Path, calibration: dict[str, Any]) -> TrialConfig | 
         return None
     try:
         analysis = _json(reference_path / "analysis.json")
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return None
     winner = analysis.get("winner")
     return _config(winner.get("config")) if isinstance(winner, dict) else None
@@ -891,7 +897,7 @@ def _harvest(
                     continue
                 try:
                     produced = reader(root, path)
-                except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+                except (OSError, ValueError, TypeError, KeyError) as exc:
                     warnings.append(f"{path}: {exc}")
                     continue
                 rows.extend(produced)
@@ -948,7 +954,7 @@ def _atomic_text(output_dir: Path, name: str, content: str) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def build(roots: tuple[Path, ...], output_dir: Path) -> dict[str, Any]:
+def build(roots: tuple[Path, ...], output_dir: Path) -> MatrixBuildSummary:
     """Harvest roots and atomically materialize the JSON and Markdown artifacts.
 
     When a previous artifact with a current-version source cache exists in
@@ -972,15 +978,9 @@ def build(roots: tuple[Path, ...], output_dir: Path) -> dict[str, Any]:
         raise OSError(f"matrix output is not a directory: {output_dir}")
     if any((output_dir / marker).exists() for marker in ("session.json", "run.json")):
         raise ValueError(f"matrix output cannot be a session or run directory: {output_dir}")
-    try:
-        module = importlib.import_module("llamatune.matrixreport")
-        renderer = cast(
-            Callable[[ResultsMatrix], str],
-            module.render_markdown,
-        )
-        markdown = renderer(matrix)
-    except ImportError:
-        markdown = f"# Results Matrix\n\nRows: {len(matrix.rows)}\n"
+    from llamatune.matrixreport import render_markdown
+
+    markdown = render_markdown(matrix)
     document = _document(matrix)
     document["source_cache"] = {"version": _CACHE_VERSION, "sources": cache}
     _atomic_text(
@@ -992,15 +992,15 @@ def build(roots: tuple[Path, ...], output_dir: Path) -> dict[str, Any]:
     kinds: dict[str, int] = {}
     for row in matrix.rows:
         kinds[row.kind] = kinds.get(row.kind, 0) + 1
-    return {
-        "output": str(output_dir.resolve()),
-        "rows": len(matrix.rows),
-        "current_rows": sum(row.current for row in matrix.rows),
-        "models": len({row.model_fingerprint for row in matrix.rows}),
-        "roots": [str(root) for root in matrix.roots],
-        "kinds": dict(sorted(kinds.items())),
-        "warnings": list(matrix.warnings),
-    }
+    return MatrixBuildSummary(
+        output=str(output_dir.resolve()),
+        rows=len(matrix.rows),
+        current_rows=sum(row.current for row in matrix.rows),
+        models=len({row.model_fingerprint for row in matrix.rows}),
+        roots=[str(root) for root in matrix.roots],
+        kinds=dict(sorted(kinds.items())),
+        warnings=list(matrix.warnings),
+    )
 
 
 def _artifact_roots(artifact: Path) -> tuple[Path, ...]:
@@ -1023,7 +1023,10 @@ def _refresh_roots(root: Path) -> tuple[Path, ...]:
         return (resolved,)
     try:
         configured = _artifact_roots(artifact)
-    except Exception as exc:
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        # Legacy matrix artifacts may be malformed; fall back to the owner
+        # root. Anything outside these parse/error types is a programming
+        # error and is caught by refresh()'s best-effort guard instead.
         typer.echo(
             f"warning: existing results matrix configuration ignored; "
             f"refreshing only {resolved}: {exc}",
@@ -1039,7 +1042,9 @@ def refresh(root: Path) -> None:
     resolved = root.resolve()
     try:
         build(_refresh_roots(resolved), resolved / "matrix")
-    except Exception as exc:  # refresh must never alter the owning command's outcome
+    except Exception as exc:
+        # Broad by design: this runs in a terminal-command epilogue, so it
+        # must never alter the owning command's outcome.
         typer.echo(f"warning: results matrix refresh failed: {exc}", err=True)
 
 

@@ -279,7 +279,7 @@ def build_registry(sessions_dir: Path, *, ctx_size: int | None = None) -> dict[s
             if not _completed(entries, session_dir / "analysis.json"):
                 continue
             record = _record(session_dir, entries)
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, TypeError, KeyError) as exc:
             warnings.warn(
                 f"skipping corrupt session {session_dir}: {exc}",
                 RuntimeWarning,
@@ -312,7 +312,7 @@ def absorb_session(
         if not _completed(entries, session_dir / "analysis.json"):
             return False
         record = _record(session_dir, entries)
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, TypeError, KeyError) as exc:
         warnings.warn(
             f"skipping corrupt session {session_dir}: {exc}",
             RuntimeWarning,
@@ -337,7 +337,7 @@ def incomplete_sessions(sessions_dir: Path) -> tuple[Path, ...]:
             entries = _journal(session_dir / "journal.jsonl")
             if not _completed(entries, session_dir / "analysis.json"):
                 candidates.append((str(session["created"]), session_dir))
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, TypeError, KeyError) as exc:
             warnings.warn(
                 f"skipping corrupt session {session_dir}: {exc}",
                 RuntimeWarning,

@@ -728,3 +728,30 @@ def test_marathon_threads_reporter_into_tuning_calls(
 
     assert outcome.exit_code == 1
     assert seen and seen[0] is reporter
+
+
+def test_startup_model_inspection_failure_still_exits_three(
+    tmp_path: Path,
+) -> None:
+    """Expected discovery/hardware failures keep the exit-3 error summary."""
+    opts = replace(options(tmp_path), dry_run=False, model_path=tmp_path / "missing.gguf")
+
+    outcome = run_marathon(opts, now_fn=AdvancingClock())
+
+    assert outcome.exit_code == 3
+    assert outcome.summary["schema_version"] == 1
+    assert "error" in outcome.summary
+
+
+def test_unexpected_startup_exception_propagates_to_internal_error_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A programming error at startup must not become a silent exit 3 (#11)."""
+    opts = replace(options(tmp_path), dry_run=False)
+    monkeypatch.setattr(
+        "llamatune.llama.discover_llama",
+        lambda _path: (_ for _ in ()).throw(KeyError("capabilities")),
+    )
+
+    with pytest.raises(KeyError):
+        run_marathon(opts, now_fn=AdvancingClock())

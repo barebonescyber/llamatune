@@ -3418,3 +3418,93 @@ def test_hill_climb_moe_patience_counts_only_executed_misses_on_resume(
     assert engine.executed_count == resume_executed + 2
     assert engine.incumbent_config == dataclasses.replace(incumbent, moe_cpu_layers=12)
     assert engine.incumbent_score == pytest.approx(4.0)
+
+
+class TestEngineEmitContract:
+    """Focused tests for the reporter-failure policy on ``_Engine._emit``."""
+
+    @staticmethod
+    def _engine(tmp_path: Path, reporter: Any) -> search._Engine:
+        hardware = HardwareReport(
+            os_name="Linux",
+            arch="x86_64",
+            cpu_model="c",
+            physical_cores=2,
+            logical_cores=2,
+            perf_cores=None,
+            ram_mb=1024,
+            gpus=(),
+            warnings=(),
+        )
+        model = ModelReport(
+            path=tmp_path / "m.gguf",
+            size_bytes=8,
+            architecture="llama",
+            n_layer=1,
+            ngl_all=0,
+            expert_count=0,
+            moe=False,
+            name="m",
+            fingerprint="ab" * 32,
+            full_sha256=None,
+        )
+        llama = LlamaCppReport(
+            bench_path=tmp_path / "llama-bench",
+            cli_path=None,
+            server_path=None,
+            capabilities=frozenset(),
+            help_sha256="h" * 64,
+            build_commit=None,
+            build_number=None,
+        )
+        options = TuneOptions(
+            target="balanced",
+            budget_trials=2,
+            budget_minutes=None,
+            reps_search=1,
+            reps_confirm=1,
+            baseline_runs=3,
+            pp=512,
+            tg=128,
+            allow_lossy=False,
+            cooldown_s=0.0,
+            baseline_only=True,
+            llama_bin=tmp_path / "llama-bench",
+            sessions_dir=tmp_path / "sessions",
+            full_hash=False,
+        )
+        session = Session.create(
+            tmp_path / "sessions",
+            model=model,
+            hardware=hardware,
+            llama=llama,
+            options=options,
+            argv=["llamatune", "tune"],
+        )
+        return search._Engine(session, hardware, model, llama, options, reporter=reporter)
+
+    def test_expected_reporter_failures_degrade_then_disable(self, tmp_path: Path) -> None:
+        class FailingReporter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def emit(self, event: Any) -> None:
+                self.calls += 1
+                raise ValueError(f"boom {self.calls}")
+
+        engine = self._engine(tmp_path, FailingReporter())
+        engine._emit("stage", stage="one")
+        engine._emit("stage", stage="two")
+        assert engine.reporter is not None
+        assert any("progress reporter failed" in warning for warning in engine.extra_warnings)
+        engine._emit("stage", stage="three")
+        assert engine.reporter is None
+
+    def test_unexpected_reporter_exception_propagates(self, tmp_path: Path) -> None:
+        class BrokenReporter:
+            def emit(self, event: Any) -> None:
+                raise KeyError("payload")
+
+        engine = self._engine(tmp_path, BrokenReporter())
+        with pytest.raises(KeyError):
+            engine._emit("stage", stage="one")

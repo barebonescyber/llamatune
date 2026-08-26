@@ -25,7 +25,14 @@ import typer
 from llamatune._version import __version__
 
 if TYPE_CHECKING:
-    from llamatune.types import HardwareReport, LlamaCppReport, TuneOutcome
+    from llamatune.types import (
+        HardwareReport,
+        LlamaCppReport,
+        QualityOutcome,
+        Reporter,
+        ResultsMatrix,
+        TuneOutcome,
+    )
 
 app = typer.Typer(
     name="llamatune",
@@ -124,7 +131,7 @@ class ProgressMode(StrEnum):
     none = "none"
 
 
-def _make_reporter(mode: ProgressMode, *, tui: bool, quiet: bool) -> Any:
+def _make_reporter(mode: ProgressMode, *, tui: bool, quiet: bool) -> Reporter | None:
     """Resolve display aliases and lazily construct the progress reporter."""
     if tui and quiet:
         typer.echo("error: --tui and --quiet are mutually exclusive", err=True)
@@ -227,7 +234,7 @@ def _matrix_identity(llama_bin: Path) -> tuple[str, str]:
     return hardware_hash, discriminator
 
 
-def _matrix_document(matrix: Any) -> dict[str, Any]:
+def _matrix_document(matrix: ResultsMatrix) -> dict[str, Any]:
     return {
         "schema_version": matrix.schema_version,
         "generated": matrix.generated,
@@ -332,7 +339,7 @@ def _echo_matrix_query(payload: dict[str, Any]) -> None:
         typer.echo(f"warning: {warning}", err=True)
 
 
-def _matrix_show_payload(matrix: Any) -> dict[str, Any]:
+def _matrix_show_payload(matrix: ResultsMatrix) -> dict[str, Any]:
     models: dict[str, dict[str, Any]] = {}
     for row in matrix.rows:
         item = models.setdefault(
@@ -827,7 +834,7 @@ def _verbose_resume_diagnostics(session_dir: Path) -> None:
     ui.emit_diagnostic(f"session: {session_dir}")
     try:
         report = _load_json(session_dir / "llamacpp.json")
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return
     bench = report.get("bench_path")
     if isinstance(bench, str) and bench:
@@ -845,7 +852,7 @@ def _quality_exec_supported() -> bool:
     return True
 
 
-def _emit_quality_outcome(outcome: Any, *, json_output: bool) -> None:
+def _emit_quality_outcome(outcome: QualityOutcome, *, json_output: bool) -> None:
     if json_output:
         _echo_json(outcome.summary)
         return
@@ -1449,7 +1456,7 @@ def tune(
         try:
             if calibration_path.is_file():
                 calibration = VramCalibration(**_load_json(calibration_path))
-        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        except (OSError, TypeError, ValueError) as exc:
             typer.echo(f"warning: ignoring calibration file: {exc}", err=True)
         incumbent = TrialConfig(
             gpu_layers=min(
@@ -1527,7 +1534,7 @@ def tune(
             from llamatune.types import VramCalibration
 
             calibration = VramCalibration(**_load_json(calibration_path))
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, TypeError, ValueError) as exc:
         typer.echo(f"warning: ignoring calibration file: {exc}", err=True)
 
     outcome = run_tuning(
@@ -1600,7 +1607,6 @@ def report_cmd(
         KeyError,
         TypeError,
         AttributeError,
-        json.JSONDecodeError,
         SessionCorruptionError,
         SessionPathError,
     ) as exc:
@@ -1635,7 +1641,7 @@ def export_cmd(
         recommended = _load_json(session_dir / "recommended.json")
         session_meta = _load_json(session_dir / "session.json")
         text = render_export(recommended, session_meta, export_format)
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, KeyError, TypeError, ValueError) as exc:
         typer.echo(f"error: could not export recommendation: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     typer.echo(text, nl=False)

@@ -305,7 +305,7 @@ def calibrate(sessions_dir: Path) -> dict[str, Any]:
                 actual = float(observed.get("observed_used_delta_mb") or 0.0)
                 if estimated > 0 and actual > 0:
                     ratios.append(actual / estimated)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            except (OSError, ValueError, TypeError):
                 continue
     scale = statistics.median(ratios) if len(ratios) >= 3 else 1.0
     result = {

@@ -403,7 +403,7 @@ def list_sessions(sessions_dir: Path) -> list[dict[str, Any]]:
                 else:
                     row["exit_code"] = found.get("exit_code") if found is not None else None
                 row["status"] = "complete"
-        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, KeyError, TypeError):
             row["status"] = "corrupt"
         rows.append(row)
     return rows
