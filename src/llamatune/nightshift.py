@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import warnings
 from collections.abc import Callable, Mapping, Sequence
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from llamatune._version import __version__
+from llamatune.bench import BenchParseError
 from llamatune.calibrate import run_calibration
 from llamatune.evidence import (
     EvidenceWriter,
@@ -31,6 +33,7 @@ from llamatune.evidence import (
 from llamatune.evidence import (
     utc_iso as _utc_iso,
 )
+from llamatune.llama import LlamaDiscoveryError
 from llamatune.sanitize import strip_control_chars
 from llamatune.session import JournalTailIncomplete, scan_journal_tail
 from llamatune.types import (
@@ -38,18 +41,33 @@ from llamatune.types import (
     DiscoveredModel,
     HardwareReport,
     LlamaCppReport,
+    NightshiftContentGroup,
+    NightshiftItemSummary,
     NightshiftOptions,
     NightshiftOutcome,
+    NightshiftSummary,
+    NightshiftWindow,
     RegistryRecord,
     Reporter,
     TuneOptions,
     WorkItem,
 )
 
+logger = logging.getLogger(__name__)
+
 MIN_TUNE_MINUTES = 20.0
 SHUTDOWN_MARGIN_MIN = 5.0
 _CALIBRATION_FALLBACK_S = 300.0
 _CALIBRATION_SAFETY_FACTOR = 1.5
+
+# Operational failures an item execution is expected to raise (DESIGN exit
+# codes 2/3 surfaces): filesystem, child-process capture, benchmark parsing,
+# and path-confinement errors. They record outcome='failed' and feed the
+# tune-failure circuit breaker exactly as before (issue #11). Anything else
+# -- including KeyError/TypeError from evidence lookups -- is a programming
+# error: it propagates to run_nightshift's shutdown handler, which logs it
+# via logging.exception, marks the shift failed, and finalizes evidence.
+_EXPECTED_ITEM_ERRORS = (OSError, RuntimeError, ValueError, BenchParseError, PathEscapeError)
 
 _PROFILES: dict[str, dict[str, float | int]] = {
     "standard": {
@@ -110,8 +128,8 @@ class NightshiftRun(EvidenceWriter):
                 "created": _utc_iso(),
             },
         )
-        run.write_json("hardware.json", cast(dict[str, Any], _jsonable(hardware)))
-        run.write_json("llamacpp.json", cast(dict[str, Any], _jsonable(llama)))
+        run.write_json("hardware.json", _jsonable_record(hardware))
+        run.write_json("llamacpp.json", _jsonable_record(llama))
         run.append({"type": "nightshift_start", "tool_version": __version__})
         return run
 
@@ -276,7 +294,7 @@ def _session_fingerprint(path: Path) -> str | None:
     try:
         payload = json.loads((path / "model.json").read_text(encoding="utf-8"))
         return str(payload["fingerprint"])
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    except (OSError, KeyError, TypeError, ValueError):
         return None
 
 
@@ -327,8 +345,23 @@ def _tune_options(
     )
 
 
-def _item_dict(item: WorkItem) -> dict[str, Any]:
-    return cast(dict[str, Any], _jsonable(item))
+def _jsonable_record(value: Any) -> dict[str, Any]:
+    """Project one dataclass/evidence object to a JSON-safe mapping."""
+    return cast(dict[str, Any], _jsonable(value))
+
+
+def _item_fields(item: WorkItem) -> NightshiftItemSummary:
+    """Project one planned item into a record with its identity fields."""
+    return {
+        "kind": item.kind,
+        "model_path": str(item.model_path) if item.model_path is not None else None,
+        "fingerprint": item.fingerprint,
+        "reference_fingerprint": item.reference_fingerprint,
+        "reason": item.reason,
+        "session_dir": str(item.session_dir) if item.session_dir is not None else None,
+        "estimated_minutes": item.estimated_minutes,
+        "depth_workload": item.depth_workload,
+    }
 
 
 def _announce_item(reporter: Reporter | None, index: int, total: int, item: WorkItem) -> None:
@@ -394,7 +427,7 @@ def tune_failure_breaker(history: Sequence[str]) -> bool:
     return len(history) >= 3 and len(set(history[-3:])) == 3
 
 
-def _summary_counts(items: Sequence[dict[str, Any]]) -> dict[str, int]:
+def _summary_counts(items: Sequence[NightshiftItemSummary]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for item in items:
         key = f"{item.get('kind', 'unknown')}:{item.get('outcome', 'unknown')}"
@@ -402,7 +435,7 @@ def _summary_counts(items: Sequence[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
-def _total_invocations(items: Sequence[dict[str, Any]]) -> int:
+def _total_invocations(items: Sequence[NightshiftItemSummary]) -> int:
     total = 0
     for item in items:
         calibration = item.get("calibration")
@@ -423,19 +456,19 @@ def _total_invocations(items: Sequence[dict[str, Any]]) -> int:
     return total
 
 
-def _content_groups(models: Sequence[DiscoveredModel]) -> list[dict[str, Any]]:
+def _content_groups(models: Sequence[DiscoveredModel]) -> list[NightshiftContentGroup]:
     grouped: dict[str, list[DiscoveredModel]] = {}
     for model in models:
         if model.group_key is not None:
             grouped.setdefault(model.group_key, []).append(model)
     return [
-        {
-            "group_key": key,
-            "representative": str(
+        NightshiftContentGroup(
+            group_key=key,
+            representative=str(
                 next((model.path for model in members if model.representative), members[0].path)
             ),
-            "members": [str(model.path) for model in members],
-        }
+            members=[str(model.path) for model in members],
+        )
         for key, members in sorted(grouped.items())
     ]
 
@@ -445,7 +478,7 @@ def _finalize(
     options: NightshiftOptions,
     start: datetime,
     deadline: datetime | None,
-    items: list[dict[str, Any]],
+    items: list[NightshiftItemSummary],
     warning_messages: list[str],
     exit_code: int,
     *,
@@ -458,20 +491,21 @@ def _finalize(
     if interrupt_state is not None:
         for signum, immediate in interrupt_state.drain_events():
             run.append({"type": "interrupted", "signal": signum, "immediate": immediate})
-    summary: dict[str, Any] = {
+    window = NightshiftWindow(
+        started=start.isoformat(),
+        ended=_utc_iso(),
+        deadline=deadline.isoformat() if deadline else None,
+        outcome="interrupted" if stopped else "completed",
+    )
+    summary: NightshiftSummary = {
         "schema_version": 1,
-        "options": _jsonable(options),
-        "window": {
-            "started": start.isoformat(),
-            "ended": _utc_iso(),
-            "deadline": deadline.isoformat() if deadline else None,
-            "outcome": "interrupted" if stopped else "completed",
-        },
+        "options": _jsonable_record(options),
+        "window": window,
         "items": items,
         "counts": _summary_counts(items),
         "total_invocations": _total_invocations(items),
-        "hardware": _jsonable(hardware),
-        "llamacpp": _jsonable(llama),
+        "hardware": _jsonable_record(hardware),
+        "llamacpp": _jsonable_record(llama),
         "content_groups": _content_groups(models),
         "warnings": warning_messages,
         "exit_code": exit_code,
@@ -481,18 +515,18 @@ def _finalize(
         },
     }
     run.append({"type": "nightshift_end", "exit_code": exit_code, "stopped": stopped})
-    run.write_json("nightshift.json", summary)
+    run.write_json("nightshift.json", dict(summary))
     from llamatune.nightreport import render
 
-    run.write_text("nightshift-report.md", render(summary))
-    return NightshiftOutcome(run_dir=run.dir, summary=summary, exit_code=exit_code)
+    run.write_text("nightshift-report.md", render(dict(summary)))
+    return NightshiftOutcome(run_dir=run.dir, summary=dict(summary), exit_code=exit_code)
 
 
 @dataclass
 class _ShiftState:
     """Mutable scheduling state threaded explicitly through Night Shift phases."""
 
-    items: list[dict[str, Any]] = field(default_factory=list)
+    items: list[NightshiftItemSummary] = field(default_factory=list)
     warning_messages: list[str] = field(default_factory=list)
     failed: bool = False
     tune_failure_models: list[str] = field(default_factory=list)
@@ -510,8 +544,12 @@ def _journal_interrupts(run: NightshiftRun, state: InterruptState) -> None:
         run.append({"type": "interrupted", "signal": signum, "immediate": immediate})
 
 
-def _deferred_item(item: WorkItem, reason: str) -> dict[str, Any]:
-    return {**_item_dict(item), "outcome": "deferred", "reason": reason, "wall_s": 0.0}
+def _deferred_item(item: WorkItem, reason: str) -> NightshiftItemSummary:
+    record = _item_fields(item)
+    record["outcome"] = "deferred"
+    record["reason"] = reason
+    record["wall_s"] = 0.0
+    return record
 
 
 def _startup_evidence(
@@ -521,29 +559,20 @@ def _startup_evidence(
 
     Returns the reports plus accumulated startup error messages; a non-empty
     message list means the shift must end immediately with exit code 3.
+    Hardware assessment is best-effort by contract and never raises, so it is
+    not guarded: an exception there is a programming error and propagates to
+    the CLI internal-error guard instead of masquerading as a data failure
+    (issue #11). llama.cpp discovery has a real failure type and keeps its
+    degradation path unchanged.
     """
     from llamatune.hardware import assess_hardware
     from llamatune.llama import discover_llama
 
     startup_errors: list[str] = []
-    try:
-        hardware = assess_hardware()
-    except Exception as exc:
-        startup_errors.append(f"hardware assessment failed: {exc}")
-        hardware = HardwareReport(
-            os_name="unknown",
-            arch="unknown",
-            cpu_model="unknown",
-            physical_cores=1,
-            logical_cores=1,
-            perf_cores=None,
-            ram_mb=0,
-            gpus=(),
-            warnings=tuple(startup_errors),
-        )
+    hardware = assess_hardware()
     try:
         llama = discover_llama(options.llama_bin)
-    except Exception as exc:
+    except (LlamaDiscoveryError, OSError, RuntimeError) as exc:
         startup_errors.append(f"llama.cpp discovery failed: {exc}")
         llama = LlamaCppReport(
             bench_path=options.llama_bin or Path("llama-bench"),
@@ -593,15 +622,18 @@ def _run_calibrate_item(
     reference: RegistryRecord,
     llama: LlamaCppReport,
     options: NightshiftOptions,
-) -> tuple[dict[str, Any], WorkItem | None]:
+) -> tuple[NightshiftItemSummary, WorkItem | None]:
     """Calibrate one model against its reference; maybe enqueue a retune.
 
     Returns the result record (without ``wall_s``) and an optional retune item
-    the caller must queue and journal.
+    the caller must queue and journal. Expected operational failures record
+    calibration verdict 'error' exactly as before (including retune enqueue);
+    an unexpected exception propagates to the shift shutdown handler instead
+    of being recorded as a model failure (issue #11).
     """
     try:
         calibration = run_calibration(run, reference, model.report, llama, options)
-    except Exception as exc:
+    except _EXPECTED_ITEM_ERRORS as exc:
         calibration = CalibrationResult(
             fingerprint=model.report.fingerprint,
             reference_session=reference.session_dir,
@@ -620,11 +652,9 @@ def _run_calibrate_item(
             artifact_dir=None,
         )
     state.calibrated_fingerprints.add(model.report.fingerprint)
-    result_record = {
-        **_item_dict(item),
-        "outcome": calibration.verdict,
-        "calibration": _jsonable(calibration),
-    }
+    result_record = _item_fields(item)
+    result_record["outcome"] = calibration.verdict
+    result_record["calibration"] = _jsonable_record(calibration)
     retune: WorkItem | None = None
     if calibration.verdict in {"drift", "error"}:
         retune = WorkItem(
@@ -653,11 +683,15 @@ def _run_tune_class_item(
     reporter: Reporter | None,
     remaining: float | None,
     interrupt_state: InterruptState,
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[WorkItem]]:
+) -> tuple[NightshiftItemSummary, list[NightshiftItemSummary], list[WorkItem]]:
     """Resume or tune one model item with per-item error recovery.
 
     Returns the result record (without ``wall_s``), deferred sibling records
     journaled after this item ends, and transfer calibrations to enqueue.
+    Expected operational failures record outcome='failed' and feed the
+    tune-failure circuit breaker; any other exception propagates so the
+    shift shutdown handler can log it and finalize evidence without feeding
+    the breaker (issue #11).
     """
     from llamatune.hardware import assess_hardware
     from llamatune.registry import absorb_session
@@ -665,13 +699,26 @@ def _run_tune_class_item(
     from llamatune.session import Session
 
     session_dir = item.session_dir
+    # Explicit missing-key handling (#11): a plan item whose fingerprint is
+    # absent from the discovery map is a scheduling invariant violation, not
+    # a model failure; it produces an 'error' record and never feeds the
+    # circuit breaker.
+    tune_model = by_fingerprint.get(item.fingerprint or "") if item.kind != "resume" else None
+    if item.kind != "resume" and tune_model is None:
+        message = (
+            f"plan invariant violated: no discovered model for fingerprint {item.fingerprint!r}"
+        )
+        logger.error(message)
+        record = _item_fields(item)
+        record["outcome"] = "error"
+        record["error"] = message
+        return record, [], []
     try:
         if item.kind == "resume":
             if session_dir is None:
                 raise ValueError("resume item has no session directory")
             outcome = resume_tuning(session_dir, reporter=reporter)
-        else:
-            model = by_fingerprint[item.fingerprint or ""]
+        elif tune_model is not None:
             current_hardware = assess_hardware()
             tune_options = _tune_options(
                 options,
@@ -682,7 +729,7 @@ def _run_tune_class_item(
             )
             session = Session.create(
                 options.sessions_dir,
-                model=model.report,
+                model=tune_model.report,
                 hardware=current_hardware,
                 llama=llama,
                 options=tune_options,
@@ -692,36 +739,38 @@ def _run_tune_class_item(
             outcome = run_tuning(
                 session,
                 current_hardware,
-                model.report,
+                tune_model.report,
                 llama,
                 tune_options,
                 reporter=reporter,
             )
-        result_record = {
-            **_item_dict(item),
-            "session_dir": str(session_dir),
-            "outcome": ("succeeded" if outcome.exit_code in {0, 1} else "failed"),
-            "tune_exit_code": outcome.exit_code,
-        }
-    except Exception as exc:
-        result_record = {
-            **_item_dict(item),
-            "session_dir": str(session_dir) if session_dir else None,
-            "outcome": "failed",
-            "error": str(exc),
-        }
+        else:  # pragma: no cover - non-resume items always resolve tune_model
+            raise RuntimeError("tune-class item lost its discovered model")
+        result_record = _item_fields(item)
+        result_record["session_dir"] = str(session_dir)
+        result_record["outcome"] = "succeeded" if outcome.exit_code in {0, 1} else "failed"
+        result_record["tune_exit_code"] = outcome.exit_code
+    except _EXPECTED_ITEM_ERRORS as exc:
+        result_record = _item_fields(item)
+        result_record["session_dir"] = str(session_dir) if session_dir else None
+        result_record["outcome"] = "failed"
+        result_record["error"] = str(exc)
     if session_dir is not None and _interrupted_session(session_dir):
         interrupt_state.stop_requested = True
         result_record["outcome"] = "interrupted"
-    post_item_records: list[dict[str, Any]] = []
+    post_item_records: list[NightshiftItemSummary] = []
     transfers: list[WorkItem] = []
     if result_record["outcome"] == "failed":
         state.failed = True
         fingerprint = item.fingerprint or str(item.model_path)
         if not state.tune_failure_models or state.tune_failure_models[-1] != fingerprint:
             state.tune_failure_models.append(fingerprint)
-        if item.kind == "tune" and item.fingerprint:
-            representative = by_fingerprint[item.fingerprint]
+        representative = (
+            by_fingerprint.get(item.fingerprint or "")
+            if item.kind == "tune" and item.fingerprint
+            else None
+        )
+        if representative is not None:
             for sibling in models:
                 if (
                     sibling.representative
@@ -730,16 +779,20 @@ def _run_tune_class_item(
                 ):
                     continue
                 post_item_records.append(
-                    {
-                        "kind": "calibrate",
-                        "model_path": str(sibling.path),
-                        "fingerprint": sibling.report.fingerprint,
-                        "reference_fingerprint": item.fingerprint,
-                        "outcome": "deferred",
-                        "reason": "representative tune failed",
-                        "wall_s": 0.0,
-                    }
+                    NightshiftItemSummary(
+                        kind="calibrate",
+                        model_path=str(sibling.path),
+                        fingerprint=sibling.report.fingerprint,
+                        reference_fingerprint=item.fingerprint,
+                        reason="representative tune failed",
+                        outcome="deferred",
+                        wall_s=0.0,
+                    )
                 )
+    elif result_record["outcome"] == "error":
+        # Unexpected internal failure: mark the shift failed but never feed
+        # the tune-failure circuit breaker with programming errors (#11).
+        state.failed = True
     else:
         state.tune_failure_models.clear()
         if item.fingerprint:
@@ -748,12 +801,11 @@ def _run_tune_class_item(
             # Fold the just-finished session into the registry incrementally;
             # a full rescan is unnecessary under strictly serial scheduling.
             absorb_session(records, session_dir, ctx_size=options.ctx_size)
-        if item.kind == "tune" and item.fingerprint in records:
-            representative = by_fingerprint[item.fingerprint]
+        if item.kind == "tune" and item.fingerprint in records and tune_model is not None:
             for sibling in models:
                 if (
                     sibling.representative
-                    or sibling.group_key != representative.group_key
+                    or sibling.group_key != tune_model.group_key
                     or sibling.report.fingerprint in records
                     or sibling.report.fingerprint in state.calibrated_fingerprints
                 ):
@@ -783,8 +835,12 @@ def _run_deepen_candidate(
     llama: LlamaCppReport,
     remaining: float | None,
     clock: Callable[[], datetime],
-) -> tuple[dict[str, Any], bool]:
-    """Execute one spare-time deepen item; returns (record, interrupted)."""
+) -> tuple[NightshiftItemSummary, bool]:
+    """Execute one spare-time deepen item; returns (record, interrupted).
+
+    Expected operational failures record outcome='failed' exactly as before;
+    any other exception propagates to the shift shutdown handler (issue #11).
+    """
     from llamatune.hardware import assess_hardware
     from llamatune.search import run_tuning
     from llamatune.session import Session
@@ -812,26 +868,22 @@ def _run_deepen_candidate(
             tune_options,
         )
         interrupted = _interrupted_session(session.dir)
-        result_record = {
-            **_item_dict(item),
-            "session_dir": str(session.dir),
-            "outcome": (
-                "interrupted"
-                if interrupted
-                else "succeeded"
-                if outcome.exit_code in {0, 1}
-                else "failed"
-            ),
-            "tune_exit_code": outcome.exit_code,
-        }
-    except Exception as exc:
+        result_record = _item_fields(item)
+        result_record["session_dir"] = str(session.dir)
+        result_record["outcome"] = (
+            "interrupted"
+            if interrupted
+            else "succeeded"
+            if outcome.exit_code in {0, 1}
+            else "failed"
+        )
+        result_record["tune_exit_code"] = outcome.exit_code
+    except _EXPECTED_ITEM_ERRORS as exc:
         interrupted = False
-        result_record = {
-            **_item_dict(item),
-            "session_dir": (str(deepen_session_dir) if deepen_session_dir else None),
-            "outcome": "failed",
-            "error": str(exc),
-        }
+        result_record = _item_fields(item)
+        result_record["session_dir"] = str(deepen_session_dir) if deepen_session_dir else None
+        result_record["outcome"] = "failed"
+        result_record["error"] = str(exc)
     result_record["wall_s"] = max(0.0, (clock() - item_started).total_seconds())
     return result_record, interrupted
 
@@ -871,7 +923,7 @@ def _run_deepening(
         )
         state.phase_queues["retune"].append(item)
         state.total_items += 1
-        run.append({"type": "item_start", **_item_dict(item)})
+        run.append({"type": "item_start", **_item_fields(item)})
         state.started_items += 1
         _announce_item(reporter, state.started_items, state.total_items, item)
         result_record, interrupted = _run_deepen_candidate(
@@ -881,6 +933,14 @@ def _run_deepening(
         run.append({"type": "item_end", **result_record})
         if interrupted:
             interrupt_state.stop_requested = True
+            break
+        if result_record["outcome"] == "error":
+            # Unexpected internal failure (#11): mark the shift failed, keep
+            # the breaker history untouched, and abort spare-time work.
+            state.failed = True
+            state.warning_messages.append(
+                "internal error during deepening; spare-time work aborted"
+            )
             break
         if result_record["outcome"] == "failed":
             state.failed = True
@@ -961,23 +1021,45 @@ def _run_plan_phases(
                 state.items.append(record)
                 run.append({"type": "deferred", **record})
                 continue
-            run.append({"type": "item_start", **_item_dict(item)})
+            run.append({"type": "item_start", **_item_fields(item)})
             state.started_items += 1
             _announce_item(reporter, state.started_items, state.total_items, item)
             item_started = clock()
-            result_record: dict[str, Any]
-            post_item_records: list[dict[str, Any]] = []
+            result_record: NightshiftItemSummary
+            post_item_records: list[NightshiftItemSummary] = []
+            retune: WorkItem | None = None
+            transfers: list[WorkItem] = []
             if item.kind == "calibrate":
-                model = by_fingerprint[item.fingerprint or ""]
-                reference = records[item.reference_fingerprint or ""]
-                result_record, retune = _run_calibrate_item(
-                    run, state, item, model=model, reference=reference, llama=llama, options=options
-                )
+                # Explicit missing-key handling (#11): a calibration item whose
+                # model or reference record is missing from the evidence
+                # snapshot is a plan invariant violation, not a model failure.
+                calib_model = by_fingerprint.get(item.fingerprint or "")
+                calib_reference = records.get(item.reference_fingerprint or "")
+                if calib_model is None or calib_reference is None:
+                    message = (
+                        "plan invariant violated: calibration item references "
+                        f"missing {'model' if calib_model is None else 'record'} "
+                        f"for {item.fingerprint!r}"
+                    )
+                    logger.error(message)
+                    result_record = _item_fields(item)
+                    result_record["outcome"] = "error"
+                    result_record["error"] = message
+                else:
+                    result_record, retune = _run_calibrate_item(
+                        run,
+                        state,
+                        item,
+                        model=calib_model,
+                        reference=calib_reference,
+                        llama=llama,
+                        options=options,
+                    )
                 run.append({"type": "calibration", **result_record})
                 if retune is not None:
                     state.phase_queues["retune"].append(retune)
                     state.total_items += 1
-                    run.append({"type": "retune_enqueued", **_item_dict(retune)})
+                    run.append({"type": "retune_enqueued", **_item_fields(retune)})
                 if result_record["outcome"] == "error":
                     state.failed = True
             else:
@@ -1056,10 +1138,10 @@ def run_nightshift(
     plan = build_initial_plan(
         models, records, incomplete, calibration_runs=options.calibration_runs
     )
-    plan_payload = {"schema_version": 1, "items": [_item_dict(item) for item in plan]}
+    plan_payload = {"schema_version": 1, "items": [_item_fields(item) for item in plan]}
     run.write_json("plan.json", plan_payload)
     run.append({"type": "plan", "items": plan_payload["items"]})
-    items: list[dict[str, Any]] = []
+    items: list[NightshiftItemSummary] = []
     if not models:
         warning_messages.append("no GGUF model survived discovery and filters")
         return _finalize(
@@ -1075,7 +1157,11 @@ def run_nightshift(
             models=models,
         )
     if options.dry_run:
-        items.extend({**_item_dict(item), "outcome": "planned", "wall_s": 0.0} for item in plan)
+        for plan_item in plan:
+            record = _item_fields(plan_item)
+            record["outcome"] = "planned"
+            record["wall_s"] = 0.0
+            items.append(record)
         return _finalize(
             run,
             options,
@@ -1139,6 +1225,12 @@ def run_nightshift(
         except KeyboardInterrupt:
             interrupt_state.stop_requested = True
             interrupt_state.second_signal = True
+        # No broad handler here (issue #11): expected item failures are
+        # narrowed at each helper and recorded as 'failed'; fingerprint
+        # invariant violations are recorded as 'error' without touching the
+        # breaker; any other exception propagates to the CLI internal-error
+        # guard so a programming error surfaces as exit code 3 instead of
+        # being misclassified per-item.
 
     _journal_interrupts(run, interrupt_state)
 

@@ -63,6 +63,11 @@ COOLDOWN_S = 10.0
 _RECON_TIMEOUT_S = 1800.0
 
 
+def _jsonable_record(value: Any) -> dict[str, Any]:
+    """Project one dataclass/evidence object to a JSON-safe mapping."""
+    return cast(dict[str, Any], _jsonable(value))
+
+
 class MarathonPathError(PathEscapeError):
     """A requested artifact path escaped its Marathon run directory."""
 
@@ -108,9 +113,9 @@ class MarathonRun(EvidenceWriter):
                 "created": _utc_iso(),
             },
         )
-        run.write_json("hardware.json", cast(dict[str, Any], _jsonable(hardware)))
-        run.write_json("llamacpp.json", cast(dict[str, Any], _jsonable(llama)))
-        run.write_json("model.json", cast(dict[str, Any], _jsonable(model)))
+        run.write_json("hardware.json", _jsonable_record(hardware))
+        run.write_json("llamacpp.json", _jsonable_record(llama))
+        run.write_json("model.json", _jsonable_record(model))
         run.append(
             {
                 "type": "marathon_start",
@@ -568,7 +573,7 @@ class BracketTracker:
             self._llama,
             _bracket_options(self._options),
         )
-        payload = cast(dict[str, Any], _jsonable(result))
+        payload = _jsonable_record(result)
         self._run.append({"type": "bracket", "phase": phase, "number": self.number, **payload})
         self.last_at = current
         if result.verdict == "error":
@@ -826,7 +831,7 @@ def _run_rounds_phase(state: _MarathonState) -> int | None:
                 options=options,
                 label=f"challenge-{index}",
             )
-            challenge_payload = cast(dict[str, Any], _jsonable(challenge))
+            challenge_payload = _jsonable_record(challenge)
             summary["challenges"].append(challenge_payload)
             run.append({"type": "challenge", "round": index, **challenge_payload})
             if challenge.verdict == "b":
@@ -910,12 +915,8 @@ def _run_matrix_phase(state: _MarathonState) -> int | None:
             options,
             remaining_minutes_fn=lambda: (
                 float("inf")
-                if state.deadline is None
-                else max(
-                    0.0,
-                    cast(float, remaining_minutes(state.deadline, state.clock()))
-                    - ab_reserved_minutes(options.ab_blocks),
-                )
+                if (remain_for_matrix := remaining_minutes(state.deadline, state.clock())) is None
+                else max(0.0, remain_for_matrix - ab_reserved_minutes(options.ab_blocks))
             ),
         )
         summary["matrix"] = _jsonable(cells)
@@ -968,19 +969,17 @@ def _run_verification_phase(state: _MarathonState) -> int:
 def run_marathon(
     options: MarathonOptions,
     *,
-    now_fn: Callable[[], Any] | None = None,
+    now_fn: Callable[[], datetime] | None = None,
     reporter: Reporter | None = None,
 ) -> MarathonOutcome:
     """Run or naturally resume an exhaustive, strictly serial Marathon."""
     from llamatune.coverage import build_ledger, enumerate_space
     from llamatune.hardware import assess_hardware
-    from llamatune.llama import discover_llama
-    from llamatune.model import inspect_model
+    from llamatune.llama import LlamaDiscoveryError, discover_llama
+    from llamatune.model import ModelInspectionError, inspect_model
 
     clock = now_fn or (lambda: datetime.now(UTC))
     start = clock()
-    if not isinstance(start, datetime):
-        raise TypeError("now_fn must return datetime")
     if start.tzinfo is None:
         start = start.replace(tzinfo=UTC)
     deadline = resolve_deadline(start, options.until, options.max_hours)
@@ -990,7 +989,10 @@ def run_marathon(
             discover_llama(options.llama_bin),
             inspect_model(options.model_path, full_hash=options.full_hash),
         )
-    except Exception as exc:
+    except (LlamaDiscoveryError, ModelInspectionError, OSError, RuntimeError) as exc:
+        # Real discovery/hardware failure types only (issue #11): anything
+        # else is a programming error and propagates to the CLI
+        # internal-error guard instead of becoming a silent exit 3.
         return MarathonOutcome(
             run_dir=options.sessions_dir / "marathon",
             summary={"schema_version": 1, "error": str(exc)},

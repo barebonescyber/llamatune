@@ -276,7 +276,7 @@ def _load_calibration(sessions_dir: Path) -> VramCalibration | None:
     try:
         data = json.loads((sessions_dir / "calibration.json").read_text(encoding="utf-8"))
         return VramCalibration(**data)
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    except (OSError, TypeError, ValueError):
         return None
 
 
@@ -607,7 +607,11 @@ class _Engine:
             self.reporter.emit(
                 ProgressEvent(kind=event_kind, ts=datetime.now(UTC).isoformat(), payload=payload)
             )
-        except Exception:
+        except (OSError, TypeError, ValueError):
+            # Progress output is best-effort: degrade on stream failures
+            # (OSError) and renderer formatting/serialization bugs (TypeError/
+            # ValueError). Any other exception is a programming error and
+            # propagates instead of being swallowed (issue #11).
             self._reporter_failures += 1
             if not self._reporter_warning_added:
                 self.extra_warnings.append("progress reporter failed; tuning continued")

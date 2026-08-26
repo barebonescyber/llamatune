@@ -668,3 +668,132 @@ def test_follow_symlinks_flag_plumbs_into_discovery(
 
     run_nightshift(_options(tmp_path, tmp_path, dry_run=True))
     assert captured[-1] is False
+
+
+def test_unexpected_item_exception_propagates_and_does_not_masquerade(
+    tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A programming error (KeyError) must surface, not record 'failed' (#11)."""
+    model = DiscoveredModel(
+        path=tiny_gguf,
+        report=inspect_model(tiny_gguf),
+        shard_paths=(),
+        group_key=None,
+        representative=True,
+    )
+    _patch_foundation(monkeypatch, tmp_path, model)
+
+    def boom(session: Any, *_args: object, **_kwargs: object) -> TuneOutcome:
+        raise KeyError("fingerprint")
+
+    monkeypatch.setattr(search, "run_tuning", boom)
+    with pytest.raises(KeyError):
+        run_nightshift(_options(tmp_path, tiny_gguf.parent))
+
+
+_GOLDEN_NIGHTREPORT = Path(__file__).resolve().parents[1] / "fixtures" / "golden_nightreport.md"
+
+
+def test_nightreport_render_matches_golden_fixture(tmp_path: Path) -> None:
+    """A typed fixture summary renders byte-identically to the golden report."""
+    from llamatune.nightreport import render
+    from llamatune.types import NightshiftContentGroup, NightshiftItemSummary, NightshiftWindow
+
+    tune_item = NightshiftItemSummary(
+        kind="tune",
+        model_path="/models/alpha.gguf",
+        fingerprint="a" * 64,
+        reference_fingerprint=None,
+        reason="no completed session",
+        outcome="succeeded",
+        session_dir=str(tmp_path / "alpha"),
+        wall_s=120.0,
+        tune_exit_code=1,
+    )
+    consistent_item = NightshiftItemSummary(
+        kind="calibrate",
+        model_path="/models/beta.gguf",
+        fingerprint="b" * 64,
+        reference_fingerprint="b" * 64,
+        reason="verify latest completed session",
+        outcome="consistent",
+        calibration={
+            "verdict": "consistent",
+            "drift_pp": 0.012,
+            "drift_tg": 0.004,
+            "drift_pp_signed": -0.012,
+            "drift_tg_signed": 0.004,
+            "build_changed": False,
+        },
+    )
+    transfer_item = NightshiftItemSummary(
+        kind="calibrate",
+        model_path="/models/gamma.gguf",
+        fingerprint="c" * 64,
+        reference_fingerprint="a" * 64,
+        reason="transfer calibration from content-group representative",
+        outcome="consistent",
+        calibration={
+            "verdict": "consistent",
+            "transfer_from": "a" * 64,
+            "drift_pp": 0.003,
+            "drift_tg": 0.009,
+            "build_changed": False,
+        },
+    )
+    error_item = NightshiftItemSummary(
+        kind="calibrate",
+        model_path="/models/delta.gguf",
+        fingerprint="d" * 64,
+        reference_fingerprint="d" * 64,
+        reason="verify latest completed session",
+        outcome="error",
+        calibration={"verdict": "error", "reason": "llama-bench failed", "build_changed": True},
+    )
+    deferred_item = NightshiftItemSummary(
+        kind="tune",
+        model_path="/models/epsilon.gguf",
+        fingerprint="e" * 64,
+        reference_fingerprint=None,
+        reason="insufficient time for tune-class item",
+        outcome="deferred",
+        estimated_minutes=45.0,
+    )
+    summary = {
+        "schema_version": 1,
+        "options": {},
+        "window": NightshiftWindow(
+            started="2026-01-01T22:00:00+00:00",
+            ended="2026-01-02T06:00:00+00:00",
+            deadline="2026-01-02T06:00:00+00:00",
+            outcome="completed",
+        ),
+        "items": [
+            tune_item,
+            consistent_item,
+            transfer_item,
+            error_item,
+            deferred_item,
+        ],
+        "counts": {
+            "tune:succeeded": 1,
+            "calibrate:consistent": 2,
+            "calibrate:error": 1,
+            "tune:deferred": 1,
+        },
+        "total_invocations": 42,
+        "hardware": {"cpu_model": "Test CPU", "gpus": [{"name": "Test GPU"}]},
+        "llamacpp": {"build_commit": "abc1234", "help_sha256": "f" * 64},
+        "content_groups": [
+            NightshiftContentGroup(
+                group_key="qwen-family",
+                representative="/models/alpha.gguf",
+                members=["/models/alpha.gguf", "/models/gamma.gguf"],
+            )
+        ],
+        "warnings": ["model epsilon skipped: deadline reached"],
+        "exit_code": 1,
+        "constants": {"min_tune_minutes": 20.0, "shutdown_margin_minutes": 5.0},
+    }
+    rendered = render(summary)
+    assert rendered == _GOLDEN_NIGHTREPORT.read_text(encoding="utf-8")

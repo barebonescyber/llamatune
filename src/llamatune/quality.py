@@ -49,6 +49,7 @@ from llamatune.qualscore import (
 )
 from llamatune.qualserver import (
     REAL_TIMING,
+    ServerError,
     ServerHandle,
     ServerProtocolError,
     ServerStartError,
@@ -679,7 +680,7 @@ def _chat(
             seed=seed,
             timeout_s=timeout_s,
         )
-    except Exception as exc:
+    except (ServerError, OSError) as exc:
         run.write_json(str(relative / f"response-{turn}.json"), {"error": str(exc)})
         raise
     run.write_json(str(relative / f"response-{turn}.json"), {"content": response})
@@ -1476,7 +1477,7 @@ def _execute(
     resolved: _Resolved,
     *,
     run: QualityRun | None,
-    now_fn: Callable[[], Any] | None,
+    now_fn: Callable[[], float] | None,
     reporter: Reporter | None = None,
 ) -> QualityOutcome:
     if resolved.options.dry_run:
@@ -1562,9 +1563,7 @@ def _execute(
     comparison = None
     harness_error = False
     interrupted = False
-    timing: Timing = (
-        _RunTiming(cast(Callable[[], float], now_fn)) if now_fn is not None else REAL_TIMING
-    )
+    timing: Timing = _RunTiming(now_fn) if now_fn is not None else REAL_TIMING
     try:
         evaluated, failed, abort = _evaluate_http_side(
             run,
@@ -1635,7 +1634,7 @@ def _execute(
 def run_quality(
     options: QualityOptions,
     *,
-    now_fn: Callable[[], Any] | None = None,
+    now_fn: Callable[[], float] | None = None,
     reporter: Reporter | None = None,
 ) -> QualityOutcome:
     """Resolve and execute one deterministic quality evaluation."""
@@ -1652,7 +1651,7 @@ def resume_quality(
     run_dir: Path,
     *,
     llama_bin: Path | None = None,
-    now_fn: Callable[[], Any] | None = None,
+    now_fn: Callable[[], float] | None = None,
     reporter: Reporter | None = None,
 ) -> QualityOutcome:
     """Resume one identity-bound run, skipping exact journaled task tuples."""
