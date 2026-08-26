@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import errno
+import itertools
 import json
 import signal
 import sys
@@ -14,11 +15,13 @@ import pytest
 
 from llamatune import bench, config, executor, search
 from llamatune.bench import BenchParseError
+from llamatune.config import gpu_layer_cap
 from llamatune.llama import discover_llama
 from llamatune.model import inspect_model
 from llamatune.session import Session, SessionPathError
 from llamatune.types import (
     BaselineResult,
+    FeasibilityBoundary,
     GPUInfo,
     GpuSample,
     HardwareReport,
@@ -694,7 +697,7 @@ class TestFeasibilitySearch:
         assert boundary.min_fail_ngl == 0
         assert boundary.probes == 2
         engine.boundaries = [boundary]
-        assert engine._context_candidates(_envelope_config(33)) == []
+        assert list(engine._context_candidates(_envelope_config(33))) == []
 
     def test_no_successful_capped_config_emits_no_fabricated_recommendation(
         self,
@@ -1971,6 +1974,195 @@ def test_envelope_budget_exhaustion_marks_remaining_rows_skipped(
     truncated = [entry for entry in session.entries if entry.get("stage") == "envelope_truncated"]
     assert len(truncated) == 1
     assert truncated[0]["reason"] == "budget"
+
+
+def _legacy_context_candidates(engine: search._Engine, base: TrialConfig) -> list[TrialConfig]:
+    """The pre-PERF-010 eager enumeration, kept as the behavioral oracle."""
+    cap = gpu_layer_cap(engine.model, engine.options)
+    candidates = [base] if base.gpu_layers <= cap else []
+    for boundary in sorted(
+        (b for b in engine.boundaries if search._boundary_has_fit(b)),
+        key=lambda b: b.max_ok_ngl,
+        reverse=True,
+    ):
+        candidates.extend(
+            dataclasses.replace(base, gpu_layers=ngl, moe_cpu_layers=boundary.moe_cpu_layers)
+            for ngl in range(boundary.max_ok_ngl, -1, -1)
+        )
+    result: list[TrialConfig] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate.trial_id not in seen:
+            result.append(candidate)
+            seen.add(candidate.trial_id)
+    return result
+
+
+@pytest.mark.parametrize(
+    "boundaries",
+    (
+        [],
+        [
+            FeasibilityBoundary(moe_cpu_layers=0, max_ok_ngl=30, min_fail_ngl=31, probes=2),
+        ],
+        [
+            FeasibilityBoundary(moe_cpu_layers=0, max_ok_ngl=30, min_fail_ngl=31, probes=2),
+            FeasibilityBoundary(moe_cpu_layers=4, max_ok_ngl=28, min_fail_ngl=29, probes=2),
+            FeasibilityBoundary(moe_cpu_layers=0, max_ok_ngl=12, min_fail_ngl=13, probes=2),
+        ],
+        [
+            # Overlapping placements plus a fitless boundary that must be
+            # filtered out before ordering.
+            FeasibilityBoundary(moe_cpu_layers=8, max_ok_ngl=24, min_fail_ngl=25, probes=2),
+            FeasibilityBoundary(moe_cpu_layers=8, max_ok_ngl=6, min_fail_ngl=7, probes=2),
+            FeasibilityBoundary(moe_cpu_layers=2, max_ok_ngl=0, min_fail_ngl=0, probes=2),
+        ],
+    ),
+)
+def test_context_candidates_lazy_order_matches_legacy_oracle(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    boundaries: list[FeasibilityBoundary],
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    engine = search._Engine(session, hw, model, llama, options)
+    engine.boundaries = boundaries
+    base = _envelope_config(20)
+
+    oracle = _legacy_context_candidates(engine, base)
+
+    assert list(engine._context_candidates(base)) == oracle
+    for take in (1, 3, len(oracle)):
+        assert list(itertools.islice(engine._context_candidates(base), take)) == oracle[:take]
+
+
+def test_context_candidates_exclude_base_above_cap(
+    tmp_path: Path, fake_bin_dir: Path, tiny_gguf: Path
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf, max_gpu_layers=8)
+    engine = search._Engine(session, hw, model, llama, options)
+    engine.boundaries = [
+        FeasibilityBoundary(moe_cpu_layers=0, max_ok_ngl=5, min_fail_ngl=6, probes=2),
+    ]
+    base = _envelope_config(40)
+
+    oracle = _legacy_context_candidates(engine, base)
+
+    assert base.gpu_layers > gpu_layer_cap(engine.model, engine.options)
+    assert list(engine._context_candidates(base)) == oracle
+    assert all(candidate.gpu_layers <= 5 for candidate in engine._context_candidates(base))
+
+
+def test_pruned_by_matches_legacy_linear_scan_oracle(
+    tmp_path: Path, fake_bin_dir: Path, tiny_gguf: Path
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    engine = search._Engine(session, hw, model, llama, options)
+
+    def oom(ngl: int, moe: int, **overrides: Any) -> TrialConfig:
+        return dataclasses.replace(_envelope_config(ngl), moe_cpu_layers=moe, **overrides)
+
+    # Insertion order matters: A and B share a bucket (duplicate partial
+    # matches); C and E share another bucket with different bounds.
+    raw_points: list[tuple[dict[str, Any], str]] = []
+    points = [
+        (oom(20, 0), "A"),
+        (oom(24, 0), "B"),
+        (oom(30, 2, ubatch=256), "C"),
+        (oom(10, 4, mmap=False), "D"),
+        (oom(28, 6, ubatch=256), "E"),
+    ]
+    for oom_cfg, point_id in points:
+        engine._record_oom_point(oom_cfg.to_dict(), point_id)
+        raw_points.append((oom_cfg.to_dict(), point_id))
+
+    def legacy_pruned_by(cfg: TrialConfig) -> str | None:
+        cfg_dict = cfg.to_dict()
+        for oom_cfg, trial_id in raw_points:
+            if (
+                cfg.gpu_layers >= int(oom_cfg["gpu_layers"])
+                and cfg.moe_cpu_layers <= int(oom_cfg["moe_cpu_layers"])
+                and search._other_fields(cfg_dict) == search._other_fields(oom_cfg)
+            ):
+                return trial_id
+        return None
+
+    candidates = [
+        oom(25, 0),  # matches A and B; first inserted wins
+        oom(23, 0),
+        oom(19, 0),  # below every bound in its bucket
+        oom(29, 2, ubatch=256),  # misses C on gpu_layers, hits E
+        oom(31, 2, ubatch=256),  # hits C first
+        oom(27, 7, ubatch=256),  # moe above both bounds
+        oom(12, 3, mmap=False),
+        oom(12, 3),  # bucket with no points at all
+        oom(35, 9, mmap=False, threads_batch=4),  # distinct other-fields key
+    ]
+    for candidate in candidates:
+        assert engine._pruned_by(candidate) == legacy_pruned_by(candidate)
+
+
+def test_pair_check_counter_seeds_from_journal_and_replaces_entries_scan(
+    tmp_path: Path, fake_bin_dir: Path, tiny_gguf: Path
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    session.append({"type": "pair_check", "dim": "mmap"})
+    session.append({"type": "trial", "trial_id": "x", "status": "ok"})
+    session.append({"type": "pair_check", "dim": "mmap"})
+
+    engine = search._Engine(session, hw, model, llama, options)
+
+    journaled = sum(1 for e in session.entries if e.get("type") == "pair_check")
+    assert journaled == 2
+    assert engine.pair_checks == journaled
+
+
+def test_envelope_enumerates_candidates_once_per_distinct_base(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, model, llama, options = _setup(
+        tmp_path,
+        fake_bin_dir,
+        tiny_gguf,
+        ctx_size=8192,
+        ctx_ladder=(16384, 32768, 65536),
+    )
+    engine = search._Engine(session, hw, model, llama, options)
+    primary, mid, low = (_envelope_config(value) for value in (20, 12, 5))
+    engine.context_validation = {"ctx": 8192, "status": "ok", "evidence": "probes/required"}
+    monkeypatch.setattr(engine, "_context_candidates", lambda _base: [primary, mid, low])
+    enumerated: list[TrialConfig] = []
+    real_candidates = engine._context_envelope_candidates
+
+    def counting(base: TrialConfig) -> list[TrialConfig]:
+        enumerated.append(base)
+        return real_candidates(base)
+
+    monkeypatch.setattr(engine, "_context_envelope_candidates", counting)
+
+    def probe(_config: TrialConfig, _purpose: str, ctx: int | None) -> str:
+        assert ctx is not None
+        engine.executed_count += 1
+        return "oom"
+
+    monkeypatch.setattr(engine, "_probe", probe)
+    engine._run_context_envelope(primary, None)
+
+    # The fallback never improves, so the base stays `primary` across rungs;
+    # the historical code re-enumerated per failing rung.
+    assert enumerated == [primary]
+    assert engine.context_envelope is not None
+    statuses = [row["status"] for row in engine.context_envelope]
+    assert statuses == ["ok", "failed", "pruned", "pruned"]
+    assert [row["fallback_config"] for row in engine.context_envelope[1:]] == [None, None, None]
+    assert engine.context_envelope[1]["evidence"] == (
+        f"probes/{search._probe_id('context', primary, 16384)}"
+    )
+    assert engine.context_envelope[2]["evidence"] is None
 
 
 def test_depth_profile_reuses_cached_rows_and_ignores_failures(
