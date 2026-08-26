@@ -573,7 +573,7 @@ class TestLossy:
     ) -> None:
         session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
         engine = search._Engine(session, hw, model, llama, options)
-        metric = MetricStats(mean=1.0, stdev=0.0, cv=0.0, n=3)
+        metric = MetricStats(mean=50.0, stdev=0.0, cv=0.0, n=3)
         engine.baseline = BaselineResult(
             runs=3,
             pp=metric,
@@ -2364,6 +2364,324 @@ def test_confirmation_thermal_retry_progress_has_no_duplicate_original_id(
         f"{config.trial_id}-confirm-2",
         f"{config.trial_id}-confirm-3",
     ]
+
+
+def _confirmation_engine(
+    session: Session,
+    hw: HardwareReport,
+    model: ModelReport,
+    llama: LlamaCppReport,
+    options: TuneOptions,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run_child: Any,
+    measured: search._Measured | None = None,
+) -> search._Engine:
+    engine = search._Engine(session, hw, model, llama, options)
+    pp_metric = MetricStats(mean=50.0, stdev=0.0, cv=0.0, n=3)
+    tg_metric = MetricStats(mean=5.0, stdev=0.0, cv=0.0, n=3)
+    engine.baseline = BaselineResult(
+        runs=3,
+        pp=pp_metric,
+        tg=tg_metric,
+        noise_floor_cv=0.01,
+        fallback=None,
+        resolved_defaults=_envelope_config(1).to_dict(),
+    )
+    monkeypatch.setattr(engine, "_run_child", run_child)
+    monkeypatch.setattr(
+        engine, "_classify", lambda result, reps: measured or _measured(110.0, 11.0)
+    )
+    monkeypatch.setattr(engine, "_write_command", lambda *args: None)
+    monkeypatch.setattr(engine, "_record_load", lambda threads: None)
+    monkeypatch.setattr(engine, "_cooldown", lambda: None)
+    return engine
+
+
+def _recording_run_child(tmp_path: Path, calls: list[str], fail_on: int | None = None) -> Any:
+    attempt = {"count": 0}
+
+    def run_child(**kwargs: Any) -> tuple[executor.ExecResult, search._RunObservation]:
+        attempt["count"] += 1
+        if fail_on is not None and attempt["count"] >= fail_on:
+            raise KeyboardInterrupt
+        calls.append(str(kwargs["run_id"]))
+        return (
+            _exec_result(tmp_path, f"recorded-{len(calls)}"),
+            search._RunObservation(None, None, ()),
+        )
+
+    return run_child
+
+
+def test_confirmation_resume_reuses_journaled_runs_and_preserves_statistics(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_a, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    session_b, _, _, _, _ = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    config = _envelope_config(20)
+    fresh_calls: list[str] = []
+    fresh_engine = _confirmation_engine(
+        session_a,
+        hw,
+        model,
+        llama,
+        options,
+        monkeypatch,
+        run_child=_recording_run_child(tmp_path, fresh_calls),
+    )
+    fresh = fresh_engine._confirm(config)
+
+    interrupted_calls: list[str] = []
+    interrupted = _confirmation_engine(
+        session_b,
+        hw,
+        model,
+        llama,
+        options,
+        monkeypatch,
+        run_child=_recording_run_child(tmp_path, interrupted_calls, fail_on=3),
+    )
+    with pytest.raises(KeyboardInterrupt):
+        interrupted._confirm(config)
+    assert [run_id[-1] for run_id in interrupted_calls] == ["1", "2"]
+
+    resumed_calls: list[str] = []
+    resumed = _confirmation_engine(
+        session_b,
+        hw,
+        model,
+        llama,
+        options,
+        monkeypatch,
+        run_child=_recording_run_child(tmp_path, resumed_calls),
+    )
+    assert resumed.executed_count == 2
+    replayed = resumed._confirm(config)
+
+    assert resumed_calls == [f"{config.trial_id}-confirm-3"]
+    assert fresh.confirmed is True
+    assert replayed.confirmed is True
+    assert replayed.pp.mean == fresh.pp.mean
+    assert replayed.tg.mean == fresh.tg.mean
+    assert replayed.score == pytest.approx(fresh.score)
+    assert resumed.executed_count == 3
+    records = [entry for entry in session_b.entries if entry.get("type") == "confirmation_run"]
+    assert sorted(int(record["run"]) for record in records) == [1, 2, 3]
+
+
+def test_confirmation_ignores_records_for_other_trial_ids(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    config = _envelope_config(20)
+    for index in range(1, options.baseline_runs + 1):
+        session.append(
+            {
+                "type": "confirmation_run",
+                "trial_id": "0123456789abcdef",
+                "run": index,
+                "status": "ok",
+                "pp_mean": 555.0,
+                "tg_mean": 55.0,
+            }
+        )
+    calls: list[str] = []
+    engine = _confirmation_engine(
+        session,
+        hw,
+        model,
+        llama,
+        options,
+        monkeypatch,
+        run_child=_recording_run_child(tmp_path, calls),
+    )
+
+    confirmation = engine._confirm(config)
+
+    assert len(calls) == options.baseline_runs
+    assert confirmation.confirmed is True
+    assert confirmation.pp.mean == pytest.approx(110.0)
+    assert confirmation.tg.mean == pytest.approx(11.0)
+    assert engine.executed_count == options.baseline_runs + options.baseline_runs
+
+
+def test_confirmation_partial_journal_record_falls_back_to_execution(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    config = _envelope_config(20)
+    session.append(
+        {
+            "type": "confirmation_run",
+            "trial_id": config.trial_id,
+            "run": 1,
+            "status": "ok",
+            "pp_mean": 120.0,
+            "tg_mean": None,
+        }
+    )
+    session.append(
+        {
+            "type": "confirmation_run",
+            "trial_id": config.trial_id,
+            "run": 2,
+            "status": "ok",
+            "pp_mean": 111.0,
+            "tg_mean": 11.1,
+        }
+    )
+    calls: list[str] = []
+    engine = _confirmation_engine(
+        session,
+        hw,
+        model,
+        llama,
+        options,
+        monkeypatch,
+        run_child=_recording_run_child(tmp_path, calls),
+    )
+
+    confirmation = engine._confirm(config)
+
+    assert calls == [
+        f"{config.trial_id}-confirm-1",
+        f"{config.trial_id}-confirm-3",
+    ]
+    assert confirmation.pp.mean == pytest.approx((110.0 + 111.0 + 110.0) / 3)
+    assert confirmation.tg.mean == pytest.approx((11.0 + 11.1 + 11.0) / 3)
+
+
+@pytest.mark.parametrize(("exit_code", "expected_status"), [(0, "ok"), (1, "failed")])
+def test_cli_validation_resume_reuses_journaled_stage_record(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exit_code: int,
+    expected_status: str,
+) -> None:
+    session, hw, model, llama, options = _setup(
+        tmp_path, fake_bin_dir, tiny_gguf, validate_with_cli=True, ctx_size=8192
+    )
+    llama = dataclasses.replace(llama, cli_path=fake_bin_dir / "llama-cli")
+    config = _envelope_config(20)
+
+    def run_child(**kwargs: Any) -> tuple[executor.ExecResult, search._RunObservation]:
+        result = dataclasses.replace(
+            _exec_result(tmp_path, str(kwargs["run_id"])), exit_code=exit_code
+        )
+        return (result, search._RunObservation(None, None, ()))
+
+    engine = search._Engine(session, hw, model, llama, options)
+    monkeypatch.setattr(engine, "_run_child", run_child)
+    monkeypatch.setattr(engine, "_write_command", lambda *args: None)
+    monkeypatch.setattr(engine, "_record_load", lambda threads: None)
+    engine._validate_with_cli(config)
+    first = engine.cli_validation
+    assert first is not None
+    assert first["status"] == expected_status
+    record = next(entry for entry in session.entries if entry.get("stage") == "cli_validation")
+    assert record["trial_id"] == config.trial_id
+
+    entries_before = tuple(session.entries)
+    resumed = search._Engine(session, hw, model, llama, options)
+
+    def forbidden(**_kwargs: Any) -> Any:
+        pytest.fail("cli validation must not re-execute on resume")
+
+    monkeypatch.setattr(resumed, "_run_child", forbidden)
+    resumed._validate_with_cli(config)
+    assert resumed.cli_validation == first
+    assert tuple(session.entries) == entries_before
+    if expected_status != "ok":
+        assert any("failed llama-cli" in warning for warning in resumed.extra_warnings)
+
+
+def test_quality_gate_resume_reuses_journaled_ppl_values(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus = tmp_path / "quality.txt"
+    corpus.write_text("quality corpus")
+    session, hw, model, llama, options = _setup(
+        tmp_path, fake_bin_dir, tiny_gguf, quality_corpus=corpus, observe_vram=False
+    )
+    llama = dataclasses.replace(llama, perplexity_path=fake_bin_dir / "llama-perplexity")
+    config = TrialConfig(
+        gpu_layers=0,
+        moe_cpu_layers=0,
+        flash_attn=True,
+        ubatch=512,
+        batch=2048,
+        threads=8,
+        mmap=True,
+        no_kv_offload=False,
+        cache_type_k="q8_0",
+        cache_type_v="f16",
+    )
+    outputs = iter(("10.0", "9.0"))
+    calls: list[str] = []
+
+    def run_child(**kwargs: Any) -> tuple[executor.ExecResult, search._RunObservation]:
+        run_id = str(kwargs["run_id"])
+        calls.append(run_id)
+        stdout = tmp_path / f"{run_id}.json"
+        stderr = tmp_path / f"{run_id}.log"
+        stdout.write_text(f"Final estimate: PPL = {next(outputs)}\n")
+        stderr.write_text("")
+        result = executor.ExecResult(
+            exit_code=0,
+            wall_s=1.0,
+            timed_out=False,
+            stdout=executor.CaptureInfo(stdout, "hash", stdout.stat().st_size, False),
+            stderr=executor.CaptureInfo(stderr, "hash", 0, False),
+            started="start",
+            ended="end",
+            env_names=(),
+        )
+        return (result, search._RunObservation(None, None, ()))
+
+    engine = search._Engine(session, hw, model, llama, options)
+    monkeypatch.setattr(engine, "_run_child", run_child)
+    monkeypatch.setattr(engine, "_write_command", lambda *args: None)
+    monkeypatch.setattr(engine, "_record_load", lambda threads: None)
+    engine._run_quality_gate(config)
+    assert len(calls) == 2
+    gate = engine.quality_gate
+    assert gate is not None
+    assert gate["status"] == "ok"
+    assert gate["ppl_lossy"] == 10.0
+    assert gate["ppl_f16"] == 9.0
+    assert gate["delta_pct"] == pytest.approx(100 / 9)
+    journaled = [entry for entry in session.entries if entry.get("type") == "quality_gate_run"]
+    assert [entry["ppl"] for entry in journaled] == [10.0, 9.0]
+
+    resumed = search._Engine(session, hw, model, llama, options)
+
+    def forbidden(**_kwargs: Any) -> Any:
+        pytest.fail("quality gate must not re-execute on resume")
+
+    monkeypatch.setattr(resumed, "_run_child", forbidden)
+    resumed._run_quality_gate(config)
+    replayed = resumed.quality_gate
+    assert replayed is not None
+    assert replayed["status"] == "ok"
+    assert replayed["ppl_lossy"] == 10.0
+    assert replayed["ppl_f16"] == 9.0
+    assert replayed["delta_pct"] == pytest.approx(100 / 9)
+    assert len([e for e in session.entries if e.get("type") == "quality_gate_run"]) == 2
 
 
 def test_thermal_retest_requires_opted_in_successful_run_samples(
