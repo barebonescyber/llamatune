@@ -5,9 +5,29 @@ All notable changes to llamatune will be documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and releases use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Tag spelling note
+
+Released tags use the spelling `v0.1.0-beta.N`. This equals the PEP 440 canonical
+spelling `0.1.0bN`. For example, tag `v0.1.0-beta.3` and version `0.1.0b3` name
+the same release.
+
 ## [Unreleased]
 
-No changes yet.
+### Added
+
+- A continuous-integration job that resolves the lowest allowed direct dependency
+  versions into a clean environment and smoke-tests the installed command line
+  against them.
+
+### Changed
+
+- Explicit dependency floors: `typer>=0.16,<1` and `gguf>=0.18,<1`. Older typer
+  releases fail with current click releases, and older gguf releases either fail
+  to import or require an undeclared extra.
+- The security audit workflow now runs its local dependency, source, and secret
+  audits on every push to main, every pull request, and a weekly schedule.
+  CodeQL runs by default on the schedule and on pushes to main; it stays opt-in
+  through manual dispatch elsewhere.
 
 ## [0.1.0-beta.3] - 2026-08-01
 

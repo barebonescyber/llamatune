@@ -1,10 +1,16 @@
 name: Security audit
 
 on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    - cron: "23 6 * * 1" # Weekly, Mondays 06:23 UTC
   workflow_dispatch:
     inputs:
       run_codeql:
-        description: "Run CodeQL (requires GitHub Code Security for this private repository)"
+        description: "Run CodeQL (runs automatically on schedule and pushes to main)"
         required: false
         default: false
         type: boolean
@@ -48,7 +54,13 @@ jobs:
 
   codeql:
     name: CodeQL / Python
-    if: ${{ inputs.run_codeql }}
+    if: >-
+      ${{
+        github.event_name == 'schedule'
+        || github.event_name == 'push'
+        || (github.event_name == 'pull_request' && inputs.run_codeql)
+        || (github.event_name == 'workflow_dispatch' && inputs.run_codeql)
+      }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
