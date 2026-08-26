@@ -7,17 +7,27 @@ import importlib
 import json
 import os
 import re
-import sys
 import tempfile
+import warnings
 from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
+import typer
+
 from llamatune.config import hardware_signature
+from llamatune.evidence import PathEscapeError, confined_path, read_journal_lines
 from llamatune.types import GPUInfo, HardwareReport, ResultRow, ResultsMatrix, TrialConfig
 
 _SCHEMA_VERSION = 1
+REFRESH_EXIT_CODES = frozenset({0, 1, 4})
+
+
+class MatrixPathError(PathEscapeError):
+    """A matrix artifact path escaped its output directory."""
+
+
 _KINDS = frozenset(
     {
         "baseline",
@@ -42,19 +52,9 @@ def _json(path: Path) -> dict[str, Any]:
 
 
 def _journal(path: Path) -> list[dict[str, Any]]:
-    entries: list[dict[str, Any]] = []
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    for index, line in enumerate(lines):
-        if not line.strip():
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            if index == len(lines) - 1:
-                break
-            raise
-        if isinstance(value, dict):
-            entries.append(value)
+    entries, corruption = read_journal_lines(path)
+    for warning in corruption:
+        warnings.warn(warning, RuntimeWarning, stacklevel=2)
     return entries
 
 
@@ -841,16 +841,8 @@ def _canonical_json(matrix: ResultsMatrix) -> str:
     return json.dumps(_document(matrix), indent=2, sort_keys=True) + "\n"
 
 
-def _confined(output_dir: Path, name: str) -> Path:
-    root = output_dir.resolve()
-    target = (root / name).resolve()
-    if target.parent != root:
-        raise ValueError(f"matrix output escapes output directory: {name}")
-    return target
-
-
 def _atomic_text(output_dir: Path, name: str, content: str) -> None:
-    target = _confined(output_dir, name)
+    target = confined_path(output_dir, name, error=MatrixPathError)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{name}.", dir=output_dir)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
@@ -904,10 +896,10 @@ def _refresh_roots(root: Path) -> tuple[Path, ...]:
     try:
         configured = load_artifact(artifact).roots
     except Exception as exc:
-        print(
+        typer.echo(
             f"warning: existing results matrix configuration ignored; "
             f"refreshing only {resolved}: {exc}",
-            file=sys.stderr,
+            err=True,
         )
         return (resolved,)
     normalized = tuple(dict.fromkeys(path.resolve() for path in configured))
@@ -916,11 +908,11 @@ def _refresh_roots(root: Path) -> tuple[Path, ...]:
 
 def refresh(root: Path) -> None:
     """Best-effort artifact refresh used by terminal command epilogues."""
+    resolved = root.resolve()
     try:
-        resolved = root.resolve()
         build(_refresh_roots(resolved), resolved / "matrix")
     except Exception as exc:  # refresh must never alter the owning command's outcome
-        print(f"warning: results matrix refresh failed: {exc}", file=sys.stderr)
+        typer.echo(f"warning: results matrix refresh failed: {exc}", err=True)
 
 
 def load_artifact(path: Path) -> ResultsMatrix:

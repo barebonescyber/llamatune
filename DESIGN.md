@@ -490,6 +490,13 @@ warning. (v1 deliberately does not hash-chain the journal — it is
 honest-operator evidence, not tamper-proof; documented divergence from
 infer-tune.)
 
+**Journal corruption policy** (`evidence.read_journal_lines`, shared by all
+orchestrator readers): unparseable lines are skipped and reported as
+warnings. Valid entries before and after a corrupt line still load.
+Nothing is silently truncated or hidden. A torn final line follows the
+same rule and is named in a warning. Session resume stays stricter:
+mid-file corruption stops resume with a corruption error.
+
 Thermally observed `trial` and `confirmation_run` records carry contamination,
 retry, and replacement-contamination state. A final trial rejected for thermal
 provenance additionally carries `thermal_rejected: true` and has `score: null`.
@@ -525,6 +532,8 @@ src/llamatune/
   config.py     # search-space construction, constraints, feasibility (pure)
   hardware.py   # §4      model.py  # §5      llama.py  # binary discovery/probe
   executor.py   # §7      bench.py  # command build + JSON parse (never executes)
+  evidence.py   # shared evidence IO: jsonable, timestamps, confinement,
+                 # journal reader, unique dirs, two-stage interrupt protocol
   session.py    # §12     search.py # §10 orchestration incl. baseline/confirm
   stats.py      # §6/§11 statistics
   recommend.py  # §11 scoring, pareto, analysis.json, recommended.*

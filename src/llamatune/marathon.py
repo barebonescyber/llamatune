@@ -5,18 +5,34 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
-import os
-import secrets
-import signal
 import statistics
 import sys
 import time
+import warnings
 from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime, timedelta, tzinfo
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Self, cast
 
 from llamatune._version import __version__
+from llamatune.evidence import (
+    EvidenceWriter,
+    InterruptState,
+    PathEscapeError,
+    confined_path,
+    create_unique_dir,
+    install_interrupt_handlers,
+    read_journal_lines,
+)
+from llamatune.evidence import (
+    jsonable as _jsonable,
+)
+from llamatune.evidence import (
+    resolve_deadline as resolve_deadline,
+)
+from llamatune.evidence import (
+    utc_iso as _utc_iso,
+)
 from llamatune.types import (
     CoverageLedger,
     HardwareReport,
@@ -41,44 +57,21 @@ REPS_SEARCH = 8
 REPS_CONFIRM = 12
 BASELINE_RUNS = 5
 COOLDOWN_S = 10.0
-_CREATE_RETRIES = 5
 _RECON_TIMEOUT_S = 1800.0
 
 
-class MarathonPathError(Exception):
+class MarathonPathError(PathEscapeError):
     """A requested artifact path escaped its Marathon run directory."""
 
 
-def _jsonable(value: Any) -> Any:
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {
-            field.name: _jsonable(getattr(value, field.name)) for field in dataclasses.fields(value)
-        }
-    if isinstance(value, Mapping):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list, set, frozenset)):
-        return [_jsonable(item) for item in value]
-    if isinstance(value, Path):
-        return str(value)
-    return value
-
-
-def _utc_iso() -> str:
-    return datetime.now(UTC).isoformat()
-
-
 def _confine(base: Path, *parts: str) -> Path:
-    root = base.resolve()
-    candidate = base.joinpath(*parts)
-    try:
-        candidate.resolve().relative_to(root)
-    except ValueError:
-        raise MarathonPathError(f"path {candidate} escapes marathon directory {base}") from None
-    return candidate
+    return confined_path(base, *parts, error=MarathonPathError)
 
 
-class MarathonRun:
+class MarathonRun(EvidenceWriter):
     """The sole writer inside one Marathon evidence directory."""
+
+    path_error: type[PathEscapeError] = MarathonPathError
 
     def __init__(self, run_dir: Path) -> None:
         self._dir = Path(run_dir)
@@ -99,19 +92,8 @@ class MarathonRun:
         argv: list[str],
     ) -> Self:
         root = sessions_dir / "marathon"
-        root.mkdir(parents=True, exist_ok=True)
         stem = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in model.path.stem)
-        run_dir: Path | None = None
-        for _ in range(_CREATE_RETRIES):
-            candidate = root / f"{stem}-{datetime.now(UTC):%Y%m%d-%H%M%S}-{secrets.token_hex(3)}"
-            try:
-                candidate.mkdir(exist_ok=False)
-            except FileExistsError:
-                continue
-            run_dir = candidate
-            break
-        if run_dir is None:
-            raise MarathonPathError(f"could not allocate a unique run under {root}")
+        run_dir = create_unique_dir(root, stem, error=MarathonPathError)
         run = cls(run_dir)
         run.write_json(
             "run.json",
@@ -142,15 +124,6 @@ class MarathonRun:
             raise FileNotFoundError(f"not a Marathon run: {path}")
         return cls(path)
 
-    def append(self, entry: dict[str, Any]) -> None:
-        record = cast(dict[str, Any], _jsonable(dict(entry)))
-        record.setdefault("ts", _utc_iso())
-        path = _confine(self._dir, "journal.jsonl")
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-
     def _mkdir(self, *parts: str) -> Path:
         path = _confine(self._dir, *parts)
         path.mkdir(parents=True, exist_ok=True)
@@ -180,40 +153,6 @@ class MarathonRun:
 
     def select_bracket(self, number: int) -> None:
         self._bracket = number
-
-    def write_json(self, name: str, payload: dict[str, Any]) -> None:
-        path = _confine(self._dir, name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as handle:
-            json.dump(_jsonable(payload), handle, indent=2, sort_keys=True)
-            handle.write("\n")
-
-    def write_text(self, name: str, text: str) -> None:
-        path = _confine(self._dir, name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
-
-
-def resolve_deadline(
-    start: datetime,
-    until: str | None,
-    max_hours: float | None,
-    *,
-    local_tz: tzinfo | None = None,
-) -> datetime | None:
-    """Resolve the earlier supplied deadline, with past wall times meaning tomorrow."""
-    candidates: list[datetime] = []
-    if until is not None:
-        hour, minute = (int(part) for part in until.split(":"))
-        zone = local_tz or datetime.now().astimezone().tzinfo or UTC
-        local = start.astimezone(zone)
-        candidate = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if candidate <= local:
-            candidate += timedelta(days=1)
-        candidates.append(candidate.astimezone(UTC))
-    if max_hours is not None:
-        candidates.append(start + timedelta(hours=max_hours))
-    return min(candidates) if candidates else None
 
 
 def round_budget(base: int, index: int) -> int:
@@ -273,18 +212,15 @@ def identity_matches(
 
 
 def _entries(run_dir: Path) -> list[dict[str, Any]]:
-    path = run_dir / "journal.jsonl"
-    if not path.is_file():
-        return []
-    result: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            break
-        if isinstance(value, dict):
-            result.append(value)
-    return result
+    """Load journal entries; corrupt lines are skipped and warned, never fatal.
+
+    The shared reader guarantees later valid entries still load after a
+    corrupt line (issue #8): resume scans must not silently truncate.
+    """
+    entries, corruption = read_journal_lines(run_dir / "journal.jsonl")
+    for warning in corruption:
+        warnings.warn(warning, RuntimeWarning, stacklevel=2)
+    return entries
 
 
 def find_reentry(
@@ -500,7 +436,16 @@ def _trial_evidence(
     return executed, pruned, trials
 
 
-def _finalize(run: MarathonRun, summary: dict[str, Any], exit_code: int) -> MarathonOutcome:
+def _finalize(
+    run: MarathonRun,
+    summary: dict[str, Any],
+    exit_code: int,
+    *,
+    interrupt_state: InterruptState | None = None,
+) -> MarathonOutcome:
+    if interrupt_state is not None:
+        for signum, immediate in interrupt_state.drain_events():
+            run.append({"type": "interrupted", "signal": signum, "immediate": immediate})
     summary["exit_code"] = exit_code
     run.write_json("marathon.json", summary)
     try:
@@ -592,288 +537,169 @@ def run_marathon(
         summary["stop_reason"] = "dry_run"
         return _finalize(run, summary, 0)
 
-    stop = False
-    second = False
-    old_handlers: dict[signal.Signals, Any] = {}
+    def journal_interrupts(state: InterruptState) -> None:
+        """Journal queued interrupt events at the next safe main-flow point."""
+        for signum, immediate in state.drain_events():
+            run.append({"type": "interrupted", "signal": signum, "immediate": immediate})
 
-    def handle(signum: int, _frame: Any) -> None:
-        nonlocal stop, second
-        if stop:
-            second = True
-            raise KeyboardInterrupt
-        stop = True
-        run.append({"type": "interrupted", "signal": signum, "immediate": False})
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        old_handlers[sig] = signal.getsignal(sig)
-        signal.signal(sig, handle)
-    try:
-        entries = _entries(run.dir)
-        recon_entry = next(
-            (entry for entry in reversed(entries) if entry.get("type") == "recon_complete"),
-            None,
-        )
-        run.append({"type": "phase", "phase": "resume"})
-        incomplete = next(
-            (
-                entry
-                for entry in reversed(entries)
-                if entry.get("type") == "round_start"
-                and not any(
-                    end.get("type") in {"round_end", "round_failed"}
-                    and end.get("index") == entry.get("index")
-                    for end in entries
-                )
-            ),
-            None,
-        )
-        if incomplete and not stop:
-            from llamatune.search import resume_tuning
-
-            outcome = resume_tuning(Path(str(incomplete["session_dir"])))
-            run.append(
-                {
-                    "type": "round_end" if outcome.exit_code in (0, 1) else "round_failed",
-                    "index": incomplete["index"],
-                    "session_dir": str(outcome.session_dir),
-                    "exit_code": outcome.exit_code,
-                    "resumed": True,
-                }
-            )
+    with install_interrupt_handlers() as interrupt_state:
+        try:
             entries = _entries(run.dir)
-        run.append({"type": "phase", "phase": "reconnaissance"})
-        reference_value = (
-            dict(recon_entry["reference"]) if recon_entry else _recon(run, model, llama, options)
-        )
-        if reference_value is None:
-            reference_value = _recon(run, model, llama, options)
-        if reference_value is None:
-            summary["stop_reason"] = "reconnaissance_failed"
-            summary["failed"].append({"kind": "reconnaissance", "reason": "both attempts failed"})
-            return _finalize(run, summary, 3)
-        reference: dict[str, Any] = reference_value
-        if recon_entry is None:
-            run.append({"type": "recon_complete", "reference": reference})
-        summary["reference"] = {
-            "original": reference,
-            "current": reference,
-            "rebaselines": [],
-        }
-        run.decision_threshold = max(0.01, 2.0 * float(reference["cv_ref"]))
-        if reference.get("warmup_drift"):
-            summary["warnings"].append(
-                "warmup_drift: reconnaissance halves differed beyond threshold"
+            recon_entry = next(
+                (entry for entry in reversed(entries) if entry.get("type") == "recon_complete"),
+                None,
             )
-
-        bracket_number = 0
-        bracket_errors = 0
-        last_bracket: datetime | None = None
-
-        def bracket(phase: str) -> bool:
-            nonlocal bracket_number, bracket_errors, last_bracket, reference
-            current = clock()
-            if (
-                last_bracket is not None
-                and (current - last_bracket).total_seconds() < BRACKET_FRESH_MINUTES * 60
-            ):
-                return True
-            from llamatune.calibrate import run_calibration
-
-            bracket_number += 1
-            run.select_bracket(bracket_number)
-            result = run_calibration(
-                run,
-                _synth_record(reference, model, llama, options, run),
-                model,
-                llama,
-                _bracket_options(options),
+            run.append({"type": "phase", "phase": "resume"})
+            incomplete = next(
+                (
+                    entry
+                    for entry in reversed(entries)
+                    if entry.get("type") == "round_start"
+                    and not any(
+                        end.get("type") in {"round_end", "round_failed"}
+                        and end.get("index") == entry.get("index")
+                        for end in entries
+                    )
+                ),
+                None,
             )
-            payload = cast(dict[str, Any], _jsonable(result))
-            run.append({"type": "bracket", "phase": phase, "number": bracket_number, **payload})
-            last_bracket = current
-            if result.verdict == "error":
-                bracket_errors += 1
-                summary["failed"].append(
-                    {"kind": "bracket", "phase": phase, "reason": result.reason}
-                )
-                return bracket_errors < 3
-            bracket_errors = 0
-            if result.verdict == "drift" and result.pp is not None and result.tg is not None:
-                old = dict(reference)
-                reference = {
-                    **reference,
-                    "pp": result.pp.mean,
-                    "tg": result.tg.mean,
-                    "cv_ref": max(0.01, result.pp.cv, result.tg.cv),
-                }
-                run.decision_threshold = max(0.01, 2.0 * float(reference["cv_ref"]))
-                summary["reference"]["current"] = reference
-                summary["reference"]["rebaselines"].append(
-                    {"phase": phase, "old": old, "new": dict(reference)}
-                )
+            if incomplete and not interrupt_state.stop_requested:
+                from llamatune.search import resume_tuning
+
+                outcome = resume_tuning(Path(str(incomplete["session_dir"])))
                 run.append(
                     {
-                        "type": "environment_drift",
-                        "phase": phase,
-                        "old_reference": old,
-                        "new_reference": reference,
+                        "type": "round_end" if outcome.exit_code in (0, 1) else "round_failed",
+                        "index": incomplete["index"],
+                        "session_dir": str(outcome.session_dir),
+                        "exit_code": outcome.exit_code,
+                        "resumed": True,
                     }
                 )
-                if len(summary["reference"]["rebaselines"]) >= 2:
-                    summary["warnings"].append(
-                        "environment unstable: consecutive phase brackets drifted"
-                    )
-            return True
-
-        champion: TrialConfig | None = None
-        champion_session: Path | None = None
-        completed_rounds = [
-            entry for entry in _entries(run.dir) if entry.get("type") == "round_end"
-        ]
-        for completed in completed_rounds:
-            config = completed.get("winner_config")
-            if completed.get("champion_changed") and isinstance(config, dict):
-                champion = TrialConfig.from_dict(config)
-                champion_session = Path(str(completed["session_dir"]))
-        summary["rounds"] = [dict(entry) for entry in completed_rounds]
-        default_data = reference.get("default_config")
-        default_config = (
-            TrialConfig.from_dict(default_data)
-            if isinstance(default_data, dict)
-            else TrialConfig(
-                gpu_layers=0,
-                moe_cpu_layers=0,
-                flash_attn=False,
-                ubatch=512,
-                batch=2048,
-                threads=max(1, hardware.physical_cores),
-                mmap=True,
-                no_kv_offload=False,
-                cache_type_k="f16",
-                cache_type_v="f16",
+                entries = _entries(run.dir)
+            run.append({"type": "phase", "phase": "reconnaissance"})
+            reference_value = (
+                dict(recon_entry["reference"])
+                if recon_entry
+                else _recon(run, model, llama, options)
             )
-        )
-        session_dirs = [
-            Path(str(entry["session_dir"]))
-            for entry in completed_rounds
-            if entry.get("session_dir")
-        ]
-        no_change = 0
-        failures = 0
-        ledger = build_ledger(
-            enumerate_space(
-                model,
-                llama,
-                hardware,
-                options,
-                champion=champion or default_config,
-                known_placements=(),
-            ),
-            *_trial_evidence(session_dirs)[:2],
-            trials=_trial_evidence(session_dirs)[2],
-        )
-        run.append({"type": "phase", "phase": "rounds"})
-        if not bracket("rounds"):
-            summary["stop_reason"] = "bracket_circuit_breaker"
-            return _finalize(run, summary, 3)
-        for index in range(len(completed_rounds) + 1, options.rounds_max + 1):
-            if stop:
-                break
-            remain = remaining_minutes(deadline, clock())
-            if not round_fits(
-                remain,
-                ab_reserved=(ab_reserved_minutes(options.ab_blocks) if deadline else 0.0),
-            ):
-                summary["stop_reason"] = "deadline"
-                summary["deferred"].append(
-                    {"kind": "round", "index": index, "reason": "insufficient time"}
+            if reference_value is None:
+                reference_value = _recon(run, model, llama, options)
+            if reference_value is None:
+                summary["stop_reason"] = "reconnaissance_failed"
+                summary["failed"].append(
+                    {"kind": "reconnaissance", "reason": "both attempts failed"}
                 )
-                run.append({"type": "deferred", **summary["deferred"][-1]})
-                break
-            tune_options = _profile(options, index, remain)
-            if champion is not None:
-                tune_options = dataclasses.replace(
-                    tune_options,
-                    initial_gpu_layers=champion.gpu_layers,
-                    initial_cpu_moe=champion.moe_cpu_layers,
+                return _finalize(run, summary, 3, interrupt_state=interrupt_state)
+            reference: dict[str, Any] = reference_value
+            if recon_entry is None:
+                run.append({"type": "recon_complete", "reference": reference})
+            summary["reference"] = {
+                "original": reference,
+                "current": reference,
+                "rebaselines": [],
+            }
+            run.decision_threshold = max(0.01, 2.0 * float(reference["cv_ref"]))
+            if reference.get("warmup_drift"):
+                summary["warnings"].append(
+                    "warmup_drift: reconnaissance halves differed beyond threshold"
                 )
-            from llamatune.search import run_tuning
-            from llamatune.session import Session
 
-            session = Session.create(
-                options.sessions_dir,
-                model=model,
-                hardware=assess_hardware(),
-                llama=llama,
-                options=tune_options,
-                argv=list(sys.argv),
-            )
-            run.append(
-                {
-                    "type": "round_start",
-                    "index": index,
-                    "session_dir": str(session.dir),
-                    "budget": tune_options.budget_trials,
-                    "steering": {
-                        tier: coverage.remaining_ids for tier, coverage in ledger.tiers.items()
-                    },
-                }
-            )
-            before = clock()
-            outcome = run_tuning(session, hardware, model, llama, tune_options)
-            wall = max(0.0, (clock() - before).total_seconds())
-            if outcome.exit_code not in (0, 1):
-                failures += 1
-                item = {
-                    "type": "round_failed",
-                    "index": index,
-                    "session_dir": str(outcome.session_dir),
-                    "exit_code": outcome.exit_code,
-                    "wall_s": wall,
-                }
-                run.append(item)
-                summary["failed"].append(item)
-                if failures >= 3:
-                    summary["stop_reason"] = "circuit_breaker"
-                    return _finalize(run, summary, 3)
-                continue
-            failures = 0
-            session_dirs.append(outcome.session_dir)
-            winner = outcome.analysis.get("winner")
-            contender = (
-                TrialConfig.from_dict(winner["config"])
-                if isinstance(winner, dict) and isinstance(winner.get("config"), dict)
-                else None
-            )
-            changed = False
-            challenge_payload: dict[str, Any] | None = None
-            if contender is not None and (
-                champion is None or contender.trial_id != champion.trial_id
-            ):
-                from llamatune.abtest import run_ab
+            bracket_number = 0
+            bracket_errors = 0
+            last_bracket: datetime | None = None
 
-                challenge = run_ab(
+            def bracket(phase: str) -> bool:
+                nonlocal bracket_number, bracket_errors, last_bracket, reference
+                current = clock()
+                if (
+                    last_bracket is not None
+                    and (current - last_bracket).total_seconds() < BRACKET_FRESH_MINUTES * 60
+                ):
+                    return True
+                from llamatune.calibrate import run_calibration
+
+                bracket_number += 1
+                run.select_bracket(bracket_number)
+                result = run_calibration(
                     run,
-                    champion,
-                    contender,
-                    blocks=max(3, options.ab_blocks - 2),
-                    model=model,
-                    llama=llama,
-                    options=options,
-                    label=f"challenge-{index}",
+                    _synth_record(reference, model, llama, options, run),
+                    model,
+                    llama,
+                    _bracket_options(options),
                 )
-                challenge_payload = cast(dict[str, Any], _jsonable(challenge))
-                summary["challenges"].append(challenge_payload)
-                run.append({"type": "challenge", "round": index, **challenge_payload})
-                if challenge.verdict == "b":
-                    champion, champion_session, changed = (
-                        contender,
-                        outcome.session_dir,
-                        True,
+                payload = cast(dict[str, Any], _jsonable(result))
+                run.append({"type": "bracket", "phase": phase, "number": bracket_number, **payload})
+                last_bracket = current
+                if result.verdict == "error":
+                    bracket_errors += 1
+                    summary["failed"].append(
+                        {"kind": "bracket", "phase": phase, "reason": result.reason}
                     )
-            no_change = 0 if changed else no_change + 1
-            executed, pruned, trials = _trial_evidence(session_dirs)
-            known = () if champion is None else ((champion.gpu_layers, champion.moe_cpu_layers),)
+                    return bracket_errors < 3
+                bracket_errors = 0
+                if result.verdict == "drift" and result.pp is not None and result.tg is not None:
+                    old = dict(reference)
+                    reference = {
+                        **reference,
+                        "pp": result.pp.mean,
+                        "tg": result.tg.mean,
+                        "cv_ref": max(0.01, result.pp.cv, result.tg.cv),
+                    }
+                    run.decision_threshold = max(0.01, 2.0 * float(reference["cv_ref"]))
+                    summary["reference"]["current"] = reference
+                    summary["reference"]["rebaselines"].append(
+                        {"phase": phase, "old": old, "new": dict(reference)}
+                    )
+                    run.append(
+                        {
+                            "type": "environment_drift",
+                            "phase": phase,
+                            "old_reference": old,
+                            "new_reference": reference,
+                        }
+                    )
+                    if len(summary["reference"]["rebaselines"]) >= 2:
+                        summary["warnings"].append(
+                            "environment unstable: consecutive phase brackets drifted"
+                        )
+                return True
+
+            champion: TrialConfig | None = None
+            champion_session: Path | None = None
+            completed_rounds = [
+                entry for entry in _entries(run.dir) if entry.get("type") == "round_end"
+            ]
+            for completed in completed_rounds:
+                config = completed.get("winner_config")
+                if completed.get("champion_changed") and isinstance(config, dict):
+                    champion = TrialConfig.from_dict(config)
+                    champion_session = Path(str(completed["session_dir"]))
+            summary["rounds"] = [dict(entry) for entry in completed_rounds]
+            default_data = reference.get("default_config")
+            default_config = (
+                TrialConfig.from_dict(default_data)
+                if isinstance(default_data, dict)
+                else TrialConfig(
+                    gpu_layers=0,
+                    moe_cpu_layers=0,
+                    flash_attn=False,
+                    ubatch=512,
+                    batch=2048,
+                    threads=max(1, hardware.physical_cores),
+                    mmap=True,
+                    no_kv_offload=False,
+                    cache_type_k="f16",
+                    cache_type_v="f16",
+                )
+            )
+            session_dirs = [
+                Path(str(entry["session_dir"]))
+                for entry in completed_rounds
+                if entry.get("session_dir")
+            ]
+            no_change = 0
+            failures = 0
             ledger = build_ledger(
                 enumerate_space(
                     model,
@@ -881,142 +707,258 @@ def run_marathon(
                     hardware,
                     options,
                     champion=champion or default_config,
-                    known_placements=known,
+                    known_placements=(),
                 ),
-                executed,
-                pruned,
-                trials=trials,
+                *_trial_evidence(session_dirs)[:2],
+                trials=_trial_evidence(session_dirs)[2],
             )
-            item = {
-                "type": "round_end",
-                "index": index,
-                "session_dir": str(outcome.session_dir),
-                "exit_code": outcome.exit_code,
-                "winner_config": contender.to_dict() if contender else None,
-                "champion_changed": changed,
-                "wall_s": wall,
-                "coverage_pct": coverage_percent(ledger),
-                "challenge": challenge_payload,
-            }
-            run.append(item)
-            summary["rounds"].append(item)
-            run.append(
-                {
-                    "type": "coverage_snapshot",
-                    "round": index,
-                    "ledger": _jsonable(ledger),
-                }
-            )
-            if has_converged(no_change, options.converge_rounds, ledger):
-                summary["stop_reason"] = "converged"
-                break
-        else:
-            summary["stop_reason"] = "rounds_max"
-        summary["ledger"] = _jsonable(ledger)
-        summary["champion"] = {
-            "config": champion.to_dict() if champion else None,
-            "session_dir": str(champion_session) if champion_session else None,
-            "defaults": champion is None,
-        }
-
-        if stop:
-            summary["stop_reason"] = "interrupted"
-            return _finalize(run, summary, 4)
-        run.append({"type": "phase", "phase": "matrix"})
-        if not bracket("matrix"):
-            summary["stop_reason"] = "bracket_circuit_breaker"
-            return _finalize(run, summary, 3)
-        remain = remaining_minutes(deadline, clock())
-        if remain is None or remain >= MATRIX_MIN_MINUTES:
-            from llamatune.matrix import run_matrix
-
-            if champion_session is not None:
-                try:
-                    champion_analysis = json.loads(
-                        (champion_session / "analysis.json").read_text(encoding="utf-8")
+            run.append({"type": "phase", "phase": "rounds"})
+            if not bracket("rounds"):
+                summary["stop_reason"] = "bracket_circuit_breaker"
+                return _finalize(run, summary, 3, interrupt_state=interrupt_state)
+            for index in range(len(completed_rounds) + 1, options.rounds_max + 1):
+                journal_interrupts(interrupt_state)
+                if interrupt_state.stop_requested:
+                    break
+                remain = remaining_minutes(deadline, clock())
+                if not round_fits(
+                    remain,
+                    ab_reserved=(ab_reserved_minutes(options.ab_blocks) if deadline else 0.0),
+                ):
+                    summary["stop_reason"] = "deadline"
+                    summary["deferred"].append(
+                        {"kind": "round", "index": index, "reason": "insufficient time"}
                     )
-                    winner = champion_analysis.get("winner")
-                    validated = champion_analysis.get("feasibility", {}).get("ctx_validated")
-                    if (
-                        isinstance(winner, dict)
-                        and winner.get("confirmed") is True
-                        and isinstance(validated, int)
-                        and options.ctx_size is not None
-                        and validated >= options.ctx_size
-                    ):
-                        run.champion_evidence = {
-                            "ctx": options.ctx_size,
-                            "config": winner.get("config"),
-                            "pp": winner.get("pp"),
-                            "tg": winner.get("tg"),
-                            "evidence": str(champion_session / "analysis.json"),
-                        }
-                except (OSError, TypeError, ValueError):
-                    run.champion_evidence = None
-
-            cells = run_matrix(
-                run,
-                champion or default_config,
-                model,
-                llama,
-                options,
-                remaining_minutes_fn=lambda: (
-                    float("inf")
-                    if deadline is None
-                    else max(
-                        0.0,
-                        cast(float, remaining_minutes(deadline, clock()))
-                        - ab_reserved_minutes(options.ab_blocks),
+                    run.append({"type": "deferred", **summary["deferred"][-1]})
+                    break
+                tune_options = _profile(options, index, remain)
+                if champion is not None:
+                    tune_options = dataclasses.replace(
+                        tune_options,
+                        initial_gpu_layers=champion.gpu_layers,
+                        initial_cpu_moe=champion.moe_cpu_layers,
                     )
-                ),
-            )
-            summary["matrix"] = _jsonable(cells)
-        else:
-            summary["deferred"].append({"kind": "matrix", "reason": "insufficient time"})
-            run.append({"type": "deferred", **summary["deferred"][-1]})
+                from llamatune.search import run_tuning
+                from llamatune.session import Session
 
-        exit_code = 1 if summary["failed"] else 0
-        run.append({"type": "phase", "phase": "verification"})
-        if not bracket("verification"):
-            summary["stop_reason"] = "bracket_circuit_breaker"
-            return _finalize(run, summary, 3)
-        if champion is None:
-            summary["warnings"].append("final verification skipped: defaults remain champion")
-            summary["verification"] = {
-                "status": "skipped",
-                "reason": "defaults champion",
-            }
-            exit_code = 1
-        else:
-            from llamatune.abtest import run_ab
-
-            verified = run_ab(
-                run,
-                None,
-                champion,
-                blocks=options.ab_blocks,
-                model=model,
-                llama=llama,
-                options=options,
-                label="final",
-            )
-            summary["ab"] = _jsonable(verified)
-            replicated = verified.verdict == "b"
-            summary["verification"] = {
-                "status": "replicated" if replicated else "not replicated",
-                "verdict": verified.verdict,
-            }
-            if not replicated:
-                summary["warnings"].append(
-                    "not replicated: champion did not beat defaults in final A/B"
+                session = Session.create(
+                    options.sessions_dir,
+                    model=model,
+                    hardware=assess_hardware(),
+                    llama=llama,
+                    options=tune_options,
+                    argv=list(sys.argv),
                 )
+                run.append(
+                    {
+                        "type": "round_start",
+                        "index": index,
+                        "session_dir": str(session.dir),
+                        "budget": tune_options.budget_trials,
+                        "steering": {
+                            tier: coverage.remaining_ids for tier, coverage in ledger.tiers.items()
+                        },
+                    }
+                )
+                before = clock()
+                outcome = run_tuning(session, hardware, model, llama, tune_options)
+                wall = max(0.0, (clock() - before).total_seconds())
+                if outcome.exit_code not in (0, 1):
+                    failures += 1
+                    item = {
+                        "type": "round_failed",
+                        "index": index,
+                        "session_dir": str(outcome.session_dir),
+                        "exit_code": outcome.exit_code,
+                        "wall_s": wall,
+                    }
+                    run.append(item)
+                    summary["failed"].append(item)
+                    if failures >= 3:
+                        summary["stop_reason"] = "circuit_breaker"
+                        return _finalize(run, summary, 3, interrupt_state=interrupt_state)
+                    continue
+                failures = 0
+                session_dirs.append(outcome.session_dir)
+                winner = outcome.analysis.get("winner")
+                contender = (
+                    TrialConfig.from_dict(winner["config"])
+                    if isinstance(winner, dict) and isinstance(winner.get("config"), dict)
+                    else None
+                )
+                changed = False
+                challenge_payload: dict[str, Any] | None = None
+                if contender is not None and (
+                    champion is None or contender.trial_id != champion.trial_id
+                ):
+                    from llamatune.abtest import run_ab
+
+                    challenge = run_ab(
+                        run,
+                        champion,
+                        contender,
+                        blocks=max(3, options.ab_blocks - 2),
+                        model=model,
+                        llama=llama,
+                        options=options,
+                        label=f"challenge-{index}",
+                    )
+                    challenge_payload = cast(dict[str, Any], _jsonable(challenge))
+                    summary["challenges"].append(challenge_payload)
+                    run.append({"type": "challenge", "round": index, **challenge_payload})
+                    if challenge.verdict == "b":
+                        champion, champion_session, changed = (
+                            contender,
+                            outcome.session_dir,
+                            True,
+                        )
+                no_change = 0 if changed else no_change + 1
+                executed, pruned, trials = _trial_evidence(session_dirs)
+                known = (
+                    () if champion is None else ((champion.gpu_layers, champion.moe_cpu_layers),)
+                )
+                ledger = build_ledger(
+                    enumerate_space(
+                        model,
+                        llama,
+                        hardware,
+                        options,
+                        champion=champion or default_config,
+                        known_placements=known,
+                    ),
+                    executed,
+                    pruned,
+                    trials=trials,
+                )
+                item = {
+                    "type": "round_end",
+                    "index": index,
+                    "session_dir": str(outcome.session_dir),
+                    "exit_code": outcome.exit_code,
+                    "winner_config": contender.to_dict() if contender else None,
+                    "champion_changed": changed,
+                    "wall_s": wall,
+                    "coverage_pct": coverage_percent(ledger),
+                    "challenge": challenge_payload,
+                }
+                run.append(item)
+                summary["rounds"].append(item)
+                run.append(
+                    {
+                        "type": "coverage_snapshot",
+                        "round": index,
+                        "ledger": _jsonable(ledger),
+                    }
+                )
+                if has_converged(no_change, options.converge_rounds, ledger):
+                    summary["stop_reason"] = "converged"
+                    break
+            else:
+                summary["stop_reason"] = "rounds_max"
+            summary["ledger"] = _jsonable(ledger)
+            summary["champion"] = {
+                "config": champion.to_dict() if champion else None,
+                "session_dir": str(champion_session) if champion_session else None,
+                "defaults": champion is None,
+            }
+
+            journal_interrupts(interrupt_state)
+            if interrupt_state.stop_requested:
+                summary["stop_reason"] = "interrupted"
+                return _finalize(run, summary, 4, interrupt_state=interrupt_state)
+            run.append({"type": "phase", "phase": "matrix"})
+            if not bracket("matrix"):
+                summary["stop_reason"] = "bracket_circuit_breaker"
+                return _finalize(run, summary, 3, interrupt_state=interrupt_state)
+            remain = remaining_minutes(deadline, clock())
+            if remain is None or remain >= MATRIX_MIN_MINUTES:
+                from llamatune.matrix import run_matrix
+
+                if champion_session is not None:
+                    try:
+                        champion_analysis = json.loads(
+                            (champion_session / "analysis.json").read_text(encoding="utf-8")
+                        )
+                        winner = champion_analysis.get("winner")
+                        validated = champion_analysis.get("feasibility", {}).get("ctx_validated")
+                        if (
+                            isinstance(winner, dict)
+                            and winner.get("confirmed") is True
+                            and isinstance(validated, int)
+                            and options.ctx_size is not None
+                            and validated >= options.ctx_size
+                        ):
+                            run.champion_evidence = {
+                                "ctx": options.ctx_size,
+                                "config": winner.get("config"),
+                                "pp": winner.get("pp"),
+                                "tg": winner.get("tg"),
+                                "evidence": str(champion_session / "analysis.json"),
+                            }
+                    except (OSError, TypeError, ValueError):
+                        run.champion_evidence = None
+
+                cells = run_matrix(
+                    run,
+                    champion or default_config,
+                    model,
+                    llama,
+                    options,
+                    remaining_minutes_fn=lambda: (
+                        float("inf")
+                        if deadline is None
+                        else max(
+                            0.0,
+                            cast(float, remaining_minutes(deadline, clock()))
+                            - ab_reserved_minutes(options.ab_blocks),
+                        )
+                    ),
+                )
+                summary["matrix"] = _jsonable(cells)
+            else:
+                summary["deferred"].append({"kind": "matrix", "reason": "insufficient time"})
+                run.append({"type": "deferred", **summary["deferred"][-1]})
+
+            exit_code = 1 if summary["failed"] else 0
+            run.append({"type": "phase", "phase": "verification"})
+            if not bracket("verification"):
+                summary["stop_reason"] = "bracket_circuit_breaker"
+                return _finalize(run, summary, 3, interrupt_state=interrupt_state)
+            if champion is None:
+                summary["warnings"].append("final verification skipped: defaults remain champion")
+                summary["verification"] = {
+                    "status": "skipped",
+                    "reason": "defaults champion",
+                }
                 exit_code = 1
-        run.append({"type": "phase", "phase": "report"})
-        return _finalize(run, summary, exit_code)
-    except KeyboardInterrupt:
-        summary["stop_reason"] = "interrupted"
-        run.append({"type": "interrupted", "immediate": second})
-        return _finalize(run, summary, 4)
-    finally:
-        for sig, handler in old_handlers.items():
-            signal.signal(sig, handler)
+            else:
+                from llamatune.abtest import run_ab
+
+                verified = run_ab(
+                    run,
+                    None,
+                    champion,
+                    blocks=options.ab_blocks,
+                    model=model,
+                    llama=llama,
+                    options=options,
+                    label="final",
+                )
+                summary["ab"] = _jsonable(verified)
+                replicated = verified.verdict == "b"
+                summary["verification"] = {
+                    "status": "replicated" if replicated else "not replicated",
+                    "verdict": verified.verdict,
+                }
+                if not replicated:
+                    summary["warnings"].append(
+                        "not replicated: champion did not beat defaults in final A/B"
+                    )
+                    exit_code = 1
+            run.append({"type": "phase", "phase": "report"})
+            return _finalize(run, summary, exit_code, interrupt_state=interrupt_state)
+        except KeyboardInterrupt:
+            summary["stop_reason"] = "interrupted"
+            journal_interrupts(interrupt_state)
+            run.append({"type": "interrupted", "immediate": interrupt_state.second_signal})
+            return _finalize(run, summary, 4, interrupt_state=interrupt_state)

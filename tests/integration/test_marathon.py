@@ -363,9 +363,17 @@ def test_reentry_retains_mismatched_unfinished_run(tmp_path: Path) -> None:
     assert mismatches == (run.dir,)
 
 
-def test_journal_reader_ignores_non_records_and_stops_at_torn_tail(tmp_path: Path) -> None:
-    (tmp_path / "journal.jsonl").write_text('1\n{"type":"phase"}\n{"torn"')
-    assert _entries(tmp_path) == [{"type": "phase"}]
+def test_journal_reader_skips_corrupt_lines_and_keeps_later_entries(tmp_path: Path) -> None:
+    (tmp_path / "journal.jsonl").write_text(
+        '{"type":"phase","phase":"first"}\n'
+        "{corrupt middle line\n"
+        '{"type":"phase","phase":"last"}\n'
+        '{"torn tail"',
+        encoding="utf-8",
+    )
+    with pytest.warns(RuntimeWarning, match="is corrupt and was skipped"):
+        entries = _entries(tmp_path)
+    assert [entry["phase"] for entry in entries] == ["first", "last"]
     assert _entries(tmp_path / "absent") == []
 
 

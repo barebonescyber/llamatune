@@ -2,19 +2,33 @@
 
 from __future__ import annotations
 
-import dataclasses
 import json
-import os
-import secrets
-import signal
 import sys
 import warnings
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime, timedelta, tzinfo
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
 from llamatune._version import __version__
+from llamatune.evidence import (
+    EvidenceWriter,
+    InterruptState,
+    PathEscapeError,
+    confined_path,
+    create_unique_dir,
+    install_interrupt_handlers,
+    read_journal_lines,
+)
+from llamatune.evidence import (
+    jsonable as _jsonable,
+)
+from llamatune.evidence import (
+    resolve_deadline as resolve_deadline,
+)
+from llamatune.evidence import (
+    utc_iso as _utc_iso,
+)
 from llamatune.types import (
     CalibrationResult,
     DiscoveredModel,
@@ -31,7 +45,6 @@ MIN_TUNE_MINUTES = 20.0
 SHUTDOWN_MARGIN_MIN = 5.0
 _CALIBRATION_FALLBACK_S = 300.0
 _CALIBRATION_SAFETY_FACTOR = 1.5
-_CREATE_RETRIES = 5
 
 _PROFILES: dict[str, dict[str, float | int]] = {
     "standard": {
@@ -51,44 +64,18 @@ _PROFILES: dict[str, dict[str, float | int]] = {
 }
 
 
-class NightshiftPathError(Exception):
+class NightshiftPathError(PathEscapeError):
     """A requested run artifact path escaped the Night Shift directory."""
 
 
-def _jsonable(value: Any) -> Any:
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return cast(
-            dict[str, Any],
-            {
-                field.name: _jsonable(getattr(value, field.name))
-                for field in dataclasses.fields(value)
-            },
-        )
-    if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list, frozenset, set)):
-        return [_jsonable(item) for item in value]
-    if isinstance(value, Path):
-        return str(value)
-    return value
-
-
-def _utc_iso() -> str:
-    return datetime.now(UTC).isoformat()
-
-
 def _confine(base: Path, *parts: str) -> Path:
-    resolved = base.resolve()
-    candidate = base.joinpath(*parts)
-    try:
-        candidate.resolve().relative_to(resolved)
-    except ValueError:
-        raise NightshiftPathError(f"path {candidate} escapes nightshift directory {base}") from None
-    return candidate
+    return confined_path(base, *parts, error=NightshiftPathError)
 
 
-class NightshiftRun:
+class NightshiftRun(EvidenceWriter):
     """The only writer allowed inside one Night Shift evidence directory."""
+
+    path_error: type[PathEscapeError] = NightshiftPathError
 
     def __init__(self, run_dir: Path) -> None:
         self._dir = run_dir
@@ -105,19 +92,7 @@ class NightshiftRun:
         argv: Sequence[str],
     ) -> NightshiftRun:
         root = sessions_dir / "nightshift"
-        root.mkdir(parents=True, exist_ok=True)
-        run_dir: Path | None = None
-        for _ in range(_CREATE_RETRIES):
-            name = f"{datetime.now(UTC):%Y%m%d-%H%M%S}-{secrets.token_hex(3)}"
-            candidate = root / name
-            try:
-                candidate.mkdir(exist_ok=False)
-            except FileExistsError:
-                continue
-            run_dir = candidate
-            break
-        if run_dir is None:
-            raise NightshiftPathError(f"could not allocate a unique run directory under {root}")
+        run_dir = create_unique_dir(root, "", error=NightshiftPathError)
         run = cls(run_dir)
         _confine(run_dir, "calibrations").mkdir(exist_ok=True)
         run.write_json(
@@ -130,8 +105,8 @@ class NightshiftRun:
                 "created": _utc_iso(),
             },
         )
-        run.write_json("hardware.json", _jsonable(hardware))
-        run.write_json("llamacpp.json", _jsonable(llama))
+        run.write_json("hardware.json", cast(dict[str, Any], _jsonable(hardware)))
+        run.write_json("llamacpp.json", cast(dict[str, Any], _jsonable(llama)))
         run.append({"type": "nightshift_start", "tool_version": __version__})
         return run
 
@@ -142,15 +117,6 @@ class NightshiftRun:
             raise FileNotFoundError(f"not a Night Shift run: {path}")
         return cls(path)
 
-    def append(self, entry: dict[str, Any]) -> None:
-        record = _jsonable(dict(entry))
-        record.setdefault("ts", _utc_iso())
-        path = _confine(self._dir, "journal.jsonl")
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-
     def calibration_dir(self, fingerprint16: str, n: int) -> Path:
         invalid = not fingerprint16 or any(
             character not in "0123456789abcdefABCDEF" for character in fingerprint16
@@ -160,40 +126,6 @@ class NightshiftRun:
         path = _confine(self._dir, "calibrations", fingerprint16, f"run-{n}")
         path.mkdir(parents=True, exist_ok=True)
         return path
-
-    def write_json(self, name: str, payload: dict[str, Any]) -> None:
-        path = _confine(self._dir, name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as handle:
-            json.dump(_jsonable(payload), handle, indent=2, sort_keys=True)
-            handle.write("\n")
-
-    def write_text(self, name: str, text: str) -> None:
-        path = _confine(self._dir, name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
-
-
-def resolve_deadline(
-    start: datetime,
-    until: str | None,
-    max_hours: float | None,
-    *,
-    local_tz: tzinfo | None = None,
-) -> datetime | None:
-    """Resolve the earliest supplied deadline; pure when ``local_tz`` is supplied."""
-    candidates: list[datetime] = []
-    if until is not None:
-        hour, minute = (int(part) for part in until.split(":"))
-        zone = local_tz or datetime.now().astimezone().tzinfo or UTC
-        local_start = start.astimezone(zone)
-        candidate = local_start.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if candidate <= local_start:
-            candidate += timedelta(days=1)
-        candidates.append(candidate.astimezone(UTC))
-    if max_hours is not None:
-        candidates.append(start + timedelta(hours=max_hours))
-    return min(candidates) if candidates else None
 
 
 def profile_values(options: NightshiftOptions, *, deepen: bool = False) -> dict[str, float | int]:
@@ -344,27 +276,11 @@ def _session_fingerprint(path: Path) -> str | None:
 
 
 def _interrupted_session(path: Path) -> bool:
-    try:
-        lines = (path / "journal.jsonl").read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return False
-    entries: list[dict[str, Any]] = []
-    for index, line in enumerate(lines):
-        if not line.strip():
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            if index == len(lines) - 1:
-                break
-            return False
-        if isinstance(entry, dict):
-            entries.append(entry)
+    entries, _corruption = read_journal_lines(path / "journal.jsonl")
     return any(
         entry.get("type") == "session_end"
         and entry.get("reason") in {"stopped_by_user", "interrupted"}
         for entry in entries
-        if isinstance(entry, dict)
     )
 
 
@@ -452,16 +368,14 @@ def _total_invocations(items: Sequence[dict[str, Any]]) -> int:
         if not isinstance(session_dir, str):
             continue
         try:
-            lines = (Path(session_dir) / "journal.jsonl").read_text(encoding="utf-8").splitlines()
-            entries = (json.loads(line) for line in lines if line.strip())
-            total += sum(
-                1
-                for entry in entries
-                if isinstance(entry, dict)
-                and entry.get("type") in {"baseline_run", "trial", "confirmation_run"}
-            )
-        except (OSError, json.JSONDecodeError):
+            entries, _corruption = read_journal_lines(Path(session_dir) / "journal.jsonl")
+        except OSError:
             continue
+        total += sum(
+            1
+            for entry in entries
+            if entry.get("type") in {"baseline_run", "trial", "confirmation_run"}
+        )
     return total
 
 
@@ -495,7 +409,11 @@ def _finalize(
     llama: LlamaCppReport,
     models: Sequence[DiscoveredModel],
     stopped: bool = False,
+    interrupt_state: InterruptState | None = None,
 ) -> NightshiftOutcome:
+    if interrupt_state is not None:
+        for signum, immediate in interrupt_state.drain_events():
+            run.append({"type": "interrupted", "signal": signum, "immediate": immediate})
     summary: dict[str, Any] = {
         "schema_version": 1,
         "options": _jsonable(options),
@@ -649,322 +567,331 @@ def run_nightshift(
         )
 
     by_fingerprint = {model.report.fingerprint: model for model in models}
-    stop = False
-    second_signal = False
-    signalled = False
-    old_handlers: dict[signal.Signals, Any] = {}
 
-    def handle_signal(signum: int, _frame: Any) -> None:
-        nonlocal stop, second_signal, signalled
-        if stop:
-            second_signal = True
-            run.append({"type": "interrupted", "signal": signum, "immediate": True})
-            raise KeyboardInterrupt
-        signalled = True
-        stop = True
-        run.append({"type": "interrupted", "signal": signum, "immediate": False})
+    def _journal_interrupts(state: InterruptState) -> None:
+        """Journal queued interrupt events at the next safe main-flow point."""
+        for signum, immediate in state.drain_events():
+            run.append({"type": "interrupted", "signal": signum, "immediate": immediate})
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        old_handlers[sig] = signal.getsignal(sig)
-        signal.signal(sig, handle_signal)
+    with install_interrupt_handlers() as interrupt_state:
+        failed = False
+        tune_failure_models: list[str] = []
+        calibrated_fingerprints: set[str] = set()
+        tuned_fingerprints: set[str] = set()
+        phase_queues: dict[str, list[WorkItem]] = {
+            "resume": [item for item in plan if item.kind == "resume"],
+            "tune": [item for item in plan if item.kind == "tune"],
+            "calibrate": [item for item in plan if item.kind == "calibrate"],
+            "retune": [],
+        }
+        consumed: dict[str, int] = {}
 
-    failed = False
-    tune_failure_models: list[str] = []
-    calibrated_fingerprints: set[str] = set()
-    tuned_fingerprints: set[str] = set()
-    phase_queues: dict[str, list[WorkItem]] = {
-        "resume": [item for item in plan if item.kind == "resume"],
-        "tune": [item for item in plan if item.kind == "tune"],
-        "calibrate": [item for item in plan if item.kind == "calibrate"],
-        "retune": [],
-    }
-    consumed: dict[str, int] = {}
+        try:
+            for phase in ("resume", "tune", "calibrate", "retune"):
+                queue = phase_queues[phase]
+                index = 0
+                while index < len(queue) and not interrupt_state.stop_requested:
+                    _journal_interrupts(interrupt_state)
+                    item = queue[index]
+                    index += 1
+                    consumed[phase] = index
+                    remaining = _remaining_minutes(deadline, clock())
+                    if item.kind != "calibrate" and not item_fits(item, remaining):
+                        record = {
+                            **_item_dict(item),
+                            "outcome": "deferred",
+                            "reason": "insufficient time for tune-class item",
+                            "wall_s": 0.0,
+                        }
+                        items.append(record)
+                        run.append({"type": "deferred", **record})
+                        continue
+                    if item.kind == "calibrate" and not item_fits(item, remaining):
+                        record = {
+                            **_item_dict(item),
+                            "outcome": "deferred",
+                            "reason": "calibration estimate exceeds remaining time",
+                            "wall_s": 0.0,
+                        }
+                        items.append(record)
+                        run.append({"type": "deferred", **record})
+                        continue
+                    run.append({"type": "item_start", **_item_dict(item)})
+                    item_started = clock()
+                    result_record: dict[str, Any]
+                    post_item_records: list[dict[str, Any]] = []
+                    if item.kind == "calibrate":
+                        from llamatune.calibrate import run_calibration
 
-    try:
-        for phase in ("resume", "tune", "calibrate", "retune"):
-            queue = phase_queues[phase]
-            index = 0
-            while index < len(queue) and not stop:
-                item = queue[index]
-                index += 1
-                consumed[phase] = index
-                remaining = _remaining_minutes(deadline, clock())
-                if item.kind != "calibrate" and not item_fits(item, remaining):
-                    record = {
-                        **_item_dict(item),
-                        "outcome": "deferred",
-                        "reason": "insufficient time for tune-class item",
-                        "wall_s": 0.0,
-                    }
-                    items.append(record)
-                    run.append({"type": "deferred", **record})
-                    continue
-                if item.kind == "calibrate" and not item_fits(item, remaining):
-                    record = {
-                        **_item_dict(item),
-                        "outcome": "deferred",
-                        "reason": "calibration estimate exceeds remaining time",
-                        "wall_s": 0.0,
-                    }
-                    items.append(record)
-                    run.append({"type": "deferred", **record})
-                    continue
-                run.append({"type": "item_start", **_item_dict(item)})
-                item_started = clock()
-                result_record: dict[str, Any]
-                post_item_records: list[dict[str, Any]] = []
-                if item.kind == "calibrate":
-                    from llamatune.calibrate import run_calibration
-
-                    model = by_fingerprint[item.fingerprint or ""]
-                    reference = records[item.reference_fingerprint or ""]
-                    try:
-                        calibration = run_calibration(run, reference, model.report, llama, options)
-                    except Exception as exc:
-                        calibration = CalibrationResult(
-                            fingerprint=model.report.fingerprint,
-                            reference_session=reference.session_dir,
-                            verdict="error",
-                            pp=None,
-                            tg=None,
-                            drift_pp=None,
-                            drift_tg=None,
-                            threshold=max(options.drift_threshold, 2 * reference.noise_floor_cv),
-                            runs=options.calibration_runs,
-                            reason=str(exc),
-                            transfer_from=(
-                                reference.fingerprint
-                                if reference.fingerprint != model.report.fingerprint
-                                else None
-                            ),
-                            build_changed=reference.help_sha256 != llama.help_sha256,
-                            artifact_dir=None,
-                        )
-                    calibrated_fingerprints.add(model.report.fingerprint)
-                    result_record = {
-                        **_item_dict(item),
-                        "outcome": calibration.verdict,
-                        "calibration": _jsonable(calibration),
-                    }
-                    run.append({"type": "calibration", **result_record})
-                    if calibration.verdict in {"drift", "error"}:
-                        retune = WorkItem(
-                            kind="retune",
-                            model_path=model.path,
-                            fingerprint=model.report.fingerprint,
-                            session_dir=None,
-                            reference_fingerprint=None,
-                            estimated_minutes=None,
-                            reason=f"calibration verdict: {calibration.verdict}",
-                            depth_workload=reference.depth_workload,
-                        )
-                        phase_queues["retune"].append(retune)
-                        run.append({"type": "retune_enqueued", **_item_dict(retune)})
-                    if calibration.verdict == "error":
-                        failed = True
-                else:
-                    session_dir = item.session_dir
-                    try:
-                        if item.kind == "resume":
-                            if session_dir is None:
-                                raise ValueError("resume item has no session directory")
-                            outcome = resume_tuning(session_dir)
-                        else:
-                            model = by_fingerprint[item.fingerprint or ""]
-                            current_hardware = assess_hardware()
-                            tune_options = _tune_options(
-                                options,
-                                current_hardware,
-                                remaining,
-                                deepen=item.kind == "deepen",
-                                depth=item.depth_workload,
+                        model = by_fingerprint[item.fingerprint or ""]
+                        reference = records[item.reference_fingerprint or ""]
+                        try:
+                            calibration = run_calibration(
+                                run, reference, model.report, llama, options
                             )
-                            session = Session.create(
-                                options.sessions_dir,
-                                model=model.report,
-                                hardware=current_hardware,
-                                llama=llama,
-                                options=tune_options,
-                                argv=sys.argv,
+                        except Exception as exc:
+                            calibration = CalibrationResult(
+                                fingerprint=model.report.fingerprint,
+                                reference_session=reference.session_dir,
+                                verdict="error",
+                                pp=None,
+                                tg=None,
+                                drift_pp=None,
+                                drift_tg=None,
+                                threshold=max(
+                                    options.drift_threshold, 2 * reference.noise_floor_cv
+                                ),
+                                runs=options.calibration_runs,
+                                reason=str(exc),
+                                transfer_from=(
+                                    reference.fingerprint
+                                    if reference.fingerprint != model.report.fingerprint
+                                    else None
+                                ),
+                                build_changed=reference.help_sha256 != llama.help_sha256,
+                                artifact_dir=None,
                             )
-                            session_dir = session.dir
-                            outcome = run_tuning(
-                                session, current_hardware, model.report, llama, tune_options
-                            )
+                        calibrated_fingerprints.add(model.report.fingerprint)
                         result_record = {
                             **_item_dict(item),
-                            "session_dir": str(session_dir),
-                            "outcome": "succeeded" if outcome.exit_code in {0, 1} else "failed",
-                            "tune_exit_code": outcome.exit_code,
+                            "outcome": calibration.verdict,
+                            "calibration": _jsonable(calibration),
                         }
-                    except Exception as exc:
-                        result_record = {
-                            **_item_dict(item),
-                            "session_dir": str(session_dir) if session_dir else None,
-                            "outcome": "failed",
-                            "error": str(exc),
-                        }
-                    if session_dir is not None and _interrupted_session(session_dir):
-                        stop = True
-                        result_record["outcome"] = "interrupted"
-                    if result_record["outcome"] == "failed":
-                        failed = True
-                        fingerprint = item.fingerprint or str(item.model_path)
-                        if not tune_failure_models or tune_failure_models[-1] != fingerprint:
-                            tune_failure_models.append(fingerprint)
-                        if item.kind == "tune" and item.fingerprint:
-                            representative = by_fingerprint[item.fingerprint]
-                            for sibling in models:
-                                if (
-                                    sibling.representative
-                                    or sibling.group_key != representative.group_key
-                                    or sibling.report.fingerprint in records
-                                ):
-                                    continue
-                                deferred = {
-                                    "kind": "calibrate",
-                                    "model_path": str(sibling.path),
-                                    "fingerprint": sibling.report.fingerprint,
-                                    "reference_fingerprint": item.fingerprint,
-                                    "outcome": "deferred",
-                                    "reason": "representative tune failed",
-                                    "wall_s": 0.0,
-                                }
-                                post_item_records.append(deferred)
+                        run.append({"type": "calibration", **result_record})
+                        if calibration.verdict in {"drift", "error"}:
+                            retune = WorkItem(
+                                kind="retune",
+                                model_path=model.path,
+                                fingerprint=model.report.fingerprint,
+                                session_dir=None,
+                                reference_fingerprint=None,
+                                estimated_minutes=None,
+                                reason=f"calibration verdict: {calibration.verdict}",
+                                depth_workload=reference.depth_workload,
+                            )
+                            phase_queues["retune"].append(retune)
+                            run.append({"type": "retune_enqueued", **_item_dict(retune)})
+                        if calibration.verdict == "error":
+                            failed = True
                     else:
-                        tune_failure_models.clear()
-                        if item.fingerprint:
-                            tuned_fingerprints.add(item.fingerprint)
-                        records = _context_compatible_records(
-                            build_registry(options.sessions_dir), options.ctx_size
-                        )
-                        if item.kind == "tune" and item.fingerprint in records:
-                            representative = by_fingerprint[item.fingerprint]
-                            for sibling in models:
-                                if (
-                                    sibling.representative
-                                    or sibling.group_key != representative.group_key
-                                    or sibling.report.fingerprint in records
-                                    or sibling.report.fingerprint in calibrated_fingerprints
-                                ):
-                                    continue
-                                reference = records[item.fingerprint]
-                                phase_queues["calibrate"].append(
-                                    WorkItem(
-                                        kind="calibrate",
-                                        model_path=sibling.path,
-                                        fingerprint=sibling.report.fingerprint,
-                                        session_dir=None,
-                                        reference_fingerprint=item.fingerprint,
-                                        estimated_minutes=calibration_estimate_minutes(
-                                            reference, options.calibration_runs
-                                        ),
-                                        reason="dynamic transfer after representative tune",
-                                    )
+                        session_dir = item.session_dir
+                        try:
+                            if item.kind == "resume":
+                                if session_dir is None:
+                                    raise ValueError("resume item has no session directory")
+                                outcome = resume_tuning(session_dir)
+                            else:
+                                model = by_fingerprint[item.fingerprint or ""]
+                                current_hardware = assess_hardware()
+                                tune_options = _tune_options(
+                                    options,
+                                    current_hardware,
+                                    remaining,
+                                    deepen=item.kind == "deepen",
+                                    depth=item.depth_workload,
                                 )
-                wall_s = max(0.0, (clock() - item_started).total_seconds())
-                result_record["wall_s"] = wall_s
-                items.append(result_record)
-                run.append({"type": "item_end", **result_record})
-                for deferred in post_item_records:
-                    items.append(deferred)
-                    run.append({"type": "deferred", **deferred})
-                if tune_failure_breaker(tune_failure_models):
-                    warning_messages.append(
-                        "circuit breaker: three consecutive tune-class model failures"
-                    )
-                    stop = True
-                    break
-
-        if deadline is not None and not stop and deepening_changes_profile(options):
-            records = _context_compatible_records(
-                build_registry(options.sessions_dir), options.ctx_size
-            )
-            candidates = deepen_order(models, records)
-            for model in candidates:
-                remaining = _remaining_minutes(deadline, clock())
-                if remaining is None or remaining < MIN_TUNE_MINUTES or stop:
-                    break
-                item = WorkItem(
-                    kind="deepen",
-                    model_path=model.path,
-                    fingerprint=model.report.fingerprint,
-                    session_dir=None,
-                    reference_fingerprint=None,
-                    estimated_minutes=None,
-                    reason="deadline has spare time; deepen least-recently-tuned evidence",
-                )
-                phase_queues["retune"].append(item)
-                run.append({"type": "item_start", **_item_dict(item)})
-                item_started = clock()
-                deepen_session_dir: Path | None = None
-                try:
-                    current_hardware = assess_hardware()
-                    tune_options = _tune_options(options, current_hardware, remaining, deepen=True)
-                    session = Session.create(
-                        options.sessions_dir,
-                        model=model.report,
-                        hardware=current_hardware,
-                        llama=llama,
-                        options=tune_options,
-                        argv=sys.argv,
-                    )
-                    deepen_session_dir = session.dir
-                    outcome = run_tuning(
-                        session, current_hardware, model.report, llama, tune_options
-                    )
-                    interrupted = _interrupted_session(session.dir)
-                    result_record = {
-                        **_item_dict(item),
-                        "session_dir": str(session.dir),
-                        "outcome": (
-                            "interrupted"
-                            if interrupted
-                            else "succeeded"
-                            if outcome.exit_code in {0, 1}
-                            else "failed"
-                        ),
-                        "tune_exit_code": outcome.exit_code,
-                    }
-                except Exception as exc:
-                    interrupted = False
-                    result_record = {
-                        **_item_dict(item),
-                        "session_dir": (str(deepen_session_dir) if deepen_session_dir else None),
-                        "outcome": "failed",
-                        "error": str(exc),
-                    }
-                result_record["wall_s"] = max(0.0, (clock() - item_started).total_seconds())
-                items.append(result_record)
-                run.append({"type": "item_end", **result_record})
-                if interrupted:
-                    stop = True
-                    break
-                if result_record["outcome"] == "failed":
-                    failed = True
-                    if (
-                        not tune_failure_models
-                        or tune_failure_models[-1] != model.report.fingerprint
-                    ):
-                        tune_failure_models.append(model.report.fingerprint)
+                                session = Session.create(
+                                    options.sessions_dir,
+                                    model=model.report,
+                                    hardware=current_hardware,
+                                    llama=llama,
+                                    options=tune_options,
+                                    argv=sys.argv,
+                                )
+                                session_dir = session.dir
+                                outcome = run_tuning(
+                                    session, current_hardware, model.report, llama, tune_options
+                                )
+                            result_record = {
+                                **_item_dict(item),
+                                "session_dir": str(session_dir),
+                                "outcome": (
+                                    "succeeded" if outcome.exit_code in {0, 1} else "failed"
+                                ),
+                                "tune_exit_code": outcome.exit_code,
+                            }
+                        except Exception as exc:
+                            result_record = {
+                                **_item_dict(item),
+                                "session_dir": str(session_dir) if session_dir else None,
+                                "outcome": "failed",
+                                "error": str(exc),
+                            }
+                        if session_dir is not None and _interrupted_session(session_dir):
+                            interrupt_state.stop_requested = True
+                            result_record["outcome"] = "interrupted"
+                        if result_record["outcome"] == "failed":
+                            failed = True
+                            fingerprint = item.fingerprint or str(item.model_path)
+                            if not tune_failure_models or tune_failure_models[-1] != fingerprint:
+                                tune_failure_models.append(fingerprint)
+                            if item.kind == "tune" and item.fingerprint:
+                                representative = by_fingerprint[item.fingerprint]
+                                for sibling in models:
+                                    if (
+                                        sibling.representative
+                                        or sibling.group_key != representative.group_key
+                                        or sibling.report.fingerprint in records
+                                    ):
+                                        continue
+                                    deferred = {
+                                        "kind": "calibrate",
+                                        "model_path": str(sibling.path),
+                                        "fingerprint": sibling.report.fingerprint,
+                                        "reference_fingerprint": item.fingerprint,
+                                        "outcome": "deferred",
+                                        "reason": "representative tune failed",
+                                        "wall_s": 0.0,
+                                    }
+                                    post_item_records.append(deferred)
+                        else:
+                            tune_failure_models.clear()
+                            if item.fingerprint:
+                                tuned_fingerprints.add(item.fingerprint)
+                            records = _context_compatible_records(
+                                build_registry(options.sessions_dir), options.ctx_size
+                            )
+                            if item.kind == "tune" and item.fingerprint in records:
+                                representative = by_fingerprint[item.fingerprint]
+                                for sibling in models:
+                                    if (
+                                        sibling.representative
+                                        or sibling.group_key != representative.group_key
+                                        or sibling.report.fingerprint in records
+                                        or sibling.report.fingerprint in calibrated_fingerprints
+                                    ):
+                                        continue
+                                    reference = records[item.fingerprint]
+                                    phase_queues["calibrate"].append(
+                                        WorkItem(
+                                            kind="calibrate",
+                                            model_path=sibling.path,
+                                            fingerprint=sibling.report.fingerprint,
+                                            session_dir=None,
+                                            reference_fingerprint=item.fingerprint,
+                                            estimated_minutes=calibration_estimate_minutes(
+                                                reference, options.calibration_runs
+                                            ),
+                                            reason="dynamic transfer after representative tune",
+                                        )
+                                    )
+                    wall_s = max(0.0, (clock() - item_started).total_seconds())
+                    result_record["wall_s"] = wall_s
+                    items.append(result_record)
+                    run.append({"type": "item_end", **result_record})
+                    for deferred in post_item_records:
+                        items.append(deferred)
+                        run.append({"type": "deferred", **deferred})
                     if tune_failure_breaker(tune_failure_models):
                         warning_messages.append(
                             "circuit breaker: three consecutive tune-class model failures"
                         )
-                        stop = True
+                        interrupt_state.stop_requested = True
                         break
-                else:
-                    tune_failure_models.clear()
-        elif deadline is not None and not stop:
-            warning_messages.append(
-                "spare-time deepening skipped because its resolved profile matches the initial tune"
+
+            spare_time = (
+                deadline is not None
+                and not interrupt_state.stop_requested
+                and deepening_changes_profile(options)
             )
-    except KeyboardInterrupt:
-        stop = True
-        second_signal = True
-    finally:
-        for sig, handler in old_handlers.items():
-            signal.signal(sig, handler)
+            if spare_time:
+                records = _context_compatible_records(
+                    build_registry(options.sessions_dir), options.ctx_size
+                )
+                candidates = deepen_order(models, records)
+                for model in candidates:
+                    _journal_interrupts(interrupt_state)
+                    remaining = _remaining_minutes(deadline, clock())
+                    if (
+                        remaining is None
+                        or remaining < MIN_TUNE_MINUTES
+                        or interrupt_state.stop_requested
+                    ):
+                        break
+                    item = WorkItem(
+                        kind="deepen",
+                        model_path=model.path,
+                        fingerprint=model.report.fingerprint,
+                        session_dir=None,
+                        reference_fingerprint=None,
+                        estimated_minutes=None,
+                        reason="deadline has spare time; deepen least-recently-tuned evidence",
+                    )
+                    phase_queues["retune"].append(item)
+                    run.append({"type": "item_start", **_item_dict(item)})
+                    item_started = clock()
+                    deepen_session_dir: Path | None = None
+                    try:
+                        current_hardware = assess_hardware()
+                        tune_options = _tune_options(
+                            options, current_hardware, remaining, deepen=True
+                        )
+                        session = Session.create(
+                            options.sessions_dir,
+                            model=model.report,
+                            hardware=current_hardware,
+                            llama=llama,
+                            options=tune_options,
+                            argv=sys.argv,
+                        )
+                        deepen_session_dir = session.dir
+                        outcome = run_tuning(
+                            session, current_hardware, model.report, llama, tune_options
+                        )
+                        interrupted = _interrupted_session(session.dir)
+                        result_record = {
+                            **_item_dict(item),
+                            "session_dir": str(session.dir),
+                            "outcome": (
+                                "interrupted"
+                                if interrupted
+                                else "succeeded"
+                                if outcome.exit_code in {0, 1}
+                                else "failed"
+                            ),
+                            "tune_exit_code": outcome.exit_code,
+                        }
+                    except Exception as exc:
+                        interrupted = False
+                        result_record = {
+                            **_item_dict(item),
+                            "session_dir": (
+                                str(deepen_session_dir) if deepen_session_dir else None
+                            ),
+                            "outcome": "failed",
+                            "error": str(exc),
+                        }
+                    result_record["wall_s"] = max(0.0, (clock() - item_started).total_seconds())
+                    items.append(result_record)
+                    run.append({"type": "item_end", **result_record})
+                    if interrupted:
+                        interrupt_state.stop_requested = True
+                        break
+                    if result_record["outcome"] == "failed":
+                        failed = True
+                        if (
+                            not tune_failure_models
+                            or tune_failure_models[-1] != model.report.fingerprint
+                        ):
+                            tune_failure_models.append(model.report.fingerprint)
+                        if tune_failure_breaker(tune_failure_models):
+                            warning_messages.append(
+                                "circuit breaker: three consecutive tune-class model failures"
+                            )
+                            interrupt_state.stop_requested = True
+                            break
+                    else:
+                        tune_failure_models.clear()
+            elif deadline is not None and not interrupt_state.stop_requested:
+                warning_messages.append(
+                    "spare-time deepening skipped because its resolved profile "
+                    "matches the initial tune"
+                )
+        except KeyboardInterrupt:
+            interrupt_state.stop_requested = True
+            interrupt_state.second_signal = True
+
+    _journal_interrupts(interrupt_state)
 
     def _unconsumed_plan_items() -> bool:
         """True when any phase queue still holds items the plan never reached."""
@@ -972,11 +899,11 @@ def run_nightshift(
 
     exit_code = (
         4
-        if stop
+        if interrupt_state.stop_requested
         and (
-            second_signal
+            interrupt_state.second_signal
             or any(item.get("outcome") == "interrupted" for item in items)
-            or (signalled and _unconsumed_plan_items())
+            or (interrupt_state.count > 0 and _unconsumed_plan_items())
         )
         else 1
         if failed
@@ -993,5 +920,6 @@ def run_nightshift(
         hardware=hardware,
         llama=llama,
         models=models,
-        stopped=stop,
+        stopped=interrupt_state.stop_requested,
+        interrupt_state=interrupt_state,
     )
