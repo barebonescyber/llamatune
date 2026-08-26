@@ -271,7 +271,7 @@ def _patch_runtime(
     monkeypatch.setattr("llamatune.search.run_tuning", tune)
     monkeypatch.setattr(
         "llamatune.search.resume_tuning",
-        lambda session_dir: TuneOutcome(
+        lambda session_dir, **_kwargs: TuneOutcome(
             session_dir=session_dir,
             analysis={"winner": None},
             exit_code=0,
@@ -677,3 +677,54 @@ def test_run_marathon_incremental_ledger_matches_from_scratch(
         build_ledger(dict(_SPACE), executed, pruned, trials=trials)
     )
     assert outcome.summary["ledger"]["responsive"] == ["flash_attn"]
+
+
+def test_plain_reporter_receives_phase_and_round_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+
+    from llamatune.ui import PlainReporter
+
+    opts = replace(options(tmp_path), dry_run=False, rounds_max=1, converge_rounds=2)
+    _patch_runtime(
+        monkeypatch,
+        tmp_path,
+        winners=[None],
+        ledger_remaining=1,
+    )
+    stream = io.StringIO()
+    outcome = run_marathon(opts, now_fn=AdvancingClock(), reporter=PlainReporter(stream))
+
+    assert outcome.exit_code == 1
+    text = stream.getvalue()
+    assert "[marathon] phase reconnaissance" in text
+    assert "[marathon] phase rounds" in text
+    assert "[marathon] round 1/1 budget=" in text
+    assert "[marathon] phase matrix" in text
+    assert "[marathon] phase verification" in text
+
+
+def test_marathon_threads_reporter_into_tuning_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+
+    from llamatune.types import TuneOutcome
+    from llamatune.ui import PlainReporter
+
+    opts = replace(options(tmp_path), dry_run=False, rounds_max=1, converge_rounds=2)
+    _patch_runtime(monkeypatch, tmp_path, winners=[None], ledger_remaining=1)
+    seen: list[Any] = []
+
+    def capture_tune(session: Any, *_args: Any, **kwargs: Any) -> TuneOutcome:
+        seen.append(kwargs.get("reporter"))
+        return TuneOutcome(session_dir=session.dir, analysis={"winner": None}, exit_code=0)
+
+    monkeypatch.setattr("llamatune.search.run_tuning", capture_tune)
+    stream = io.StringIO()
+    reporter = PlainReporter(stream)
+    outcome = run_marathon(opts, now_fn=AdvancingClock(), reporter=reporter)
+
+    assert outcome.exit_code == 1
+    assert seen and seen[0] is reporter

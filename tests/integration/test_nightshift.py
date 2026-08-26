@@ -600,3 +600,71 @@ def test_run_metadata_and_report_window_are_complete(
     assert set(outcome.summary["window"]) == {"started", "ended", "deadline", "outcome"}
     report = (outcome.run_dir / "nightshift-report.md").read_text()
     assert "Started: 2026-01-01T00:00:00+00:00" in report
+
+
+def test_plain_reporter_receives_item_lines_and_run_tuning_gets_reporter(
+    tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+
+    from llamatune.ui import PlainReporter
+
+    report = inspect_model(tiny_gguf)
+    model = DiscoveredModel(
+        path=tiny_gguf, report=report, shard_paths=(), group_key=None, representative=True
+    )
+    _patch_foundation(monkeypatch, tmp_path, model)
+    seen: list[Any] = []
+
+    def fake_tune(session: Any, *_args: object, **kwargs: object) -> TuneOutcome:
+        seen.append(kwargs.get("reporter"))
+        return TuneOutcome(session_dir=session.dir, analysis={"winner": None}, exit_code=1)
+
+    monkeypatch.setattr(search, "run_tuning", fake_tune)
+    stream = io.StringIO()
+    outcome = run_nightshift(_options(tmp_path, tiny_gguf.parent), reporter=PlainReporter(stream))
+    assert outcome.exit_code == 0
+    assert "[nightshift] item 1/1 tune" in stream.getvalue()
+    assert tiny_gguf.stem in stream.getvalue()
+    assert seen and seen[0] is not None
+
+
+def test_quiet_style_none_reporter_writes_nothing(
+    tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = inspect_model(tiny_gguf)
+    model = DiscoveredModel(
+        path=tiny_gguf, report=report, shard_paths=(), group_key=None, representative=True
+    )
+    _patch_foundation(monkeypatch, tmp_path, model)
+    monkeypatch.setattr(
+        search,
+        "run_tuning",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("benchmark executed")),
+    )
+
+    outcome = run_nightshift(_options(tmp_path, tiny_gguf.parent, dry_run=True), reporter=None)
+    assert outcome.exit_code == 0
+
+
+def test_follow_symlinks_flag_plumbs_into_discovery(
+    tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = inspect_model(tiny_gguf)
+    model = DiscoveredModel(
+        path=tiny_gguf, report=report, shard_paths=(), group_key=None, representative=True
+    )
+    _patch_foundation(monkeypatch, tmp_path, model)
+    captured: list[bool] = []
+
+    def capture_discovery(*_args: Any, **kwargs: Any) -> tuple[DiscoveredModel, ...]:
+        captured.append(bool(kwargs.get("follow_symlinks")))
+        return (model,)
+
+    monkeypatch.setattr(discovery, "discover_models", capture_discovery)
+
+    run_nightshift(_options(tmp_path, tmp_path, dry_run=True), follow_symlinks=True)
+    assert captured[-1] is True
+
+    run_nightshift(_options(tmp_path, tmp_path, dry_run=True))
+    assert captured[-1] is False

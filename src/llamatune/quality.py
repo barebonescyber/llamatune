@@ -62,8 +62,10 @@ from llamatune.types import (
     HardwareReport,
     LlamaCppReport,
     ModelReport,
+    ProgressEvent,
     QualityOptions,
     QualityOutcome,
+    Reporter,
     SuiteResult,
     TaskGrade,
     TrialConfig,
@@ -828,6 +830,28 @@ def _launch(
     raise ServerStartError("; ".join(errors))
 
 
+def _announce_task(
+    reporter: Reporter | None,
+    message: str,
+    payload: dict[str, Any],
+) -> None:
+    """Emit one concise task-level progress line for interactive reporters."""
+    if reporter is None:
+        return
+    reporter.emit(
+        ProgressEvent(
+            kind="quality_task",
+            ts=_utc_now(),
+            payload={"message": message, **payload},
+        )
+    )
+    from llamatune import ui
+
+    if isinstance(reporter, ui.PlainReporter):
+        reporter.err.write(message + "\n")
+        reporter.err.flush()
+
+
 def _evaluate_http_side(
     run: QualityRun,
     resolved: _Resolved,
@@ -836,10 +860,27 @@ def _evaluate_http_side(
     prior: dict[tuple[str, str, int, str], TaskGrade],
     signals: _SignalState,
     timing: Timing,
+    reporter: Reporter | None = None,
 ) -> tuple[tuple[SuiteResult, ...], bool, bool]:
     suites = tuple(suite for suite in resolved.suites if suite.kind != "perplexity")
     if not suites:
         return (), False, False
+    selected_ids = {
+        (suite.suite_id, str(task["id"]))
+        for suite in suites
+        for task in suite.tasks
+        if _task_selected(str(task["id"]), resolved.options.task_filters)
+    }
+    total_tasks = sum(
+        1
+        for suite_id, task_id in selected_ids
+        if any(
+            _task_key(suite_id, task_id, rep, side) not in prior
+            for rep in range(1, resolved.options.reps + 1)
+        )
+    )
+    announced_tasks = 0
+    announced_keys: set[tuple[str, str]] = set()
     pending = any(
         _task_selected(str(task["id"]), resolved.options.task_filters)
         and any(
@@ -883,6 +924,21 @@ def _evaluate_http_side(
                     if key in prior:
                         rep_grades.append(prior[key])
                         continue
+                    if (suite.suite_id, task_id) not in announced_keys:
+                        announced_keys.add((suite.suite_id, task_id))
+                        announced_tasks += 1
+                        _announce_task(
+                            reporter,
+                            f"[quality] {side} task {announced_tasks}/{total_tasks}"
+                            f" {task_id} ({suite.suite_id})",
+                            {
+                                "side": side,
+                                "suite_id": suite.suite_id,
+                                "task_id": task_id,
+                                "index": announced_tasks,
+                                "total": total_tasks,
+                            },
+                        )
                     run.append(
                         {
                             "type": "task_start",
@@ -1306,6 +1362,7 @@ def _execute(
     *,
     run: QualityRun | None,
     now_fn: Callable[[], Any] | None,
+    reporter: Reporter | None = None,
 ) -> QualityOutcome:
     if resolved.options.dry_run:
         return _dry_run(resolved)
@@ -1402,6 +1459,7 @@ def _execute(
             prior,
             signals,
             timing,
+            reporter=reporter,
         )
         harness_error |= failed
         if not abort and not signals.stop_requested:
@@ -1418,6 +1476,7 @@ def _execute(
                 prior,
                 signals,
                 timing,
+                reporter=reporter,
             )
             harness_error |= failed
             if not abort:
@@ -1462,6 +1521,7 @@ def run_quality(
     options: QualityOptions,
     *,
     now_fn: Callable[[], Any] | None = None,
+    reporter: Reporter | None = None,
 ) -> QualityOutcome:
     """Resolve and execute one deterministic quality evaluation."""
     try:
@@ -1470,7 +1530,7 @@ def run_quality(
         return QualityOutcome(run_dir=Path(), summary={"error": str(exc)}, exit_code=2)
     except (LlamaDiscoveryError, ModelInspectionError, OSError, RuntimeError) as exc:
         return QualityOutcome(run_dir=Path(), summary={"error": str(exc)}, exit_code=3)
-    return _execute(resolved, run=None, now_fn=now_fn)
+    return _execute(resolved, run=None, now_fn=now_fn, reporter=reporter)
 
 
 def resume_quality(
@@ -1478,6 +1538,7 @@ def resume_quality(
     *,
     llama_bin: Path | None = None,
     now_fn: Callable[[], Any] | None = None,
+    reporter: Reporter | None = None,
 ) -> QualityOutcome:
     """Resume one identity-bound run, skipping exact journaled task tuples."""
     try:
@@ -1529,4 +1590,4 @@ def resume_quality(
         return QualityOutcome(run_dir=Path(run_dir), summary={"error": str(exc)}, exit_code=2)
     except (LlamaDiscoveryError, ModelInspectionError, OSError, RuntimeError) as exc:
         return QualityOutcome(run_dir=Path(run_dir), summary={"error": str(exc)}, exit_code=3)
-    return _execute(resolved, run=run, now_fn=now_fn)
+    return _execute(resolved, run=run, now_fn=now_fn, reporter=reporter)

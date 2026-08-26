@@ -43,6 +43,7 @@ from llamatune.types import (
     ModelReport,
     NightshiftOptions,
     RegistryRecord,
+    Reporter,
     TrialConfig,
     TuneOptions,
 )
@@ -466,8 +467,35 @@ def _finalize(
     return MarathonOutcome(run_dir=run.dir, summary=summary, exit_code=exit_code)
 
 
+def _announce(
+    reporter: Reporter | None,
+    message: str,
+    payload: dict[str, Any],
+) -> None:
+    """Emit one concise progress line for an orchestrator phase or round."""
+    if reporter is None:
+        return
+    from llamatune.types import ProgressEvent
+
+    reporter.emit(
+        ProgressEvent(
+            kind="orchestrator_item",
+            ts=_utc_iso(),
+            payload={"message": message, **payload},
+        )
+    )
+    from llamatune import ui
+
+    if isinstance(reporter, ui.PlainReporter):
+        reporter.err.write(message + "\n")
+        reporter.err.flush()
+
+
 def run_marathon(
-    options: MarathonOptions, *, now_fn: Callable[[], Any] | None = None
+    options: MarathonOptions,
+    *,
+    now_fn: Callable[[], Any] | None = None,
+    reporter: Reporter | None = None,
 ) -> MarathonOutcome:
     """Run or naturally resume an exhaustive, strictly serial Marathon."""
     from llamatune.coverage import build_ledger, enumerate_space
@@ -551,6 +579,7 @@ def run_marathon(
                 None,
             )
             run.append({"type": "phase", "phase": "resume"})
+            _announce(reporter, "[marathon] phase resume", {"phase": "resume"})
             incomplete = next(
                 (
                     entry
@@ -567,7 +596,7 @@ def run_marathon(
             if incomplete and not interrupt_state.stop_requested:
                 from llamatune.search import resume_tuning
 
-                outcome = resume_tuning(Path(str(incomplete["session_dir"])))
+                outcome = resume_tuning(Path(str(incomplete["session_dir"])), reporter=reporter)
                 run.append(
                     {
                         "type": "round_end" if outcome.exit_code in (0, 1) else "round_failed",
@@ -579,6 +608,7 @@ def run_marathon(
                 )
                 entries = _entries(run.dir)
             run.append({"type": "phase", "phase": "reconnaissance"})
+            _announce(reporter, "[marathon] phase reconnaissance", {"phase": "reconnaissance"})
             reference_value = (
                 dict(recon_entry["reference"])
                 if recon_entry
@@ -715,6 +745,7 @@ def run_marathon(
                 trials=journaled_trials,
             )
             run.append({"type": "phase", "phase": "rounds"})
+            _announce(reporter, "[marathon] phase rounds", {"phase": "rounds"})
             if not bracket("rounds"):
                 summary["stop_reason"] = "bracket_circuit_breaker"
                 return _finalize(run, summary, 3, interrupt_state=interrupt_state)
@@ -762,8 +793,16 @@ def run_marathon(
                         },
                     }
                 )
+                _announce(
+                    reporter,
+                    "[marathon] round "
+                    f"{index}/{options.rounds_max} budget={tune_options.budget_trials}",
+                    {"phase": "rounds", "round": index, "budget": tune_options.budget_trials},
+                )
                 before = clock()
-                outcome = run_tuning(session, hardware, model, llama, tune_options)
+                outcome = run_tuning(
+                    session, hardware, model, llama, tune_options, reporter=reporter
+                )
                 wall = max(0.0, (clock() - before).total_seconds())
                 if outcome.exit_code not in (0, 1):
                     failures += 1
@@ -874,6 +913,7 @@ def run_marathon(
                 summary["stop_reason"] = "interrupted"
                 return _finalize(run, summary, 4, interrupt_state=interrupt_state)
             run.append({"type": "phase", "phase": "matrix"})
+            _announce(reporter, "[marathon] phase matrix", {"phase": "matrix"})
             if not bracket("matrix"):
                 summary["stop_reason"] = "bracket_circuit_breaker"
                 return _finalize(run, summary, 3, interrupt_state=interrupt_state)
@@ -928,6 +968,7 @@ def run_marathon(
 
             exit_code = 1 if summary["failed"] else 0
             run.append({"type": "phase", "phase": "verification"})
+            _announce(reporter, "[marathon] phase verification", {"phase": "verification"})
             if not bracket("verification"):
                 summary["stop_reason"] = "bracket_circuit_breaker"
                 return _finalize(run, summary, 3, interrupt_state=interrupt_state)
@@ -963,6 +1004,7 @@ def run_marathon(
                     )
                     exit_code = 1
             run.append({"type": "phase", "phase": "report"})
+            _announce(reporter, "[marathon] phase report", {"phase": "report"})
             return _finalize(run, summary, exit_code, interrupt_state=interrupt_state)
         except KeyboardInterrupt:
             summary["stop_reason"] = "interrupted"

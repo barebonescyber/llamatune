@@ -39,6 +39,7 @@ from llamatune.types import (
     NightshiftOptions,
     NightshiftOutcome,
     RegistryRecord,
+    Reporter,
     TuneOptions,
     WorkItem,
 )
@@ -328,6 +329,38 @@ def _item_dict(item: WorkItem) -> dict[str, Any]:
     return cast(dict[str, Any], _jsonable(item))
 
 
+def _announce_item(reporter: Reporter | None, index: int, total: int, item: WorkItem) -> None:
+    """Emit one concise progress line for an orchestrator work item."""
+    if reporter is None:
+        return
+    label = (
+        Path(str(item.model_path)).stem
+        if item.model_path is not None
+        else item.fingerprint or "item"
+    )
+    message = f"[nightshift] item {index}/{total} {item.kind} {label}"
+    from llamatune.types import ProgressEvent
+
+    reporter.emit(
+        ProgressEvent(
+            kind="orchestrator_item",
+            ts=_utc_iso(),
+            payload={
+                "message": message,
+                "index": index,
+                "total": total,
+                "item_kind": item.kind,
+                "model": label,
+            },
+        )
+    )
+    from llamatune import ui
+
+    if isinstance(reporter, ui.PlainReporter):
+        reporter.err.write(message + "\n")
+        reporter.err.flush()
+
+
 def _remaining_minutes(deadline: datetime | None, now: datetime) -> float | None:
     return None if deadline is None else max(0.0, (deadline - now).total_seconds() / 60.0)
 
@@ -453,7 +486,11 @@ def _finalize(
 
 
 def run_nightshift(
-    options: NightshiftOptions, *, now_fn: Callable[[], datetime] | None = None
+    options: NightshiftOptions,
+    *,
+    now_fn: Callable[[], datetime] | None = None,
+    reporter: Reporter | None = None,
+    follow_symlinks: bool = False,
 ) -> NightshiftOutcome:
     """Run one strictly serial Night Shift schedule."""
     from llamatune.discovery import discover_models
@@ -527,7 +564,7 @@ def run_nightshift(
             options.exclude,
             duplicates=options.duplicates,
             full_hash=options.full_hash,
-            follow_symlinks=False,
+            follow_symlinks=follow_symlinks,
         )
         records = _context_compatible_records(
             build_registry(options.sessions_dir), options.ctx_size
@@ -576,6 +613,8 @@ def run_nightshift(
         )
 
     by_fingerprint = {model.report.fingerprint: model for model in models}
+    total_items = len(plan)
+    started_items = 0
 
     def _journal_interrupts(state: InterruptState) -> None:
         """Journal queued interrupt events at the next safe main-flow point."""
@@ -626,6 +665,8 @@ def run_nightshift(
                         run.append({"type": "deferred", **record})
                         continue
                     run.append({"type": "item_start", **_item_dict(item)})
+                    started_items += 1
+                    _announce_item(reporter, started_items, total_items, item)
                     item_started = clock()
                     result_record: dict[str, Any]
                     post_item_records: list[dict[str, Any]] = []
@@ -677,6 +718,7 @@ def run_nightshift(
                                 depth_workload=reference.depth_workload,
                             )
                             phase_queues["retune"].append(retune)
+                            total_items += 1
                             run.append({"type": "retune_enqueued", **_item_dict(retune)})
                         if calibration.verdict == "error":
                             failed = True
@@ -686,7 +728,7 @@ def run_nightshift(
                             if item.kind == "resume":
                                 if session_dir is None:
                                     raise ValueError("resume item has no session directory")
-                                outcome = resume_tuning(session_dir)
+                                outcome = resume_tuning(session_dir, reporter=reporter)
                             else:
                                 model = by_fingerprint[item.fingerprint or ""]
                                 current_hardware = assess_hardware()
@@ -707,7 +749,12 @@ def run_nightshift(
                                 )
                                 session_dir = session.dir
                                 outcome = run_tuning(
-                                    session, current_hardware, model.report, llama, tune_options
+                                    session,
+                                    current_hardware,
+                                    model.report,
+                                    llama,
+                                    tune_options,
+                                    reporter=reporter,
                                 )
                             result_record = {
                                 **_item_dict(item),
@@ -784,6 +831,7 @@ def run_nightshift(
                                             reason="dynamic transfer after representative tune",
                                         )
                                     )
+                                    total_items += 1
                     wall_s = max(0.0, (clock() - item_started).total_seconds())
                     result_record["wall_s"] = wall_s
                     items.append(result_record)
@@ -827,7 +875,10 @@ def run_nightshift(
                         reason="deadline has spare time; deepen least-recently-tuned evidence",
                     )
                     phase_queues["retune"].append(item)
+                    total_items += 1
                     run.append({"type": "item_start", **_item_dict(item)})
+                    started_items += 1
+                    _announce_item(reporter, started_items, total_items, item)
                     item_started = clock()
                     deepen_session_dir: Path | None = None
                     try:
@@ -845,7 +896,12 @@ def run_nightshift(
                         )
                         deepen_session_dir = session.dir
                         outcome = run_tuning(
-                            session, current_hardware, model.report, llama, tune_options
+                            session,
+                            current_hardware,
+                            model.report,
+                            llama,
+                            tune_options,
+                            reporter=reporter,
                         )
                         interrupted = _interrupted_session(session.dir)
                         result_record = {

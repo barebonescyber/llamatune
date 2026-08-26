@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -52,7 +53,7 @@ def test_depth_capability_error_precedes_run_creation(
 ) -> None:
     called = False
 
-    def fake_run(_options: MarathonOptions) -> MarathonOutcome:
+    def fake_run(_options: MarathonOptions, **_kwargs: Any) -> MarathonOutcome:
         nonlocal called
         called = True
         raise AssertionError
@@ -72,8 +73,11 @@ def test_options_assembled_and_json_emitted(
 ) -> None:
     captured: list[MarathonOptions] = []
 
-    def fake_run(options: MarathonOptions) -> MarathonOutcome:
+    def fake_run(
+        options: MarathonOptions, *, reporter: Any = None, now_fn: Any = None
+    ) -> MarathonOutcome:
         captured.append(options)
+        assert reporter is None  # json default resolves to no reporter
         return MarathonOutcome(run_dir=tmp_path / "run", summary={"schema_version": 1}, exit_code=0)
 
     monkeypatch.setattr("llamatune.llama.discover_llama", lambda _path: _llama(tmp_path))
@@ -113,7 +117,7 @@ def test_human_dry_run_includes_full_plan(tmp_path: Path, monkeypatch: pytest.Mo
     monkeypatch.setattr("llamatune.llama.discover_llama", lambda _path: _llama(tmp_path))
     monkeypatch.setattr(
         "llamatune.marathon.run_marathon",
-        lambda _options: MarathonOutcome(
+        lambda _options, **_kwargs: MarathonOutcome(
             run_dir=tmp_path / "run",
             summary={
                 "plan": {
@@ -133,3 +137,49 @@ def test_human_dry_run_includes_full_plan(tmp_path: Path, monkeypatch: pytest.Mo
     assert "round 1 budget: 240 trials" in result.output
     assert "matrix cells: 6" in result.output
     assert "A/B blocks: 5" in result.output
+
+
+@pytest.mark.parametrize(
+    ("args", "expect_plain", "expect_json"),
+    [
+        ([], True, False),
+        (["--progress", "plain"], True, False),
+        (["--progress", "json"], False, True),
+        (["--json"], False, False),
+        (["--quiet"], False, False),
+    ],
+)
+def test_progress_options_thread_reporter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    args: list[str],
+    expect_plain: bool,
+    expect_json: bool,
+) -> None:
+    from llamatune.ui import JsonReporter, PlainReporter
+
+    captured: dict[str, Any] = {}
+
+    def fake_run(
+        options: MarathonOptions, *, reporter: Any = None, now_fn: Any = None
+    ) -> MarathonOutcome:
+        captured["reporter"] = reporter
+        return MarathonOutcome(run_dir=tmp_path / "run", summary={}, exit_code=0)
+
+    monkeypatch.setattr("llamatune.llama.discover_llama", lambda _path: _llama(tmp_path))
+    monkeypatch.setattr("llamatune.marathon.run_marathon", fake_run)
+    result = runner.invoke(app, ["marathon", str(tmp_path / "model.gguf"), *args])
+    assert result.exit_code == 0
+    reporter = captured["reporter"]
+    if expect_plain:
+        assert isinstance(reporter, PlainReporter)
+    elif expect_json:
+        assert isinstance(reporter, JsonReporter)
+    else:
+        assert reporter is None
+
+
+def test_tui_and_quiet_are_mutually_exclusive(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["marathon", str(tmp_path / "m.gguf"), "--tui", "--quiet"])
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.stderr

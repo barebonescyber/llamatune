@@ -973,3 +973,32 @@ def test_dry_run_has_estimates_and_creates_no_run_directory(
     assert outcome.summary["suites"][0]["tasks"] == 1
     assert "<ephemeral>" in outcome.summary["server_argv"]
     assert not (root / "quality").exists()
+
+
+def test_plain_reporter_receives_task_level_progress_lines(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+
+    from llamatune.ui import PlainReporter
+
+    _install_server(fake_bin_dir)
+    tasks = _coding_tasks()
+    suite = _write_suite(tmp_path, "progress", "coding", tasks)
+    monkeypatch.setenv(
+        "LLAMATUNE_FAKE_SRV_SCRIPT",
+        str(_write_script(tmp_path, _coding_script(tasks, values=(2, 2)))),
+    )
+    stream = io.StringIO()
+    outcome = quality.run_quality(
+        _options(tiny_gguf, fake_bin_dir, tmp_path / "root", (str(suite),)),
+        reporter=PlainReporter(stream),
+    )
+
+    assert outcome.exit_code == 0
+    text = stream.getvalue()
+    assert "[quality] evaluated task 1/2 task-0" in text
+    assert "[quality] evaluated task 2/2 task-1" in text
