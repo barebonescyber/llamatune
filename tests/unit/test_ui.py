@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from collections.abc import Iterator
 from typing import Any, cast
 
 import pytest
@@ -10,8 +11,32 @@ from llamatune import ui
 from llamatune.types import ProgressEvent
 
 
+@pytest.fixture(autouse=True)
+def _reset_verbose() -> Iterator[None]:
+    ui.set_verbose(False)
+    yield
+    ui.set_verbose(False)
+
+
 def _event(event_kind: str, **payload: object) -> ProgressEvent:
     return ProgressEvent(kind=event_kind, ts="2026-01-01T00:00:00+00:00", payload=dict(payload))
+
+
+def test_verbose_flag_toggles_state() -> None:
+    assert ui.is_verbose() is False
+    ui.set_verbose(True)
+    assert ui.is_verbose() is True
+    ui.set_verbose(False)
+    assert ui.is_verbose() is False
+
+
+def test_emit_diagnostic_writes_only_in_verbose_mode() -> None:
+    err = io.StringIO()
+    ui.emit_diagnostic("hidden line", err=err)
+    assert err.getvalue() == ""
+    ui.set_verbose(True)
+    ui.emit_diagnostic("resolved model path", err=err)
+    assert err.getvalue() == "[verbose] resolved model path\n"
 
 
 def test_none_reporter() -> None:

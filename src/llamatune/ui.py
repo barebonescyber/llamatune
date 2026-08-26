@@ -9,6 +9,28 @@ from typing import TextIO
 
 from llamatune.types import ProgressEvent, Reporter
 
+_verbose = False
+
+
+def set_verbose(enabled: bool) -> None:
+    """Enable or disable extra stderr diagnostics."""
+    global _verbose
+    _verbose = enabled
+
+
+def is_verbose() -> bool:
+    """Return True when extra stderr diagnostics are enabled."""
+    return _verbose
+
+
+def emit_diagnostic(message: str, *, err: TextIO | None = None) -> None:
+    """Write one diagnostic line to stderr in verbose mode."""
+    if not _verbose:
+        return
+    stream = sys.stderr if err is None else err
+    stream.write(f"[verbose] {message}\n")
+    stream.flush()
+
 
 def make_reporter(mode: str, *, err: TextIO | None = None) -> Reporter | None:
     """Construct a progress reporter; ``auto`` chooses Rich only on a TTY."""
