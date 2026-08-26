@@ -611,10 +611,10 @@ Session evidence is designed to be auditable and resumable; avoid editing it man
 | Code | Meaning |
 |---:|---|
 | `0` | Confirmed improvement, or successful non-tuning command |
-| `1` | Tuning completed but no improvement was confirmed over measured defaults |
+| `1` | Tuning completed but no improvement was confirmed over measured defaults, or the nightshift circuit breaker stopped the shift |
 | `2` | Usage or configuration error |
 | `3` | Environment/model/baseline error; tuning could not start or complete normally |
-| `4` | Interrupted or failed mid-run with a resumable session |
+| `4` | Interrupted by a user signal mid-run; rerun the command to resume |
 
 Exit code `1` is a valid result: defaults were optimal within measured noise, and the
 session still contains recommendation and evidence files.

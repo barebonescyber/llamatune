@@ -105,11 +105,12 @@ for machine-readable output on stdout (human text otherwise).
   export, registry lookup/reconfirmation, and advisory estimator calibration.
 
 Exit codes: `0` success with a confirmed improvement (or scan/report
-success); `1` tuning completed but no confirmed improvement over defaults
-(evidence and a defaults-recommendation are still written); `2` usage or
-configuration error; `3` environment error (missing/unusable llama-bench,
-unreadable model); `4` interrupted or failed mid-run with a resumable
-session.
+success); `1` tuning completed but no confirmed improvement over defaults,
+or the nightshift circuit breaker stopped the shift after repeated tune
+failures (evidence and a defaults-recommendation are still written); `2`
+usage or configuration error; `3` environment error (missing/unusable
+llama-bench, unreadable model); `4` interrupted by a user signal mid-run;
+the session stays resumable.
 
 An exit-3 tuning outcome is rendered as `tuning did not start`, with its
 failure stage, reason, and session evidence path. It is never described as a

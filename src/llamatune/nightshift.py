@@ -651,14 +651,16 @@ def run_nightshift(
     by_fingerprint = {model.report.fingerprint: model for model in models}
     stop = False
     second_signal = False
+    signalled = False
     old_handlers: dict[signal.Signals, Any] = {}
 
     def handle_signal(signum: int, _frame: Any) -> None:
-        nonlocal stop, second_signal
+        nonlocal stop, second_signal, signalled
         if stop:
             second_signal = True
             run.append({"type": "interrupted", "signal": signum, "immediate": True})
             raise KeyboardInterrupt
+        signalled = True
         stop = True
         run.append({"type": "interrupted", "signal": signum, "immediate": False})
 
@@ -676,6 +678,7 @@ def run_nightshift(
         "calibrate": [item for item in plan if item.kind == "calibrate"],
         "retune": [],
     }
+    consumed: dict[str, int] = {}
 
     try:
         for phase in ("resume", "tune", "calibrate", "retune"):
@@ -684,6 +687,7 @@ def run_nightshift(
             while index < len(queue) and not stop:
                 item = queue[index]
                 index += 1
+                consumed[phase] = index
                 remaining = _remaining_minutes(deadline, clock())
                 if item.kind != "calibrate" and not item_fits(item, remaining):
                     record = {
@@ -962,13 +966,17 @@ def run_nightshift(
         for sig, handler in old_handlers.items():
             signal.signal(sig, handler)
 
+    def _unconsumed_plan_items() -> bool:
+        """True when any phase queue still holds items the plan never reached."""
+        return any(len(phase_queues[name]) > consumed.get(name, 0) for name in phase_queues)
+
     exit_code = (
         4
         if stop
         and (
             second_signal
             or any(item.get("outcome") == "interrupted" for item in items)
-            or phase_queues
+            or (signalled and _unconsumed_plan_items())
         )
         else 1
         if failed

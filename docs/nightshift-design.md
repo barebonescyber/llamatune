@@ -129,7 +129,8 @@ existing CLI conventions.
   deferred because the deadline arrived are normal and still exit 0 (they
   are listed in the report).
 - `1` — shift completed but at least one started item failed (a tune exited
-  3/4, a calibration errored). Evidence and the report are still written.
+  3/4, a calibration errored), or the consecutive-failure circuit breaker
+  (§7.4) stopped the shift. Evidence and the report are still written.
 - `2` — usage or configuration error.
 - `3` — environment error: `llama-bench` missing/unusable, `MODELS_DIR`
   missing or unreadable, or no GGUF file survives discovery/filters.
