@@ -463,8 +463,18 @@ def test_report_real_quality_shape_computes_delta_and_formats_stage3_config() ->
     )
     text = report.render(analysis, _SESSION_META, _HARDWARE, _MODEL, _LLAMACPP)
     assert "delta=1.35%" in text
-    assert "tb=12" in text
-    assert "ot=^blk\\.1\\.ffn_.*_exps=CPU" in text
+    config_line = next(line for line in text.splitlines() if line.startswith("Config: `"))
+    assert config_line.count("tb=12") == 1
+    assert config_line.count("ot=^blk\\.1\\.ffn_.*_exps=CPU") == 1
+    assert "tb=None" not in text
+    assert "ot=None" not in text
+
+
+def test_config_line_omits_unset_tb_and_ot() -> None:
+    text = report.render(_analysis_with_winner(), _SESSION_META, _HARDWARE, _MODEL, _LLAMACPP)
+    config_line = next(line for line in text.splitlines() if line.startswith("Config: `"))
+    assert "tb=" not in config_line
+    assert "ot=" not in config_line
 
 
 def test_render_search_plan_and_registry_results() -> None:

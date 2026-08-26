@@ -39,7 +39,6 @@ def _format_config(config: dict[str, Any]) -> str:
         f"ngl={config.get('gpu_layers')} ncmoe={config.get('moe_cpu_layers')} "
         f"fa={int(bool(config.get('flash_attn')))} ub={config.get('ubatch')} "
         f"b={config.get('batch')} t={config.get('threads')} "
-        f"tb={config.get('threads_batch')} ot={config.get('ot_spec')} "
         f"mmap={int(bool(config.get('mmap')))} "
         f"nkvo={int(bool(config.get('no_kv_offload')))} "
         f"ctk={config.get('cache_type_k')} ctv={config.get('cache_type_v')}"
@@ -51,7 +50,14 @@ def _format_config(config: dict[str, Any]) -> str:
     return text
 
 
-def _runtime_flags(config: TrialConfig) -> list[str]:
+def runtime_flags(config: TrialConfig) -> list[str]:
+    """Shared llama.cpp runtime flags for one config (DESIGN §11.2 flag mapping).
+
+    Single source of truth used by both export output (``render_export``,
+    ``report.md``) and ``recommend.build_recommended_sh``, so the two always
+    agree flag-for-flag. ``ot_spec`` takes precedence over ``--n-cpu-moe``:
+    a tensor override already pins expert placement.
+    """
     flags = [
         "-ngl",
         str(config.gpu_layers),
@@ -93,7 +99,7 @@ def render_export(
         return json.dumps(recommended, indent=2, sort_keys=True) + "\n"
     config = TrialConfig.from_dict(recommended["config"])
     model_path = str((recommended.get("model") or {}).get("path", "MODEL.gguf"))
-    flags = _runtime_flags(config)
+    flags = runtime_flags(config)
     ctx = (session_meta.get("options") or {}).get("ctx_size")
     if ctx is not None:
         flags += ["-c", str(ctx)]
@@ -695,7 +701,7 @@ def _recommended_runtime_section(
             gpu_layers=int(recommended.get("gpu_layers", config.gpu_layers)),
             moe_cpu_layers=int(recommended.get("moe_cpu_layers", config.moe_cpu_layers)),
         )
-        argv += _runtime_flags(config)
+        argv += runtime_flags(config)
     else:
         argv += ["-ngl", str(recommended.get("gpu_layers", 0))]
         if recommended.get("moe_cpu_layers") is not None:
