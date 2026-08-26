@@ -15,6 +15,7 @@ from pathlib import Path
 import gguf
 
 from llamatune.model import ModelInspectionError, inspect_model
+from llamatune.sanitize import strip_control_chars
 from llamatune.types import DiscoveredModel, ModelReport
 
 _SHARD_RE = re.compile(
@@ -179,8 +180,10 @@ def discover_models(
         totals = {total for _index, total, _path, _separator, _index_text, _total_text in shards}
         if len(totals) != 1:
             warnings.warn(
-                f"skipping inconsistent shard group {stem}; mixed declared totals: "
-                + ", ".join(str(total) for total in sorted(totals)),
+                strip_control_chars(
+                    f"skipping inconsistent shard group {stem}; mixed declared totals: "
+                    + ", ".join(str(total) for total in sorted(totals))
+                ),
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -188,7 +191,9 @@ def discover_models(
         total = totals.pop()
         if total < 1 or any(index < 1 or index > total for index, *_rest in shards):
             warnings.warn(
-                f"skipping inconsistent shard group {stem}; shard index outside declared total",
+                strip_control_chars(
+                    f"skipping inconsistent shard group {stem}; shard index outside declared total"
+                ),
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -202,7 +207,9 @@ def discover_models(
             members[index] = path
         if duplicate_index:
             warnings.warn(
-                f"skipping inconsistent shard group {stem}; duplicate numeric shard index",
+                strip_control_chars(
+                    f"skipping inconsistent shard group {stem}; duplicate numeric shard index"
+                ),
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -235,7 +242,9 @@ def discover_models(
                 for index in missing
             )
             warnings.warn(
-                f"skipping incomplete shard group; missing: {names}", RuntimeWarning, stacklevel=2
+                strip_control_chars(f"skipping incomplete shard group; missing: {names}"),
+                RuntimeWarning,
+                stacklevel=2,
             )
             continue
         shard_paths = tuple(members[index] for index in range(1, total + 1))
@@ -249,12 +258,16 @@ def discover_models(
             physical_paths = shard_paths or (path,)
             payload_size = sum(member.stat().st_size for member in physical_paths)
         except (ModelInspectionError, OSError, ValueError) as exc:
-            warnings.warn(f"skipping unreadable GGUF {path}: {exc}", RuntimeWarning, stacklevel=2)
+            warnings.warn(
+                strip_control_chars(f"skipping unreadable GGUF {path}: {exc}"),
+                RuntimeWarning,
+                stacklevel=2,
+            )
             continue
         previous = seen_fingerprints.get(report.fingerprint)
         if previous is not None:
             warnings.warn(
-                f"deduplicating identical GGUF {path}; kept {previous}",
+                strip_control_chars(f"deduplicating identical GGUF {path}; kept {previous}"),
                 RuntimeWarning,
                 stacklevel=2,
             )

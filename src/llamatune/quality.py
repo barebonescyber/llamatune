@@ -58,6 +58,7 @@ from llamatune.qualserver import (
 )
 from llamatune.qualsuites import SuiteSpec, build_haystack, load_suite
 from llamatune.registry import lookup
+from llamatune.sanitize import strip_control_chars
 from llamatune.types import (
     HardwareReport,
     LlamaCppReport,
@@ -550,7 +551,7 @@ def _grade_dict(grade: TaskGrade) -> dict[str, Any]:
         "id": grade.task_id,
         "score": grade.score,
         "status": grade.status,
-        "reason": grade.reason,
+        "reason": strip_control_chars(grade.reason) if grade.reason is not None else None,
         "unstable": grade.unstable,
         "graders": list(grade.grader_results),
     }
@@ -775,7 +776,7 @@ def _error_grade(task_id: str, reason: str) -> TaskGrade:
         task_id=task_id,
         score=0.0,
         status="error",
-        reason=reason,
+        reason=strip_control_chars(reason),
         unstable=False,
         grader_results=(),
     )
@@ -786,7 +787,7 @@ def _skipped_grade(task_id: str, reason: str) -> TaskGrade:
         task_id=task_id,
         score=0.0,
         status="skipped",
-        reason=reason,
+        reason=strip_control_chars(reason),
         unstable=False,
         grader_results=(),
     )
@@ -987,8 +988,10 @@ def _evaluate_http_side(
                                 {
                                     "type": "server_exit",
                                     "suite_id": suite.suite_id,
-                                    "reason": str(exc),
-                                    "stderr_tail": handle.stderr_tail if handle else "",
+                                    "reason": strip_control_chars(str(exc)),
+                                    "stderr_tail": (
+                                        strip_control_chars(handle.stderr_tail) if handle else ""
+                                    ),
                                 }
                             )
                             if handle is not None:
@@ -1268,7 +1271,7 @@ def _summary(
         "suites": [_suite_dict(suite) for suite in evaluated],
         "overall": sum(scores) / len(scores) if scores else 0.0,
         "comparison": comparison,
-        "warnings": list(warnings),
+        "warnings": [strip_control_chars(warning) for warning in warnings],
     }
     if exec_isolation is not None:
         summary["exec_isolation"] = exec_isolation
