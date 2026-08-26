@@ -1363,7 +1363,6 @@ class _Engine:
             if value == current.moe_cpu_layers:
                 break
             cfg = dataclasses.replace(current, moe_cpu_layers=value)
-            before = self.executed_count
             trial = self._evaluate(cfg, "joint_refine")
             improved = bool(
                 trial.status in ("ok", "unstable")
@@ -1388,8 +1387,6 @@ class _Engine:
             else:
                 misses += 1
                 step_index = 0
-            if self.executed_count == before:
-                misses += 1
 
     def _probe(
         self,
