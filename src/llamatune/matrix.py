@@ -109,6 +109,34 @@ def _score(value: tuple[float, float], weights: tuple[float, float]) -> float:
     return float(value[0] ** weights[0] * value[1] ** weights[1])
 
 
+def _placement_probe(
+    run: MarathonRun,
+    outcomes: dict[tuple[str, int], bool],
+    *,
+    ctx: int,
+    depth: int,
+    slot: int,
+    candidate: TrialConfig,
+    llama: LlamaCppReport,
+    model_path: Path,
+) -> bool:
+    """Execute one feasibility probe, memoized per (config identity, ctx)."""
+    key = (candidate.trial_id, ctx)
+    outcome = outcomes.get(key)
+    if outcome is None:
+        probe_dir = run.matrix_dir(ctx, depth, slot)
+        probe_argv = bench.build_context_probe_argv(
+            bench_path=llama.bench_path,
+            model_path=model_path,
+            ctx=ctx,
+            config=candidate,
+            capabilities=llama.capabilities,
+        )
+        outcome = _execute(run, probe_dir, probe_argv, _PROBE_TIMEOUT_S) is not None
+        outcomes[key] = outcome
+    return outcome
+
+
 def run_matrix(
     run: MarathonRun,
     champion: TrialConfig,
@@ -118,12 +146,21 @@ def run_matrix(
     *,
     remaining_minutes_fn: Callable[[], float],
 ) -> tuple[MatrixCell, ...]:
-    """Measure the resolved context ladder crossed with every requested depth."""
+    """Measure the resolved context ladder crossed with every requested depth.
+
+    Feasibility probes depend only on (config identity, context), never on
+    depth, so each distinct pair is probed at most once per invocation: the
+    first depth cell needing it executes llama-bench and later cells reuse
+    the verdict without re-invoking. Probe artifacts stay under the first
+    executing cell's refine directory; reused cells create no extra dirs.
+    A failed probe stays failed for that (config, context) across depths.
+    """
     contexts = ((options.ctx_size,) if options.ctx_size is not None else ()) + options.ctx_ladder
     contexts = tuple(dict.fromkeys(contexts))
     rows: list[MatrixCell] = []
     champion_failed_at: int | None = None
     weights = weights_for_target(options.target)
+    outcomes: dict[tuple[str, int], bool] = {}
     for ctx in contexts:
         for depth in options.depth_grid:
             if remaining_minutes_fn() <= 0:
@@ -174,30 +211,32 @@ def run_matrix(
             directory = run.matrix_dir(ctx, depth)
             config: TrialConfig | None = None
             if champion_failed_at is None:
-                probe_dir = run.matrix_dir(ctx, depth, -1)
-                probe_argv = bench.build_context_probe_argv(
-                    bench_path=llama.bench_path,
-                    model_path=model.path,
+                if _placement_probe(
+                    run,
+                    outcomes,
                     ctx=ctx,
-                    config=champion,
-                    capabilities=llama.capabilities,
-                )
-                if _execute(run, probe_dir, probe_argv, _PROBE_TIMEOUT_S) is not None:
+                    depth=depth,
+                    slot=-1,
+                    candidate=champion,
+                    llama=llama,
+                    model_path=model.path,
+                ):
                     config = champion
                 else:
                     champion_failed_at = ctx
             for fallback_index, candidate in enumerate(
                 _fallbacks(champion, model) if config is None else (), 2
             ):
-                probe_dir = run.matrix_dir(ctx, depth, -fallback_index)
-                probe_argv = bench.build_context_probe_argv(
-                    bench_path=llama.bench_path,
-                    model_path=model.path,
+                if _placement_probe(
+                    run,
+                    outcomes,
                     ctx=ctx,
-                    config=candidate,
-                    capabilities=llama.capabilities,
-                )
-                if _execute(run, probe_dir, probe_argv, _PROBE_TIMEOUT_S) is not None:
+                    depth=depth,
+                    slot=-fallback_index,
+                    candidate=candidate,
+                    llama=llama,
+                    model_path=model.path,
+                ):
                     config = candidate
                     break
             if config is None:
