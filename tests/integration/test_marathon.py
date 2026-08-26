@@ -240,7 +240,7 @@ def _patch_runtime(
         return SimpleNamespace(dir=session_dir)
 
     monkeypatch.setattr(
-        "llamatune.session.Session",
+        "llamatune.marathon.Session",
         SimpleNamespace(create=create_session),
     )
 
@@ -268,9 +268,9 @@ def _patch_runtime(
             )
         return TuneOutcome(session_dir=session.dir, analysis=analysis, exit_code=exit_code)
 
-    monkeypatch.setattr("llamatune.search.run_tuning", tune)
+    monkeypatch.setattr("llamatune.marathon.run_tuning", tune)
     monkeypatch.setattr(
-        "llamatune.search.resume_tuning",
+        "llamatune.marathon.resume_tuning",
         lambda session_dir, **_kwargs: TuneOutcome(
             session_dir=session_dir,
             analysis={"winner": None},
@@ -290,7 +290,7 @@ def _patch_runtime(
         verdict = ab_values.pop(0) if len(ab_values) > 1 else ab_values[0]
         return _ab_result(str(kwargs["label"]), verdict)
 
-    monkeypatch.setattr("llamatune.abtest.run_ab", run_ab)
+    monkeypatch.setattr("llamatune.marathon.run_ab", run_ab)
 
     def run_matrix(*args: Any, **kwargs: Any) -> list[Any]:
         state["matrix_calls"] += 1
@@ -595,7 +595,7 @@ def test_run_marathon_incremental_ledger_matches_from_scratch(
         sessions.append(session_dir)
         return SimpleNamespace(dir=session_dir)
 
-    monkeypatch.setattr("llamatune.session.Session", SimpleNamespace(create=create_session))
+    monkeypatch.setattr("llamatune.marathon.Session", SimpleNamespace(create=create_session))
 
     round_journals: tuple[list[dict[str, Any]], ...] = (
         [
@@ -637,14 +637,14 @@ def test_run_marathon_incremental_ledger_matches_from_scratch(
             exit_code=0,
         )
 
-    monkeypatch.setattr("llamatune.search.run_tuning", tune)
+    monkeypatch.setattr("llamatune.marathon.run_tuning", tune)
 
     def calibrate(*args: Any, **kwargs: Any) -> CalibrationResult:
         return _calibration(tmp_path, "consistent")
 
     monkeypatch.setattr(marathon_module, "run_calibration", calibrate)
     monkeypatch.setattr(
-        "llamatune.abtest.run_ab", lambda *args, **kwargs: _ab_result(str(kwargs["label"]), "b")
+        "llamatune.marathon.run_ab", lambda *args, **kwargs: _ab_result(str(kwargs["label"]), "b")
     )
     monkeypatch.setattr("llamatune.matrix.run_matrix", lambda *args, **kwargs: [])
     monkeypatch.setattr(signal, "getsignal", lambda sig: "original")
@@ -721,7 +721,7 @@ def test_marathon_threads_reporter_into_tuning_calls(
         seen.append(kwargs.get("reporter"))
         return TuneOutcome(session_dir=session.dir, analysis={"winner": None}, exit_code=0)
 
-    monkeypatch.setattr("llamatune.search.run_tuning", capture_tune)
+    monkeypatch.setattr("llamatune.marathon.run_tuning", capture_tune)
     stream = io.StringIO()
     reporter = PlainReporter(stream)
     outcome = run_marathon(opts, now_fn=AdvancingClock(), reporter=reporter)

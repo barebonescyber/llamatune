@@ -18,6 +18,7 @@ from llamatune.evidence import (
     EvidenceWriter,
     InterruptState,
     PathEscapeError,
+    confine_against,
     confined_path,
     create_unique_dir,
     install_interrupt_handlers,
@@ -273,3 +274,25 @@ def test_interrupt_state_drain_clears_events() -> None:
     state = InterruptState(events=[(2, False)])
     assert state.drain_events() == [(2, False)]
     assert state.drain_events() == []
+
+
+def test_writer_caches_resolved_root(tmp_path: Path) -> None:
+    """Repeated confinement reuses one resolve() of the root (PERF-015)."""
+
+    class _W(EvidenceWriter):
+        def __init__(self, directory: Path) -> None:
+            self.dir = directory
+
+    writer = _W(tmp_path)
+    first = writer._confined("a.json")
+    assert writer._resolved_root is not None
+    cached = writer._resolved_root
+    writer._confined("b", "c.json")
+    assert writer._resolved_root is cached
+    assert first == tmp_path / "a.json"
+
+
+def test_confine_against_still_rejects_escapes(tmp_path: Path) -> None:
+    resolved = tmp_path.resolve()
+    with pytest.raises(PathEscapeError):
+        confine_against(resolved, tmp_path, "..", "outside.json")

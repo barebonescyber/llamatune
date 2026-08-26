@@ -1,4 +1,12 @@
-"""Opt-in, POSIX-only accident barrier for generated Python code."""
+"""Opt-in, POSIX-only accident barrier for generated Python code.
+
+This module deliberately does not reuse :mod:`llamatune.executor` process
+plumbing.  Executor supervision terminates process groups with SIGTERM plus a
+grace period; the barrier here needs immediate SIGKILL, rlimit preexec hooks,
+a PATH-only environment, and its own bounded tail draining.  Sharing the
+executor helpers would extend hostile code's wall time and widen its startup
+surface (DESIGN §13).
+"""
 
 from __future__ import annotations
 

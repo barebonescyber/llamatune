@@ -579,6 +579,8 @@ src/llamatune/            # flat package; groups mark layers, not directories
     bench.py              # llama-bench argv construction and JSON parsing only
     executor.py           # bounded subprocess execution: timeouts, caps, cleanup
     sandbox.py            # opt-in POSIX accident barrier for generated code
+                          # (keeps its own kill/drain plumbing: SIGKILL-only,
+                          # rlimit preexec, PATH-only env; see module docstring)
   evidence-io
     evidence.py           # shared services: journal reader, jsonable, confinement,
                           # unique dirs, deadlines, interrupt handlers (§13.4)

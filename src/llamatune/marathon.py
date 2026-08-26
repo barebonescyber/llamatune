@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Self, cast
 
 from llamatune._version import __version__
+from llamatune.abtest import run_ab
 from llamatune.calibrate import run_calibration
 from llamatune.evidence import (
     EvidenceWriter,
@@ -35,6 +36,8 @@ from llamatune.evidence import (
     utc_iso as _utc_iso,
 )
 from llamatune.sanitize import strip_control_chars
+from llamatune.search import resume_tuning, run_tuning
+from llamatune.session import Session
 from llamatune.types import (
     CoverageLedger,
     HardwareReport,
@@ -622,7 +625,6 @@ def _resume_incomplete_round(
     run: MarathonRun, incomplete: Mapping[str, Any], reporter: Reporter | None
 ) -> None:
     """Finish an interrupted round's session before continuing the plan."""
-    from llamatune.search import resume_tuning
 
     outcome = resume_tuning(Path(str(incomplete["session_dir"])), reporter=reporter)
     run.append(
@@ -753,8 +755,6 @@ def _run_rounds_phase(state: _MarathonState) -> int | None:
                 initial_gpu_layers=state.champion.gpu_layers,
                 initial_cpu_moe=state.champion.moe_cpu_layers,
             )
-        from llamatune.search import run_tuning
-        from llamatune.session import Session
 
         session = Session.create(
             options.sessions_dir,
@@ -819,8 +819,6 @@ def _run_rounds_phase(state: _MarathonState) -> int | None:
         if contender is not None and (
             state.champion is None or contender.trial_id != state.champion.trial_id
         ):
-            from llamatune.abtest import run_ab
-
             challenge = run_ab(
                 run,
                 state.champion,
@@ -942,7 +940,6 @@ def _run_verification_phase(state: _MarathonState) -> int:
             "reason": "defaults champion",
         }
         return 1
-    from llamatune.abtest import run_ab
 
     verified = run_ab(
         run,

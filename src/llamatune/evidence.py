@@ -79,10 +79,24 @@ def confined_path(root: Path, *parts: str, error: type[PathEscapeError] = PathEs
     historical writer behavior; the containment check itself always resolves
     symlinks and ``..`` components before comparing against ``root``.
     """
-    base_resolved = root.resolve()
+    return confine_against(root.resolve(), root, *parts, error=error)
+
+
+def confine_against(
+    root_resolved: Path,
+    root: Path,
+    *parts: str,
+    error: type[PathEscapeError] = PathEscapeError,
+) -> Path:
+    """Confine against an already-resolved ``root_resolved`` (hot-path variant).
+
+    Callers that confine repeatedly against one unchanged directory can
+    resolve the root once and pass it here, avoiding repeated ``resolve()``
+    syscalls per journal append (#26 PERF-015).
+    """
     candidate = root.joinpath(*parts)
     try:
-        candidate.resolve().relative_to(base_resolved)
+        candidate.resolve().relative_to(root_resolved)
     except ValueError:
         msg = f"path {candidate} escapes evidence directory {root}"
         raise error(msg) from None
@@ -146,9 +160,12 @@ class EvidenceWriter:
 
     dir: Path
     path_error: type[PathEscapeError] = PathEscapeError
+    _resolved_root: Path | None = None
 
     def _confined(self, *parts: str) -> Path:
-        return confined_path(self.dir, *parts, error=self.path_error)
+        if self._resolved_root is None:
+            self._resolved_root = self.dir.resolve()
+        return confine_against(self._resolved_root, self.dir, *parts, error=self.path_error)
 
     def _journal_record(self, entry: dict[str, Any]) -> dict[str, Any]:
         record = cast(dict[str, Any], jsonable(dict(entry)))

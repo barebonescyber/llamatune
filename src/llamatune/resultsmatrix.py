@@ -840,7 +840,12 @@ def _revive_rows(raw_rows: object) -> list[ResultRow] | None:
 
 
 def harvest(roots: tuple[Path, ...]) -> ResultsMatrix:
-    """Read all named evidence under ``roots`` into a deterministic matrix."""
+    """Read all named evidence under ``roots`` into a deterministic matrix.
+
+    Sources are read serially on purpose.  Deterministic warning and row
+    ordering under test substitution outweighs the wall-time gain from
+    parallel reads on local disks (#22 PERF-016).
+    """
     resolved = tuple(root.resolve() for root in roots)
     rows, warnings_list, _cache = _harvest(resolved, None)
     current = sorted(_mark_current(rows), key=_sort_key)
