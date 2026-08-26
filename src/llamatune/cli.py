@@ -1642,7 +1642,3 @@ def calibrate_cmd(
         f"samples={result['samples']} weights={result['weights_scale']:.4f} "
         f"kv={result['kv_scale']:.4f} compute={result['compute_scale']:.4f}"
     )
-
-
-if __name__ == "__main__":
-    app()

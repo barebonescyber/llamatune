@@ -546,19 +546,6 @@ class CoverageLedger:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class RoundRecord:
-    """Summary of one tuning round within a Marathon."""
-
-    index: int
-    session_dir: Path
-    exit_code: int
-    winner_config: TrialConfig | None
-    champion_changed: bool
-    wall_s: float
-    coverage_pct: float
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
 class MatrixCell:
     """One measured or deferred context-by-depth operating point."""
 

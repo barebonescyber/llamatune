@@ -15,8 +15,6 @@ from typing import Any
 from llamatune.config import DIMENSION_ORDER
 from llamatune.types import TrialConfig
 
-_LOSSY_CACHE_TYPES = {"cache_type_k", "cache_type_v"}
-
 
 def _fmt(value: float | int | None, digits: int = 2) -> str:
     if value is None:

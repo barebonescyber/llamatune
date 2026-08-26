@@ -447,12 +447,6 @@ def _sample_gpu_states_amd_sysfs(drm_dir: Path | None = None) -> tuple[GpuSample
     return tuple(samples)
 
 
-def _sample_gpu_state_amd_sysfs(drm_dir: Path | None = None) -> GpuSample | None:
-    """Compatibility wrapper returning the first AMD device sample."""
-    samples = _sample_gpu_states_amd_sysfs(drm_dir)
-    return samples[0] if samples else None
-
-
 def sample_gpu_states() -> tuple[GpuSample, ...]:
     """Return bounded best-effort observations for every visible GPU."""
     out = _run_probe(

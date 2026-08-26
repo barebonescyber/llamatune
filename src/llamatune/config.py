@@ -36,9 +36,6 @@ DIMENSION_ORDER: tuple[str, ...] = (
     "cache_type_v",
 )
 
-#: Dimensions whose non-default candidate values may affect output quality.
-LOSSY_DIMENSIONS: frozenset[str] = frozenset({"cache_type_k", "cache_type_v"})
-
 #: Maps a search dimension name to the TrialConfig field it mutates. Differs
 #: from the identity mapping only for "kv_offload", which controls the
 #: `no_kv_offload` field.
@@ -355,10 +352,6 @@ def memory_pressure(est_vram: float, vram_mb: int | None) -> float:
     if vram_mb is None or vram_mb <= 0:
         return 0.0
     return est_vram / vram_mb
-
-
-def is_fully_offloaded(gpu_layers: int, ngl_all: int) -> bool:
-    return gpu_layers >= ngl_all
 
 
 def has_gpu_backend(llama: LlamaCppReport) -> bool | None:

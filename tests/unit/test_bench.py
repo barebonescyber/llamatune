@@ -502,7 +502,7 @@ class TestParseBenchOutput:
             bench.parse_bench_output_multi(json.dumps(["noise", 1, None]))
 
 
-class TestDetectOom:
+class TestClassifyFailure:
     @pytest.mark.parametrize(
         "stderr_text",
         [
@@ -511,29 +511,17 @@ class TestDetectOom:
             "cudaMalloc failed",
             "kIOGPUCommandBufferCallbackErrorOutOfMemory something",
             "ggml_backend_metal: alloc heap fail",
-        ],
-    )
-    def test_matches_oom_signatures(self, stderr_text: str) -> None:
-        assert bench.detect_oom(stderr_text) is not None
-
-    def test_case_insensitive(self) -> None:
-        assert bench.detect_oom("FAILED TO ALLOCATE buffer") == "failed to allocate"
-
-    def test_no_match_returns_none(self) -> None:
-        assert bench.detect_oom("segmentation fault (core dumped)") is None
-
-
-class TestClassifyFailure:
-    @pytest.mark.parametrize(
-        "stderr_text",
-        [
             "Vulkan error: ErrorOutOfDeviceMemory",
             "vk::OutOfDeviceMemoryError while allocating",
             "hipMalloc failed for tensor buffer",
         ],
     )
-    def test_backend_neutral_oom_signatures(self, stderr_text: str) -> None:
+    def test_oom_signatures(self, stderr_text: str) -> None:
         assert bench.classify_failure(stderr_text) == "oom"
+        assert bench.failure_pattern(stderr_text, "oom") is not None
+
+    def test_case_insensitive(self) -> None:
+        assert bench.failure_pattern("FAILED TO ALLOCATE buffer", "oom") == ("failed to allocate")
 
     def test_hip_error_is_cuda_class_error_and_oom_still_precedes(self) -> None:
         assert bench.classify_failure("HIP error: invalid device function") == "cuda_error"
@@ -572,6 +560,7 @@ class TestClassifyFailure:
 
     def test_unknown_is_none_and_parse_fact_is_independent(self) -> None:
         assert bench.classify_failure("segmentation fault") is None
+        assert bench.failure_pattern("segmentation fault (core dumped)", "oom") is None
         with pytest.raises(bench.BenchParseError):
             bench.parse_bench_output("[")
         assert bench.classify_failure("failed to load model") == "gpu_resource"
