@@ -658,6 +658,11 @@ session still contains recommendation and evidence files.
 
 ## Troubleshooting
 
+### `llama-bench not found in PATH`
+
+Install llama.cpp, or pass `--llama-bin DIR`. `DIR` is the directory containing the
+binaries, not the `llama-bench` executable itself.
+
 ### CUDA is detected but no GPU layers are used
 
 Run `scan` and verify that `backends` and capabilities describe the expected build. Ensure
@@ -716,6 +721,10 @@ llamatune calibrate   Experimental: fit VRAM estimator corrections
 ```
 
 Run `llamatune COMMAND --help` for the authoritative option list.
+
+Global options: `--version` prints the version and exits. `--verbose/-v` prints extra
+diagnostics on stderr. Set `LLAMATUNE_VERBOSE=1` to get the same diagnostics as
+`--verbose`.
 
 ## Contributing
 

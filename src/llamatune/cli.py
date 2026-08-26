@@ -8,17 +8,21 @@ inside each command body, so `llamatune --help` stays fast.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 import importlib
 import json
 import math
 import os
 import sys
+from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
 import typer
+
+from llamatune._version import __version__
 
 if TYPE_CHECKING:
     from llamatune.types import HardwareReport, LlamaCppReport, TuneOutcome
@@ -31,6 +35,65 @@ app = typer.Typer(
 )
 matrix_app = typer.Typer(help="Build, query, show, and export the Results Matrix.")
 app.add_typer(matrix_app, name="matrix")
+
+_INTERNAL_ERROR_REPORT_URL = "https://github.com/barebonescyber/llamatune/issues"
+
+
+def _guard_internal_errors(callback: Callable[..., Any]) -> Callable[..., Any]:
+    """Convert unexpected exceptions into one stderr line and exit code 3."""
+
+    @functools.wraps(callback)
+    def guarded(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return callback(*args, **kwargs)
+        except (typer.Exit, KeyboardInterrupt):
+            raise
+        except Exception as exc:
+            typer.echo(
+                f"internal error: {exc}; report at {_INTERNAL_ERROR_REPORT_URL}",
+                err=True,
+            )
+            raise typer.Exit(code=3) from exc
+
+    return guarded
+
+
+def _install_internal_error_guards() -> None:
+    """Wrap every registered command body with the internal-error guard."""
+    apps = [app, *(info.typer_instance for info in app.registered_groups if info.typer_instance)]
+    for typer_app in apps:
+        for command in typer_app.registered_commands:
+            if command.callback is not None:
+                command.callback = _guard_internal_errors(command.callback)
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"llamatune {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _global_options(
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=_version_callback,
+            is_eager=True,
+            help="Print the version and exit",
+        ),
+    ] = False,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="Print extra diagnostics on stderr"),
+    ] = False,
+) -> None:
+    """Apply global options."""
+    from llamatune import ui
+
+    ui.set_verbose(os.environ.get("LLAMATUNE_VERBOSE") == "1" or verbose)
+
 
 _MATRIX_KINDS = frozenset(
     {
@@ -530,30 +593,31 @@ def _emit_tune_outcome(outcome: TuneOutcome, *, json_output: bool) -> None:
         else:
             _echo_json(outcome.analysis)
         return
-    typer.echo(f"session: {outcome.session_dir}")
+    failure = outcome.exit_code in (2, 3) or (outcome.exit_code == 4 and not outcome.analysis)
+    typer.echo(f"session: {outcome.session_dir}", err=failure)
     if outcome.exit_code == 2:
         stage = outcome.failure_stage or "session"
         reason = outcome.failure_reason or "session evidence is unavailable or unreadable"
-        typer.echo(f"tuning could not continue: {stage}: {reason}")
-        typer.echo(f"evidence: unavailable or unreadable at {outcome.session_dir}")
-        typer.echo("resumable: no")
-        typer.echo(f"exit_code: {outcome.exit_code}")
+        typer.echo(f"tuning could not continue: {stage}: {reason}", err=True)
+        typer.echo(f"evidence: unavailable or unreadable at {outcome.session_dir}", err=True)
+        typer.echo("resumable: no", err=True)
+        typer.echo(f"exit_code: {outcome.exit_code}", err=True)
         return
     if outcome.exit_code == 3:
         stage = outcome.failure_stage or "startup"
         reason = outcome.failure_reason or "tuning could not establish a usable baseline"
-        typer.echo(f"tuning did not start: {stage}: {reason}")
-        typer.echo(f"evidence: {outcome.session_dir}")
-        typer.echo("resumable: no")
-        typer.echo(f"exit_code: {outcome.exit_code}")
+        typer.echo(f"tuning did not start: {stage}: {reason}", err=True)
+        typer.echo(f"evidence: {outcome.session_dir}", err=True)
+        typer.echo("resumable: no", err=True)
+        typer.echo(f"exit_code: {outcome.exit_code}", err=True)
         return
     if outcome.exit_code == 4 and not outcome.analysis:
         stage = outcome.failure_stage or "interruption"
         reason = outcome.failure_reason or "tuning stopped before completion"
-        typer.echo(f"tuning stopped with a resumable session: {stage}: {reason}")
-        typer.echo(f"evidence: {outcome.session_dir}")
-        typer.echo("resumable: yes")
-        typer.echo(f"exit_code: {outcome.exit_code}")
+        typer.echo(f"tuning stopped with a resumable session: {stage}: {reason}", err=True)
+        typer.echo(f"evidence: {outcome.session_dir}", err=True)
+        typer.echo("resumable: yes", err=True)
+        typer.echo(f"exit_code: {outcome.exit_code}", err=True)
         return
     winner = outcome.analysis.get("winner")
     if winner is not None:
@@ -590,6 +654,39 @@ def _emit_startup_failure(reason: str, *, exit_code: int, stage: str, json_outpu
         )
     else:
         typer.echo(f"error: {reason}", err=True)
+
+
+def _verbose_llama_bin_line(llama_bin: Path | None) -> None:
+    """Echo the llama-bench lookup location on stderr in verbose mode."""
+    from llamatune import ui
+
+    ui.emit_diagnostic(f"llama-bin: {'PATH' if llama_bin is None else llama_bin}")
+
+
+def _verbose_llama_diagnostics(llama: LlamaCppReport, model_path_value: Path) -> None:
+    """Echo resolved llama.cpp and model facts on stderr in verbose mode."""
+    from llamatune import ui
+
+    capabilities = ", ".join(sorted(llama.capabilities)) or "(none)"
+    ui.emit_diagnostic(f"model: {model_path_value}")
+    ui.emit_diagnostic(f"llama-bench: {llama.bench_path}")
+    ui.emit_diagnostic(f"probe argv: {llama.bench_path} --help")
+    ui.emit_diagnostic(f"capabilities: {capabilities}")
+
+
+def _verbose_resume_diagnostics(session_dir: Path) -> None:
+    """Echo resolved session facts on stderr in verbose mode."""
+    from llamatune import ui
+
+    ui.emit_diagnostic(f"session: {session_dir}")
+    try:
+        report = _load_json(session_dir / "llamacpp.json")
+    except (OSError, ValueError, json.JSONDecodeError):
+        return
+    bench = report.get("bench_path")
+    if isinstance(bench, str) and bench:
+        ui.emit_diagnostic(f"llama-bench: {bench}")
+        ui.emit_diagnostic(f"probe argv: {bench} --help")
 
 
 def _quality_exec_supported() -> bool:
@@ -1033,10 +1130,13 @@ def tune(
     try:
         llama_report = discover_llama(llama_bin)
     except LlamaDiscoveryError as exc:
+        _verbose_llama_bin_line(llama_bin)
         _emit_startup_failure(
             str(exc), exit_code=3, stage="llama_discovery", json_output=json_output
         )
         raise typer.Exit(code=3) from exc
+
+    _verbose_llama_diagnostics(llama_report, model_path)
 
     if (
         depth is not None or depth_profile_value is not None
@@ -1213,6 +1313,7 @@ def resume(
     """Re-validate identity, skip journaled trials, and continue tuning."""
     from llamatune.search import resume_tuning
 
+    _verbose_resume_diagnostics(session_dir)
     effective_progress = (
         ProgressMode.none if json_output and progress == ProgressMode.auto else progress
     )
@@ -1506,7 +1607,8 @@ def marathon(
         raise typer.Exit(code=3) from exc
     if any(depth > 0 for depth in depth_grid_value) and "d" not in llama_report.capabilities:
         typer.echo(
-            f"error: llama-bench '{llama_report.bench_path}' does not support -d/--n-depth",
+            f"error: llama-bench '{llama_report.bench_path}' does not support -d/--n-depth. "
+            "Use --depth-grid 0, or update llama.cpp for depth support.",
             err=True,
         )
         raise typer.Exit(code=2)
@@ -1638,10 +1740,10 @@ def revalidate_cmd(
         else:
             stage = outcome.failure_stage or "revalidation"
             reason = outcome.failure_reason or "session evidence could not be revalidated"
-            typer.echo(f"revalidation failed: {stage}: {reason}")
-            typer.echo(f"evidence: {outcome.session_dir}")
-            typer.echo(f"resumable: {'yes' if outcome.exit_code == 4 else 'no'}")
-            typer.echo(f"exit_code: {outcome.exit_code}")
+            typer.echo(f"revalidation failed: {stage}: {reason}", err=True)
+            typer.echo(f"evidence: {outcome.session_dir}", err=True)
+            typer.echo(f"resumable: {'yes' if outcome.exit_code == 4 else 'no'}", err=True)
+            typer.echo(f"exit_code: {outcome.exit_code}", err=True)
     elif json_output:
         _echo_json(outcome.analysis)
     else:
@@ -1662,9 +1764,22 @@ def calibrate_cmd(
     except ImportError as exc:
         typer.echo("error: calibration is not available", err=True)
         raise typer.Exit(code=2) from exc
-    result = calibrate_module.calibrate(sessions_dir)
+    try:
+        result = calibrate_module.calibrate(sessions_dir)
+    except ValueError as exc:
+        typer.echo(f"error: could not fit calibration factors: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    except OSError as exc:
+        typer.echo(
+            f"error: could not write calibration file under {sessions_dir}: {exc}",
+            err=True,
+        )
+        raise typer.Exit(code=3) from exc
     typer.echo(
         "experimental calibration written: "
         f"samples={result['samples']} weights={result['weights_scale']:.4f} "
         f"kv={result['kv_scale']:.4f} compute={result['compute_scale']:.4f}"
     )
+
+
+_install_internal_error_guards()

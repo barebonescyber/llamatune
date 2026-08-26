@@ -99,6 +99,54 @@ def test_discover_llama_missing_bench_raises(tmp_path: Path) -> None:
         discover_llama(empty_dir)
 
 
+def test_missing_bench_via_path_message_suggests_install_or_llama_bin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("llamatune.llama.shutil.which", lambda name: None)
+
+    with pytest.raises(LlamaDiscoveryError, match="llama-bench not found in PATH") as excinfo:
+        discover_llama(None)
+
+    message = str(excinfo.value)
+    assert "Install llama.cpp" in message
+    assert "--llama-bin DIR (the directory containing the binaries, not the binary itself)" in (
+        message
+    )
+
+
+def test_missing_bench_with_llama_bin_message_points_at_directory(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "llama-bench").write_text("not executable")
+
+    with pytest.raises(LlamaDiscoveryError) as excinfo:
+        discover_llama(bin_dir)
+
+    message = str(excinfo.value)
+    assert f"llama-bench not found in {bin_dir}" in message
+    assert (
+        "Pass --llama-bin DIR as the directory containing the binaries, "
+        "not the binary itself." in message
+    )
+
+
+def test_failed_probe_message_suggests_executable_check(
+    fake_bin_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _fail(argv: list[str], **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(executor, "run_probe", _fail)
+
+    with pytest.raises(LlamaDiscoveryError) as excinfo:
+        discover_llama(fake_bin_dir)
+
+    message = str(excinfo.value)
+    assert "failed to run" in message
+    assert "Check that the file is executable" in message
+    assert "--llama-bin DIR (the directory containing the binaries)" in message
+
+
 def test_discover_llama_non_executable_is_not_found(tmp_path: Path) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()

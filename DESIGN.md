@@ -121,6 +121,16 @@ analysis exists emits an object with `status: "failed"`, `exit_code`,
 `session_dir` (null when no session was created), `failure_stage`,
 `failure_reason`, and `resumable`. Exit 4 is resumable; exits 2 and 3 are not.
 
+Human-readable failure renderings go to stderr. Successful results and
+machine-readable `--json` payloads go to stdout. Piping stdout therefore
+captures results without diagnostics. Progress renderers also write only to
+stderr.
+
+`llamatune --version` prints `llamatune <version>` on stdout and exits 0.
+The global `--verbose/-v` flag, or the equivalent environment variable
+`LLAMATUNE_VERBOSE=1`, prints extra startup diagnostics (resolved binaries,
+model path, probe argv) on stderr.
+
 ## 4. Hardware and environment assessment (`hardware.py`)
 
 Best-effort and layered; detection failure of any single probe must never
