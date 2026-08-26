@@ -9,7 +9,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +49,86 @@ def _read_json(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as fh:
         data: dict[str, Any] = json.load(fh)
     return data
+
+
+# --------------------------------------------------------------------------
+# Journal tail scanning
+# --------------------------------------------------------------------------
+
+
+_TAIL_CHUNK_BYTES = 65536
+
+
+class JournalTailIncomplete:
+    """Sentinel returned when the journal tail alone cannot decide.
+
+    A torn, corrupt, or undecodable line was met before any match, so the
+    caller must fall back to a full tolerant parse to reproduce historical
+    semantics exactly.
+    """
+
+    def __repr__(self) -> str:
+        return "JournalTailIncomplete"
+
+
+JOURNAL_TAIL_INCOMPLETE = JournalTailIncomplete()
+
+
+def _reverse_complete_lines(path: Path) -> Iterator[bytes]:
+    """Yield complete newline-delimited lines from a file, last line first."""
+    size = path.stat().st_size
+    remaining = size
+    pending = b""
+    at_eof = True
+    with path.open("rb") as handle:
+        while remaining > 0:
+            step = min(_TAIL_CHUNK_BYTES, remaining)
+            remaining -= step
+            handle.seek(remaining)
+            buf = handle.read(step) + pending
+            parts = buf.split(b"\n")
+            pending = parts[0]
+            if at_eof:
+                # A trailing newline contributes an empty split artifact,
+                # not a line; text-mode ``splitlines`` never yields one.
+                if buf.endswith(b"\n"):
+                    parts.pop()
+                at_eof = False
+            for index in range(len(parts) - 1, 0, -1):
+                yield parts[index]
+        if pending:
+            yield pending
+        elif size and handle.read(1) == b"\n":
+            # A leading newline starts an empty first line, which strict
+            # parsing would reject just like any other blank line.
+            yield b""
+
+
+def scan_journal_tail(
+    path: Path,
+    predicate: Callable[[Mapping[str, Any]], bool],
+) -> dict[str, Any] | JournalTailIncomplete | None:
+    """Search a journal backwards for the newest entry satisfying predicate.
+
+    Returns the matching entry, ``None`` when the whole file parsed cleanly
+    without a match, or :data:`JOURNAL_TAIL_INCOMPLETE` when a line fails to
+    decode or parse before any match is found. Reading only the tail lets
+    callers answer trailing-entry questions without parsing entire journals;
+    the sentinel keeps every ambiguous case on the exact full-parse path.
+    """
+    try:
+        for line in _reverse_complete_lines(path):
+            try:
+                entry = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                return JOURNAL_TAIL_INCOMPLETE
+            if not isinstance(entry, dict):
+                continue
+            if predicate(entry):
+                return entry
+    except OSError:
+        return JOURNAL_TAIL_INCOMPLETE
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -266,6 +346,10 @@ def _options_from_dict(data: Mapping[str, Any]) -> TuneOptions:
     )
 
 
+def _is_session_end(entry: Mapping[str, Any]) -> bool:
+    return entry.get("type") == "session_end"
+
+
 def list_sessions(sessions_dir: Path) -> list[dict[str, Any]]:
     """Summarize session directories, tolerating incomplete and corrupt entries."""
     if not sessions_dir.is_dir():
@@ -303,14 +387,21 @@ def list_sessions(sessions_dir: Path) -> list[dict[str, Any]]:
                 if isinstance(winner, dict):
                     row["winner_trial_id"] = winner.get("trial_id")
                     row["confirmed"] = bool(winner.get("confirmed", False))
-                endings: list[dict[str, Any]] = []
                 journal_path = candidate / "journal.jsonl"
-                if journal_path.is_file():
+                if not journal_path.is_file():
+                    row["exit_code"] = None
+                elif isinstance(
+                    found := scan_journal_tail(journal_path, _is_session_end),
+                    JournalTailIncomplete,
+                ):
+                    endings: list[dict[str, Any]] = []
                     for line in journal_path.read_text(encoding="utf-8").splitlines():
                         entry = json.loads(line)
                         if isinstance(entry, dict) and entry.get("type") == "session_end":
                             endings.append(entry)
-                row["exit_code"] = endings[-1].get("exit_code") if endings else None
+                    row["exit_code"] = endings[-1].get("exit_code") if endings else None
+                else:
+                    row["exit_code"] = found.get("exit_code") if found is not None else None
                 row["status"] = "complete"
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             row["status"] = "corrupt"

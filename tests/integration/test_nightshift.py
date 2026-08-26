@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from llamatune import calibrate, discovery, hardware, llama, registry, search
+from llamatune import discovery, hardware, llama, nightshift, registry, search
 from llamatune.model import inspect_model
 from llamatune.nightshift import resolve_deadline, run_nightshift
 from llamatune.types import (
@@ -303,7 +303,7 @@ def test_consistent_calibration_does_not_retune(
     _patch_foundation(monkeypatch, tmp_path, model)
     monkeypatch.setattr(registry, "build_registry", lambda _path: {record.fingerprint: record})
     monkeypatch.setattr(
-        calibrate, "run_calibration", lambda *_args: _calibration(model, record, "consistent")
+        nightshift, "run_calibration", lambda *_args: _calibration(model, record, "consistent")
     )
     monkeypatch.setattr(
         search,
@@ -330,7 +330,7 @@ def test_drift_calibration_enqueues_and_executes_retune(
     _patch_foundation(monkeypatch, tmp_path, model)
     monkeypatch.setattr(registry, "build_registry", lambda _path: {record.fingerprint: record})
     monkeypatch.setattr(
-        calibrate, "run_calibration", lambda *_args: _calibration(model, record, "drift")
+        nightshift, "run_calibration", lambda *_args: _calibration(model, record, "drift")
     )
     seen_depths: list[int | None] = []
 
@@ -397,12 +397,19 @@ def test_dynamic_transfer_after_representative_tune(
     def tune(session: Any, *_args: object, **_kwargs: object) -> TuneOutcome:
         nonlocal tuned
         tuned = True
+        session.write_analysis(
+            {
+                "baseline": {"noise_floor_cv": 0.01, "pp": {"mean": 100.0}, "tg": {"mean": 20.0}},
+                "winner": None,
+            }
+        )
+        session.append({"type": "session_end", "exit_code": 1, "reason": "completed"})
         return TuneOutcome(session_dir=session.dir, analysis={}, exit_code=1)
 
     monkeypatch.setattr(registry, "build_registry", build)
     monkeypatch.setattr(search, "run_tuning", tune)
     monkeypatch.setattr(
-        calibrate, "run_calibration", lambda *_args: _calibration(sibling, record, "consistent")
+        nightshift, "run_calibration", lambda *_args: _calibration(sibling, record, "consistent")
     )
     outcome = run_nightshift(_options(tmp_path, tmp_path))
     assert [(item["kind"], item["outcome"]) for item in outcome.summary["items"]] == [
@@ -518,7 +525,7 @@ def test_identical_deepening_profile_is_skipped(
     _patch_foundation(monkeypatch, tmp_path, model)
     monkeypatch.setattr(registry, "build_registry", lambda _path: {record.fingerprint: record})
     monkeypatch.setattr(
-        calibrate, "run_calibration", lambda *_args: _calibration(model, record, "consistent")
+        nightshift, "run_calibration", lambda *_args: _calibration(model, record, "consistent")
     )
     monkeypatch.setattr(
         search,
@@ -547,7 +554,7 @@ def test_spare_time_deepens_each_model_at_most_once(
     _patch_foundation(monkeypatch, tmp_path, model)
     monkeypatch.setattr(registry, "build_registry", lambda _path: {record.fingerprint: record})
     monkeypatch.setattr(
-        calibrate, "run_calibration", lambda *_args: _calibration(model, record, "consistent")
+        nightshift, "run_calibration", lambda *_args: _calibration(model, record, "consistent")
     )
     monkeypatch.setattr(
         search,

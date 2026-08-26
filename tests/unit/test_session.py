@@ -517,3 +517,97 @@ def test_future_session_schema_is_rejected(tmp_path: Path) -> None:
     meta_path.write_text(json.dumps(meta))
     with pytest.raises(SessionCorruptionError, match="version 3"):
         Session.load(session.dir)
+
+
+def test_list_sessions_uses_last_session_end_and_falls_back_on_corrupt_tail(
+    tmp_path: Path,
+) -> None:
+    from llamatune.session import list_sessions
+
+    sessions_root = tmp_path / "sessions"
+    superseded = _create_session(tmp_path)
+    final = _create_session(tmp_path)
+    superseded.write_analysis({"winner": {"trial_id": "w", "confirmed": False}})
+    final.write_analysis({"winner": {"trial_id": "w", "confirmed": True}})
+
+    journal = final.dir / "journal.jsonl"
+    with journal.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"type": "session_end", "exit_code": 3}) + "\n")
+        handle.write(json.dumps({"type": "session_end", "exit_code": 0}) + "\n")
+    with superseded.dir.joinpath("journal.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"type": "session_end", "exit_code": 2}) + "\n")
+        handle.write('{"torn tail')
+
+    rows = list_sessions(sessions_root)
+    by_dir = {Path(row["session_dir"]).name: row for row in rows}
+    assert by_dir[final.dir.name]["exit_code"] == 0
+    assert by_dir[final.dir.name]["status"] == "complete"
+    assert by_dir[superseded.dir.name]["status"] == "corrupt"
+    assert by_dir[superseded.dir.name]["exit_code"] is None
+
+
+def test_list_sessions_tail_decision_aligns_with_shared_reader_tolerance(
+    tmp_path: Path,
+) -> None:
+    """A decisive clean tail wins even if an earlier line is malformed.
+
+    Mirrors the shared reader policy (skip corrupt lines, keep valid ones):
+    the historical strict loop rejected the whole journal for any bad line;
+    tail scanning decides from the newest complete entries instead.
+    """
+    from llamatune.session import list_sessions
+
+    session = _create_session(tmp_path)
+    session.write_analysis({"winner": {"trial_id": "w", "confirmed": False}})
+    journal = session.dir / "journal.jsonl"
+    original = journal.read_bytes()
+    journal.write_bytes(b"\n" + original)
+    with journal.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"type": "session_end", "exit_code": 0}) + "\n")
+
+    rows = list_sessions(session.dir.parent)
+
+    assert len(rows) == 1
+    assert rows[0]["exit_code"] == 0
+    assert rows[0]["status"] == "complete"
+
+
+def test_list_sessions_corrupt_tail_still_falls_back_and_marks_corrupt(
+    tmp_path: Path,
+) -> None:
+    """Corruption at the tail forces the exact historical full-parse path."""
+    from llamatune.session import list_sessions
+
+    session = _create_session(tmp_path)
+    session.write_analysis({"winner": {"trial_id": "w", "confirmed": False}})
+    journal = session.dir / "journal.jsonl"
+    with journal.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"type": "session_end", "exit_code": 0}) + "\n")
+        handle.write('{"torn')
+
+    rows = list_sessions(session.dir.parent)
+
+    assert rows[0]["status"] == "corrupt"
+    assert rows[0]["exit_code"] is None
+
+
+def test_list_sessions_large_journal_reads_only_the_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from llamatune import session as session_module
+    from llamatune.session import list_sessions
+
+    session = _create_session(tmp_path)
+    session.write_analysis({"winner": {"trial_id": "w", "confirmed": True}})
+    journal = session.dir / "journal.jsonl"
+    filler = json.dumps({"type": "trial", "trial_id": "filler", "note": "x" * 256})
+    with journal.open("a", encoding="utf-8") as handle:
+        for _ in range(2000):
+            handle.write(filler + "\n")
+        handle.write(json.dumps({"type": "session_end", "exit_code": 1}) + "\n")
+    monkeypatch.setattr(session_module, "_TAIL_CHUNK_BYTES", 512)
+
+    rows = list_sessions(session.dir.parent)
+
+    assert rows[0]["exit_code"] == 1
+    assert rows[0]["status"] == "complete"
