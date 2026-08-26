@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -132,12 +132,22 @@ class TrialConfig:
     ot_spec: str | None = None
     tensor_split: tuple[float, ...] | None = None
     split_mode: str | None = None
+    # Memoized trial identifier (PERF-008): computed once in __post_init__.
+    # Excluded from init/repr/compare so equality, hashing, and the public
+    # constructor signature are unchanged (DESIGN §7).
+    _trial_id: str = field(init=False, repr=False, compare=False, default="")
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_trial_id", self._compute_trial_id())
+
+    def _compute_trial_id(self) -> str:
+        canonical = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
     @property
     def trial_id(self) -> str:
         """Deterministic trial identifier: sha256(canonical JSON)[:16]."""
-        canonical = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+        return self._trial_id
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {

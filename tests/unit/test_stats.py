@@ -130,6 +130,70 @@ class TestParetoFront:
         assert stats.pareto_front(points) == [1]
 
 
+def _brute_force_pareto(points: list[tuple[float, float]]) -> list[int]:
+    """The pre-PERF-013 quadratic definition, kept as the behavioral oracle."""
+    result: list[int] = []
+    for i, (pp_i, tg_i) in enumerate(points):
+        dominated = any(
+            pp_j >= pp_i and tg_j >= tg_i and (pp_j > pp_i or tg_j > tg_i)
+            for j, (pp_j, tg_j) in enumerate(points)
+            if j != i
+        )
+        if not dominated:
+            result.append(i)
+    return result
+
+
+class TestParetoFrontSweepEquivalence:
+    """PERF-013: the sweep must reproduce the quadratic definition exactly.
+
+    Tie rule: dominance requires both coordinates >= and at least one
+    strictly greater, so exact duplicates (equal pp AND equal tg) never
+    dominate each other and are all retained.
+    """
+
+    def test_matches_brute_force_on_deterministic_fixtures(self) -> None:
+        # Inline LCG (ruff S311 forbids the random module here); rounding to
+        # coarse grids makes exact ties and duplicates frequent.
+        state = 20260826
+
+        def nxt() -> float:
+            nonlocal state
+            state = (state * 6364136223846793005 + 1442695040888963407) % (1 << 64)
+            return (state >> 11) / float(1 << 53)
+
+        for _ in range(200):
+            size = int(nxt() * 25)
+            points = [
+                (
+                    round(nxt() * 150.0 - 50.0, int(nxt() * 2)),
+                    round(nxt() * 150.0 - 50.0, int(nxt() * 2)),
+                )
+                for _ in range(size)
+            ]
+            assert stats.pareto_front(points) == _brute_force_pareto(points)
+
+    def test_duplicates_and_partial_ties(self) -> None:
+        points = [(5.0, 5.0), (5.0, 5.0), (5.0, 6.0), (5.0, 5.0)]
+        assert stats.pareto_front(points) == _brute_force_pareto(points) == [2]
+
+    def test_all_equal_plateau_retains_everything(self) -> None:
+        points = [(3.0, 9.0)] * 4
+        assert stats.pareto_front(points) == [0, 1, 2, 3]
+
+    def test_equal_pp_and_tg_across_positions_retained(self) -> None:
+        points = [(7.0, 4.0), (2.0, 9.0), (7.0, 4.0)]
+        assert stats.pareto_front(points) == [0, 1, 2]
+
+    def test_infinite_values_match_brute_force(self) -> None:
+        points = [(math.inf, 1.0), (1.0, math.inf), (math.inf, math.inf), (2.0, 2.0)]
+        assert stats.pareto_front(points) == _brute_force_pareto(points) == [2]
+
+    def test_returns_indices_in_input_order(self) -> None:
+        points = [(80.0, 20.0), (100.0, 10.0), (90.0, 9.0)]
+        assert stats.pareto_front(points) == [0, 1]
+
+
 class TestMetricDictRoundTrip:
     def test_round_trip(self) -> None:
         metric = MetricStats(mean=123.4, stdev=5.6, cv=0.045, n=5)

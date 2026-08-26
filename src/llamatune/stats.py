@@ -7,6 +7,7 @@ module imports nothing above the standard library plus that one dataclass
 
 from __future__ import annotations
 
+import math
 import statistics
 from collections.abc import Sequence
 from typing import Any
@@ -79,17 +80,40 @@ def pareto_front(points: Sequence[tuple[float, float]]) -> list[int]:
     """Indices of the Pareto-optimal points over (pp, tg); higher is better.
 
     A point is dominated when another has pp and tg both >= it, with at least
-    one strictly greater. Ties (identical points) are all retained.
+    one strictly greater; exact duplicates (equal pp AND equal tg) never
+    dominate each other and are all retained. Implemented as a sort by pp
+    descending with a running tg maximum per equal-pp group (PERF-013),
+    reproducing the quadratic definition exactly and returning indices in
+    input order.
     """
+    n = len(points)
+    if n <= 1:
+        return list(range(n))
+    order = sorted(range(n), key=lambda i: (-points[i][0], -points[i][1]))
     result: list[int] = []
-    for i, (pp_i, tg_i) in enumerate(points):
-        dominated = any(
-            pp_j >= pp_i and tg_j >= tg_i and (pp_j > pp_i or tg_j > tg_i)
-            for j, (pp_j, tg_j) in enumerate(points)
-            if j != i
-        )
-        if not dominated:
-            result.append(i)
+    start = 0
+    best_tg_above = -math.inf
+    while start < n:
+        group_pp = points[order[start]][0]
+        end = start
+        group_best_tg = -math.inf
+        while end < n and points[order[end]][0] == group_pp:
+            tg = points[order[end]][1]
+            if tg > group_best_tg:
+                group_best_tg = tg
+            end += 1
+        for index in range(start, end):
+            i = order[index]
+            tg = points[i][1]
+            # Survives iff no strictly-better-pp point reaches this tg
+            # (best_tg_above < tg) and no same-pp point strictly exceeds it
+            # (group_best_tg <= tg).
+            if best_tg_above < tg and group_best_tg <= tg:
+                result.append(i)
+        if group_best_tg > best_tg_above:
+            best_tg_above = group_best_tg
+        start = end
+    result.sort()
     return result
 
 

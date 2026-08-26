@@ -20,7 +20,7 @@ import signal
 import statistics
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -395,14 +395,20 @@ class _Engine:
 
         self.known: dict[str, dict[str, Any]] = {}
         self.probes: dict[str, dict[str, Any]] = {}
-        self.oom_points: list[tuple[dict[str, Any], str]] = []
+        # OOM points indexed by their reduced comparison key (PERF-009): the
+        # other-fields JSON is computed once at insertion instead of per
+        # (candidate, point) pair. Buckets preserve insertion order.
+        self.oom_index: dict[str, list[tuple[int, int, str]]] = {}
+        self.pair_checks = 0
         for entry in session.entries:
             if entry.get("type") == "trial" and "trial_id" in entry:
                 self.known[entry["trial_id"]] = entry
                 if entry.get("status") in ("oom", "gpu_resource"):
-                    self.oom_points.append((dict(entry["config"]), entry["trial_id"]))
+                    self._record_oom_point(dict(entry["config"]), entry["trial_id"])
             elif entry.get("type") == "probe" and "probe_id" in entry:
                 self.probes[entry["probe_id"]] = entry
+            elif entry.get("type") == "pair_check":
+                self.pair_checks += 1
 
         self.executed_count = _count_executed(session.entries)
         self.start = _monotonic()
@@ -1484,7 +1490,7 @@ class _Engine:
         self._emit_exec_end(label, probe_id, result, measured)
         self.probes[probe_id] = record
         if measured.status in ("oom", "gpu_resource"):
-            self.oom_points.append((cfg.to_dict(), probe_id))
+            self._record_oom_point(cfg.to_dict(), probe_id)
         self._cooldown()
         return measured.status
 
@@ -1872,7 +1878,9 @@ class _Engine:
     ) -> bool:
         if not self._can_execute():
             return False
-        pair_no = sum(1 for e in self.session.entries if e.get("type") == "pair_check") + 1
+        # Running counter seeded from the journal at engine construction
+        # (PERF-011): avoids copying the whole entries tuple per pair check.
+        pair_no = self.pair_checks + 1
         argv = bench.build_bench_argv(
             bench_path=self.llama.bench_path,
             model_path=self.model.path,
@@ -1927,9 +1935,22 @@ class _Engine:
                 "evidence": rel,
             }
         )
+        self.pair_checks += 1
         self._emit_exec_end(label, run_id, result, measured, pair_score)
         self._cooldown()
         return accepted
+
+    def _record_oom_point(self, config: dict[str, Any], point_id: str) -> None:
+        """Index one OOM point for :meth:`_pruned_by` (PERF-009).
+
+        The reduced comparison fields are computed once here; buckets keep
+        insertion order so the first matching ancestor is identical to the
+        historical linear scan over ``gpu_layers``/``moe_cpu_layers``.
+        """
+        key = json.dumps(_other_fields(config), sort_keys=True, separators=(",", ":"))
+        self.oom_index.setdefault(key, []).append(
+            (int(config["gpu_layers"]), int(config["moe_cpu_layers"]), point_id)
+        )
 
     def _pruned_by(self, cfg: TrialConfig) -> str | None:
         """Monotone OOM pruning ancestor for `cfg`, or None (DESIGN §10 step 4).
@@ -1938,14 +1959,15 @@ class _Engine:
         gpu_layers >= g and moe_cpu_layers <= c only when every other
         (memory-relevant) field is equal -- the most conservative reading.
         """
-        cfg_dict = cfg.to_dict()
-        for oom_cfg, trial_id in self.oom_points:
-            if (
-                cfg.gpu_layers >= int(oom_cfg["gpu_layers"])
-                and cfg.moe_cpu_layers <= int(oom_cfg["moe_cpu_layers"])
-                and _other_fields(cfg_dict) == _other_fields(oom_cfg)
-            ):
-                return trial_id
+        key = json.dumps(_other_fields(cfg.to_dict()), sort_keys=True, separators=(",", ":"))
+        bucket = self.oom_index.get(key)
+        if not bucket:
+            return None
+        gpu_layers = cfg.gpu_layers
+        moe_cpu_layers = cfg.moe_cpu_layers
+        for oom_gpu_layers, oom_moe_cpu_layers, point_id in bucket:
+            if gpu_layers >= oom_gpu_layers and moe_cpu_layers <= oom_moe_cpu_layers:
+                return point_id
         return None
 
     def _hard_cap_ancestor(self, cfg: TrialConfig) -> str | None:
@@ -2076,7 +2098,7 @@ class _Engine:
             else None
         )
         if measured.status in ("oom", "gpu_resource"):
-            self.oom_points.append((cfg.to_dict(), cfg.trial_id))
+            self._record_oom_point(cfg.to_dict(), cfg.trial_id)
 
         record = {
             "type": "trial",
@@ -2258,25 +2280,31 @@ class _Engine:
             "evidence": None,
         }
 
-    def _context_candidates(self, base: TrialConfig) -> list[TrialConfig]:
+    def _context_candidates(self, base: TrialConfig) -> Iterator[TrialConfig]:
+        """Yield context-probe candidates lazily in the historical order.
+
+        Order and trial_id-based dedup are identical to the former eager
+        list build (PERF-010); consumers that stop early no longer pay for
+        the tail.
+        """
         cap = gpu_layer_cap(self.model, self.options)
-        candidates = [base] if base.gpu_layers <= cap else []
-        for boundary in sorted(
+        seen: set[str] = set()
+        if base.gpu_layers <= cap:
+            seen.add(base.trial_id)
+            yield base
+        boundaries = sorted(
             (boundary for boundary in self.boundaries if _boundary_has_fit(boundary)),
             key=lambda b: b.max_ok_ngl,
             reverse=True,
-        ):
-            candidates.extend(
-                dataclasses.replace(base, gpu_layers=ngl, moe_cpu_layers=boundary.moe_cpu_layers)
-                for ngl in range(boundary.max_ok_ngl, -1, -1)
-            )
-        result: list[TrialConfig] = []
-        seen: set[str] = set()
-        for candidate in candidates:
-            if candidate.trial_id not in seen:
-                result.append(candidate)
-                seen.add(candidate.trial_id)
-        return result
+        )
+        for boundary in boundaries:
+            for ngl in range(boundary.max_ok_ngl, -1, -1):
+                candidate = dataclasses.replace(
+                    base, gpu_layers=ngl, moe_cpu_layers=boundary.moe_cpu_layers
+                )
+                if candidate.trial_id not in seen:
+                    seen.add(candidate.trial_id)
+                    yield candidate
 
     def _context_envelope_candidates(self, base: TrialConfig) -> list[TrialConfig]:
         """Return placement fallbacks with opt-in, least-lossy KV tiers interleaved."""
@@ -2408,6 +2436,11 @@ class _Engine:
         rows = [required]
         original_failed_at: int | None = None
         fallback: TrialConfig | None = None
+        # Envelope enumeration depends only on its base config (boundaries,
+        # caps, and options are fixed across rungs), so it is computed once
+        # per distinct base and reused while `fallback` stays the same.
+        envelope_candidates: list[TrialConfig] = []
+        envelope_base_id: str | None = None
         total_start = self.executed_count
         truncated = False
         budget_exhausted = False
@@ -2464,8 +2497,11 @@ class _Engine:
 
             passing = config if primary_status == "ok" else None
             if passing is None:
-                candidates = self._context_envelope_candidates(fallback or config)
-                for candidate in candidates:
+                envelope_base = fallback or config
+                if envelope_base.trial_id != envelope_base_id:
+                    envelope_candidates = self._context_envelope_candidates(envelope_base)
+                    envelope_base_id = envelope_base.trial_id
+                for candidate in envelope_candidates:
                     if candidate.trial_id == config.trial_id:
                         continue
                     if (

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -45,6 +47,42 @@ def test_trial_id_is_deterministic() -> None:
     assert a.trial_id == b.trial_id
     assert len(a.trial_id) == 16
     int(a.trial_id, 16)  # must be valid hex
+
+
+def test_trial_id_matches_direct_canonical_json_computation() -> None:
+    config = _config(threads_batch=4, tensor_split=(16.0, 24.0), split_mode="row")
+    canonical = json.dumps(config.to_dict(), sort_keys=True, separators=(",", ":"))
+    expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    assert config.trial_id == expected
+
+
+def test_trial_id_memoized_once_at_construction() -> None:
+    config = _config()
+    # PERF-008: the identifier is computed in __post_init__ into the private
+    # slot; the property is a pure accessor over it.
+    assert config._trial_id == config.trial_id
+    assert config.trial_id == config.trial_id
+
+
+def test_dataclasses_replace_recomputes_trial_id() -> None:
+    base = _config(gpu_layers=33)
+    mutated = dataclasses.replace(base, gpu_layers=1)
+    assert mutated.trial_id != base.trial_id
+    canonical = json.dumps(mutated.to_dict(), sort_keys=True, separators=(",", ":"))
+    expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    assert mutated.trial_id == expected
+
+
+def test_memoized_field_excluded_from_equality_hash_and_repr() -> None:
+    a = _config()
+    b = _config()
+    assert a == b
+    assert hash(a) == hash(b)
+    assert len({a, b}) == 1
+    assert "_trial_id" not in repr(a)
+    # The public serialization contract is untouched by the cache.
+    assert a.to_dict() == b.to_dict()
+    assert "trial_id" not in a.to_dict()
 
 
 def test_trial_id_changes_with_any_field() -> None:
