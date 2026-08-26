@@ -194,32 +194,6 @@ def build_recommended_json(
     return result
 
 
-def _cli_flags(config: TrialConfig, *, moe: bool) -> list[str]:
-    flags = [
-        "-ngl",
-        str(config.gpu_layers),
-        "-b",
-        str(config.batch),
-        "-ub",
-        str(config.ubatch),
-        "-t",
-        str(config.threads),
-    ]
-    if moe and config.moe_cpu_layers > 0:
-        flags += ["--n-cpu-moe", str(config.moe_cpu_layers)]
-    if config.flash_attn:
-        flags += ["-fa", "on"]
-    if not config.mmap:
-        flags.append("--no-mmap")
-    if config.no_kv_offload:
-        flags.append("--no-kv-offload")
-    if config.cache_type_k != "f16":
-        flags += ["-ctk", config.cache_type_k]
-    if config.cache_type_v != "f16":
-        flags += ["-ctv", config.cache_type_v]
-    return flags
-
-
 def build_recommended_sh(
     *,
     config: TrialConfig,
@@ -231,8 +205,13 @@ def build_recommended_sh(
     ctx_size: int | None = None,
     context_envelope: list[dict[str, Any]] | None = None,
 ) -> str:
-    """A commented, non-executable reference snippet (DESIGN §11.2)."""
-    runtime_flags = _cli_flags(config, moe=moe)
+    """A commented, non-executable reference snippet (DESIGN §11.2).
+
+    Runtime flags come from :func:`llamatune.report.runtime_flags` so this
+    snippet matches export output flag-for-flag. ``moe`` is accepted for
+    call-site compatibility; emission follows the shared report rules.
+    """
+    runtime_flags = report_module.runtime_flags(config)
     if ctx_size is not None:
         runtime_flags += ["-c", str(ctx_size)]
     flags = " ".join(runtime_flags)
@@ -269,7 +248,7 @@ def build_recommended_sh(
         if alternate_key in seen_alternates:
             continue
         seen_alternates.add(alternate_key)
-        alternate_flags = [*_cli_flags(alternate, moe=moe), "-c", str(row["ctx"])]
+        alternate_flags = [*report_module.runtime_flags(alternate), "-c", str(row["ctx"])]
         alternate_text = " ".join(alternate_flags)
         lines.append(f"# Alternate for {row['ctx']} context:")
         if not _is_lossless(alternate.to_dict()):

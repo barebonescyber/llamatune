@@ -8,33 +8,32 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import os
 import re
-import secrets
-from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from llamatune._version import __version__
+from llamatune.evidence import (
+    EvidenceWriter,
+    PathEscapeError,
+    confined_path,
+    create_unique_dir,
+    utc_iso,
+)
 from llamatune.types import GPUInfo, HardwareReport, LlamaCppReport, ModelReport, TuneOptions
 
 _SCHEMA_VERSION = 2
 _SAFE_STEM_RE = re.compile(r"[^A-Za-z0-9._-]+")
-_CREATE_RETRIES = 5
 _DERIVED_OUTPUTS = ("analysis.json", "recommended.json", "recommended.sh", "report.md")
 
 
-class SessionPathError(Exception):
+class SessionPathError(PathEscapeError):
     """Raised when a resolved path would escape the session directory."""
 
 
 class SessionCorruptionError(Exception):
     """Raised when journal.jsonl contains corruption resume cannot tolerate."""
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 def _sanitize_stem(stem: str) -> str:
@@ -43,24 +42,93 @@ def _sanitize_stem(stem: str) -> str:
 
 
 def _confine(base: Path, *parts: str) -> Path:
-    """Join `parts` onto `base`, rejecting any result that escapes `base`."""
-    base_resolved = base.resolve()
-    candidate = base
-    for part in parts:
-        candidate = candidate / part
-    candidate_resolved = candidate.resolve()
-    try:
-        candidate_resolved.relative_to(base_resolved)
-    except ValueError:
-        msg = f"path {candidate} escapes session directory {base}"
-        raise SessionPathError(msg) from None
-    return candidate
+    return confined_path(base, *parts, error=SessionPathError)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as fh:
         data: dict[str, Any] = json.load(fh)
     return data
+
+
+# --------------------------------------------------------------------------
+# Journal tail scanning
+# --------------------------------------------------------------------------
+
+
+_TAIL_CHUNK_BYTES = 65536
+
+
+class JournalTailIncomplete:
+    """Sentinel returned when the journal tail alone cannot decide.
+
+    A torn, corrupt, or undecodable line was met before any match, so the
+    caller must fall back to a full tolerant parse to reproduce historical
+    semantics exactly.
+    """
+
+    def __repr__(self) -> str:
+        return "JournalTailIncomplete"
+
+
+JOURNAL_TAIL_INCOMPLETE = JournalTailIncomplete()
+
+
+def _reverse_complete_lines(path: Path) -> Iterator[bytes]:
+    """Yield complete newline-delimited lines from a file, last line first."""
+    size = path.stat().st_size
+    remaining = size
+    pending = b""
+    at_eof = True
+    with path.open("rb") as handle:
+        while remaining > 0:
+            step = min(_TAIL_CHUNK_BYTES, remaining)
+            remaining -= step
+            handle.seek(remaining)
+            buf = handle.read(step) + pending
+            parts = buf.split(b"\n")
+            pending = parts[0]
+            if at_eof:
+                # A trailing newline contributes an empty split artifact,
+                # not a line; text-mode ``splitlines`` never yields one.
+                if buf.endswith(b"\n"):
+                    parts.pop()
+                at_eof = False
+            for index in range(len(parts) - 1, 0, -1):
+                yield parts[index]
+        if pending:
+            yield pending
+        elif size and handle.read(1) == b"\n":
+            # A leading newline starts an empty first line, which strict
+            # parsing would reject just like any other blank line.
+            yield b""
+
+
+def scan_journal_tail(
+    path: Path,
+    predicate: Callable[[Mapping[str, Any]], bool],
+) -> dict[str, Any] | JournalTailIncomplete | None:
+    """Search a journal backwards for the newest entry satisfying predicate.
+
+    Returns the matching entry, ``None`` when the whole file parsed cleanly
+    without a match, or :data:`JOURNAL_TAIL_INCOMPLETE` when a line fails to
+    decode or parse before any match is found. Reading only the tail lets
+    callers answer trailing-entry questions without parsing entire journals;
+    the sentinel keeps every ambiguous case on the exact full-parse path.
+    """
+    try:
+        for line in _reverse_complete_lines(path):
+            try:
+                entry = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                return JOURNAL_TAIL_INCOMPLETE
+            if not isinstance(entry, dict):
+                continue
+            if predicate(entry):
+                return entry
+    except OSError:
+        return JOURNAL_TAIL_INCOMPLETE
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -278,6 +346,10 @@ def _options_from_dict(data: Mapping[str, Any]) -> TuneOptions:
     )
 
 
+def _is_session_end(entry: Mapping[str, Any]) -> bool:
+    return entry.get("type") == "session_end"
+
+
 def list_sessions(sessions_dir: Path) -> list[dict[str, Any]]:
     """Summarize session directories, tolerating incomplete and corrupt entries."""
     if not sessions_dir.is_dir():
@@ -315,28 +387,37 @@ def list_sessions(sessions_dir: Path) -> list[dict[str, Any]]:
                 if isinstance(winner, dict):
                     row["winner_trial_id"] = winner.get("trial_id")
                     row["confirmed"] = bool(winner.get("confirmed", False))
-                endings: list[dict[str, Any]] = []
                 journal_path = candidate / "journal.jsonl"
-                if journal_path.is_file():
+                if not journal_path.is_file():
+                    row["exit_code"] = None
+                elif isinstance(
+                    found := scan_journal_tail(journal_path, _is_session_end),
+                    JournalTailIncomplete,
+                ):
+                    endings: list[dict[str, Any]] = []
                     for line in journal_path.read_text(encoding="utf-8").splitlines():
                         entry = json.loads(line)
                         if isinstance(entry, dict) and entry.get("type") == "session_end":
                             endings.append(entry)
-                row["exit_code"] = endings[-1].get("exit_code") if endings else None
+                    row["exit_code"] = endings[-1].get("exit_code") if endings else None
+                else:
+                    row["exit_code"] = found.get("exit_code") if found is not None else None
                 row["status"] = "complete"
-        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, KeyError, TypeError):
             row["status"] = "corrupt"
         rows.append(row)
     return rows
 
 
-class Session:
+class Session(EvidenceWriter):
     """A tuning session's evidence directory (DESIGN §12).
 
     Construct via :meth:`create` (new session) or :meth:`load` (existing
     session directory); the `__init__` signature is an implementation
     detail.
     """
+
+    path_error: type[PathEscapeError] = SessionPathError
 
     def __init__(
         self,
@@ -350,6 +431,8 @@ class Session:
         resume_warnings: tuple[str, ...] = (),
     ) -> None:
         self._dir = session_dir
+        # Plain attribute (not a property): EvidenceWriter requires ``dir``.
+        self.dir = session_dir
         self._model = model
         self._hardware = hardware
         self._llama = llama
@@ -358,10 +441,6 @@ class Session:
         self._resume_warnings = resume_warnings
 
     # -- properties ---------------------------------------------------
-
-    @property
-    def dir(self) -> Path:
-        return self._dir
 
     @property
     def model(self) -> ModelReport:
@@ -414,23 +493,7 @@ class Session:
     ) -> Session:
         sessions_root.mkdir(parents=True, exist_ok=True)
         stem = _sanitize_stem(model.path.stem)
-
-        session_dir: Path | None = None
-        last_error: OSError | None = None
-        for _ in range(_CREATE_RETRIES):
-            timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-            suffix = secrets.token_hex(3)
-            candidate = sessions_root / f"{stem}-{timestamp}-{suffix}"
-            try:
-                candidate.mkdir(parents=True, exist_ok=False)
-            except FileExistsError as exc:
-                last_error = exc
-                continue
-            session_dir = candidate
-            break
-        if session_dir is None:
-            msg = f"could not allocate a unique session directory under {sessions_root}"
-            raise SessionPathError(msg) from last_error
+        session_dir = create_unique_dir(sessions_root, stem, error=SessionPathError)
 
         (session_dir / "baseline").mkdir(exist_ok=True)
         (session_dir / "trials").mkdir(exist_ok=True)
@@ -444,19 +507,19 @@ class Session:
             entries=[],
         )
 
-        session._write_json(
+        session.write_json(
             "session.json",
             {
                 "schema_version": _SCHEMA_VERSION,
                 "tool_version": __version__,
                 "argv": list(argv),
                 "options": _options_to_dict(options),
-                "created": _utc_now_iso(),
+                "created": utc_iso(),
             },
         )
-        session._write_json("hardware.json", _hardware_to_dict(hardware))
-        session._write_json("model.json", _model_to_dict(model))
-        session._write_json("llamacpp.json", _llama_to_dict(llama))
+        session.write_json("hardware.json", _hardware_to_dict(hardware))
+        session.write_json("model.json", _model_to_dict(model))
+        session.write_json("llamacpp.json", _llama_to_dict(llama))
 
         session.append(
             {
@@ -539,23 +602,10 @@ class Session:
 
     # -- writes -----------------------------------------------------------
 
-    def _write_json(self, name: str, data: dict[str, Any]) -> None:
-        path = _confine(self._dir, name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, sort_keys=True)
-            fh.write("\n")
-
     def append(self, entry: dict[str, Any]) -> None:
         """Append one journal entry; adds a timestamp, flushes, and fsyncs."""
-        record = dict(entry)
-        record.setdefault("ts", _utc_now_iso())
-        line = json.dumps(record, sort_keys=True)
-        journal_path = _confine(self._dir, "journal.jsonl")
-        with journal_path.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        record = self._journal_record(entry)
+        self._append_record(record)
         self._entries.append(record)
 
     def trial_dir(self, trial_id: str) -> Path:
@@ -581,16 +631,11 @@ class Session:
         return path
 
     def write_analysis(self, analysis: dict[str, Any]) -> None:
-        self._write_json("analysis.json", analysis)
+        self.write_json("analysis.json", analysis)
 
     def read_json(self, name: str) -> dict[str, Any]:
         """Read one JSON artifact after confining it to this session."""
         return _read_json(_confine(self._dir, name))
-
-    def write_text(self, name: str, text: str) -> None:
-        path = _confine(self._dir, name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
 
     def invalidate_derived_outputs(self) -> None:
         """Remove stale generated outputs while preserving their journal evidence."""
@@ -608,4 +653,4 @@ class Session:
         self._llama = dataclasses.replace(
             self._llama, build_commit=commit, build_number=number, backends=backends
         )
-        self._write_json("llamacpp.json", _llama_to_dict(self._llama))
+        self.write_json("llamacpp.json", _llama_to_dict(self._llama))

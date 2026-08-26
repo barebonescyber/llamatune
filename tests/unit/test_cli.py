@@ -9,10 +9,18 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import typer
 from typer.main import get_command
 from typer.testing import CliRunner
 
-from llamatune.cli import _emit_tune_outcome, _parse_ctx_ladder, _parse_depth_profile, app
+from llamatune._version import __version__
+from llamatune.cli import (
+    _emit_tune_outcome,
+    _guard_internal_errors,
+    _parse_ctx_ladder,
+    _parse_depth_profile,
+    app,
+)
 from llamatune.session import Session
 from llamatune.types import GPUInfo, HardwareReport, LlamaCppReport, TuneOutcome
 
@@ -151,7 +159,9 @@ def test_scan_json_output(monkeypatch: pytest.MonkeyPatch) -> None:
     assert payload["llama_error"] is None
 
 
-def test_scan_reports_missing_llama_bench_without_failing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_scan_reports_missing_llama_bench_as_environment_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from llamatune.llama import LlamaDiscoveryError
 
     monkeypatch.setattr("llamatune.hardware.assess_hardware", _fake_hardware)
@@ -162,11 +172,13 @@ def test_scan_reports_missing_llama_bench_without_failing(monkeypatch: pytest.Mo
     monkeypatch.setattr("llamatune.llama.discover_llama", _raise)
 
     result = runner.invoke(app, ["scan"])
-    assert result.exit_code == 0
+    assert result.exit_code == 3
     assert "NOT FOUND" in result.output
 
 
-def test_scan_json_reports_missing_llama_bench(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_scan_json_reports_missing_llama_bench_with_exit_3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from llamatune.llama import LlamaDiscoveryError
 
     monkeypatch.setattr("llamatune.hardware.assess_hardware", _fake_hardware)
@@ -177,8 +189,8 @@ def test_scan_json_reports_missing_llama_bench(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr("llamatune.llama.discover_llama", _raise)
 
     result = runner.invoke(app, ["scan", "--json"])
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
+    assert result.exit_code == 3
+    payload = json.loads(result.stdout)
     assert payload["llama"] is None
     assert "not found" in payload["llama_error"]
 
@@ -230,6 +242,10 @@ def test_tune_missing_llama_bench_exits_3(tmp_path: Path) -> None:
     result = runner.invoke(app, ["tune", "nonexistent.gguf", "--llama-bin", str(empty_bin)])
     assert result.exit_code == 3
     assert "llama-bench not found" in result.stderr
+    assert (
+        "Pass --llama-bin DIR as the directory containing the binaries, "
+        "not the binary itself." in result.stderr
+    )
     assert "Traceback" not in result.output
 
 
@@ -424,6 +440,52 @@ def test_sessions_command_human_output(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert "model=model status=complete exit=0 winner=winner confirmed=True" in result.output
 
 
+def _patched_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "llamatune.session.list_sessions",
+        lambda path: [
+            {
+                "session_dir": "/sessions/a",
+                "model": "model",
+                "status": "complete",
+                "exit_code": 0,
+                "winner_trial_id": "winner",
+                "confirmed": True,
+            }
+        ],
+    )
+
+
+def test_sessions_plain_pipe_output_matches_legacy_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patched_sessions(monkeypatch)
+    monkeypatch.setattr("llamatune.cli._stdout_is_tty", lambda: False)
+
+    result = runner.invoke(app, ["sessions", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert result.stdout == (
+        "/sessions/a model=model status=complete exit=0 winner=winner confirmed=True\n"
+    )
+
+
+def test_sessions_tty_output_renders_rich_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patched_sessions(monkeypatch)
+    monkeypatch.setattr("llamatune.cli._stdout_is_tty", lambda: True)
+    monkeypatch.setenv("COLUMNS", "200")
+
+    result = runner.invoke(app, ["sessions", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "/sessions/a" in result.stdout
+    for header in ("session_dir", "model", "status", "exit", "winner", "confirmed"):
+        assert header in result.stdout
+    assert "\u2502" in result.stdout
+
+
 def test_sessions_command_preserves_windows_drive_path(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[str] = []
 
@@ -542,9 +604,10 @@ def test_revalidate_failure_has_human_and_json_contract(
 
     human = runner.invoke(app, ["revalidate", str(outcome.session_dir)])
     assert human.exit_code == 3
-    assert "revalidation failed: revalidation: session has no confirmed winner" in human.output
-    assert "resumable: no" in human.output
+    assert "revalidation failed: revalidation: session has no confirmed winner" in human.stderr
+    assert "resumable: no" in human.stderr
     assert "revalidation: unknown" not in human.output
+    assert "revalidation failed" not in human.stdout
 
     machine = runner.invoke(app, ["revalidate", str(outcome.session_dir), "--json"])
     assert machine.exit_code == 3
@@ -623,7 +686,7 @@ def test_dry_run_respects_zero_gpu_layer_hard_cap(
     assert not sessions.exists()
 
 
-def test_exit_3_outcome_has_stage_reason_and_no_old_summary(
+def test_exit_3_outcome_renders_on_stderr_only(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _emit_tune_outcome(
@@ -636,12 +699,13 @@ def test_exit_3_outcome_has_stage_reason_and_no_old_summary(
         ),
         json_output=False,
     )
-    output = capsys.readouterr().out
-    assert "tuning did not start: baseline:" in output
-    assert "default probe and -ngl 0 fallback both failed" in output
-    assert "evidence:" in output
-    assert "resumable: no" in output
-    assert "no confirmed improvement over baseline" not in output
+    captured = capsys.readouterr()
+    assert "tuning did not start: baseline:" in captured.err
+    assert "default probe and -ngl 0 fallback both failed" in captured.err
+    assert "evidence:" in captured.err
+    assert "resumable: no" in captured.err
+    assert "no confirmed improvement over baseline" not in captured.err
+    assert captured.out == ""
 
 
 def test_exit_2_outcome_reports_unreadable_evidence(
@@ -657,11 +721,29 @@ def test_exit_2_outcome_reports_unreadable_evidence(
         ),
         json_output=False,
     )
-    output = capsys.readouterr().out
-    assert "tuning could not continue: session: journal.jsonl is corrupt" in output
-    assert "evidence: unavailable or unreadable" in output
-    assert "resumable: no" in output
-    assert "no confirmed improvement over baseline" not in output
+    captured = capsys.readouterr()
+    assert "tuning could not continue: session: journal.jsonl is corrupt" in captured.err
+    assert "evidence: unavailable or unreadable" in captured.err
+    assert "resumable: no" in captured.err
+    assert "no confirmed improvement over baseline" not in captured.err
+    assert captured.out == ""
+
+
+def test_success_outcome_renders_on_stdout_only(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _emit_tune_outcome(
+        TuneOutcome(
+            session_dir=tmp_path / "session",
+            analysis={"winner": {"trial_id": "w1"}},
+            exit_code=0,
+        ),
+        json_output=False,
+    )
+    captured = capsys.readouterr()
+    assert "winner: w1" in captured.out
+    assert "exit_code: 0" in captured.out
+    assert captured.err == ""
 
 
 @pytest.mark.parametrize("exit_code,resumable", [(2, False), (3, False), (4, True)])
@@ -705,14 +787,15 @@ def test_exit_4_evidence_failure_has_resumability_explanation(
         ),
         json_output=False,
     )
-    output = capsys.readouterr().out
-    assert "tuning stopped with a resumable session: evidence:" in output
-    assert "No space left on device" in output
-    assert "evidence:" in output
-    assert "resumable: yes" in output
+    captured = capsys.readouterr()
+    assert "tuning stopped with a resumable session: evidence:" in captured.err
+    assert "No space left on device" in captured.err
+    assert "evidence:" in captured.err
+    assert "resumable: yes" in captured.err
+    assert captured.out == ""
 
 
-def test_tune_invalid_sessions_dir_exits_2(
+def test_tune_unwritable_sessions_dir_exits_3(
     fake_bin_dir: Path,
     tiny_gguf: Path,
     tmp_path: Path,
@@ -734,12 +817,12 @@ def test_tune_invalid_sessions_dir_exits_2(
         ],
     )
 
-    assert result.exit_code == 2
+    assert result.exit_code == 3
     assert "error: could not create session directory under" in result.stderr
     assert "Traceback" not in result.output
 
 
-def test_tune_insufficient_disk_space_exits_2_without_traceback(
+def test_tune_insufficient_disk_space_exits_3_without_traceback(
     fake_bin_dir: Path,
     tiny_gguf: Path,
     tmp_path: Path,
@@ -764,7 +847,7 @@ def test_tune_insufficient_disk_space_exits_2_without_traceback(
         ],
     )
 
-    assert result.exit_code == 2
+    assert result.exit_code == 3
     assert "No space left on device" in result.stderr
     assert "Traceback" not in result.output
 
@@ -794,7 +877,7 @@ def test_tune_insufficient_disk_space_json_has_no_evidence(
         ],
     )
 
-    assert result.exit_code == 2
+    assert result.exit_code == 3
     payload = json.loads(result.stdout)
     assert payload["failure_stage"] == "session_creation"
     assert payload["session_dir"] is None
@@ -805,9 +888,10 @@ def test_tune_insufficient_disk_space_json_has_no_evidence(
 def test_resume_unreadable_session_exits_2_with_contract(tmp_path: Path) -> None:
     result = runner.invoke(app, ["resume", str(tmp_path / "no-such-session")])
     assert result.exit_code == 2
-    assert "tuning could not continue: session:" in result.output
-    assert "resumable: no" in result.output
+    assert "tuning could not continue: session:" in result.stderr
+    assert "resumable: no" in result.stderr
     assert "no confirmed improvement over baseline" not in result.output
+    assert "tuning could not continue" not in result.stdout
 
     json_result = runner.invoke(app, ["resume", str(tmp_path / "no-such-session"), "--json"])
     assert json_result.exit_code == 2
@@ -1087,3 +1171,302 @@ def test_report_command_non_object_analysis_exits_2(tmp_path: Path) -> None:
     assert result.exit_code == 2
     assert "could not read session evidence" in result.stderr
     assert "Traceback" not in result.output
+
+
+def test_version_flag_prints_version_and_exits_zero() -> None:
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == 0
+    assert result.stdout == f"llamatune {__version__}\n"
+    assert "Traceback" not in result.output
+
+
+def test_marathon_depth_capability_error_has_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _no_depth(llama_bin: Path | None) -> Any:
+        return SimpleNamespace(bench_path=Path("/opt/llama-bench"), capabilities=frozenset())
+
+    monkeypatch.setattr("llamatune.llama.discover_llama", _no_depth)
+    result = runner.invoke(app, ["marathon", "model.gguf", "--depth-grid", "0,8192"])
+    assert result.exit_code == 2
+    assert "does not support -d/--n-depth" in result.stderr
+    assert "Use --depth-grid 0, or update llama.cpp for depth support." in result.stderr
+
+
+def test_calibrate_write_failure_exits_3_without_traceback(tmp_path: Path) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("regular file, not a directory")
+
+    result = runner.invoke(app, ["calibrate", "--sessions-dir", str(blocker)])
+
+    assert result.exit_code == 3
+    assert result.stderr.startswith("error: could not write calibration file under")
+    assert str(blocker) in result.stderr
+    assert "Traceback" not in result.output
+
+
+def test_calibrate_value_error_exits_2(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def _boom(path: Path) -> dict[str, Any]:
+        raise ValueError("bad session evidence")
+
+    monkeypatch.setattr("llamatune.calibrate.calibrate", _boom)
+
+    result = runner.invoke(app, ["calibrate", "--sessions-dir", str(tmp_path)])
+
+    assert result.exit_code == 2
+    assert "error: could not fit calibration factors: bad session evidence" in result.stderr
+    assert "Traceback" not in result.output
+
+
+def test_unexpected_engine_error_becomes_single_stderr_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def _boom(path: Path) -> list[dict[str, Any]]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("llamatune.session.list_sessions", _boom)
+
+    result = runner.invoke(app, ["sessions", str(tmp_path)])
+
+    assert result.exit_code == 3
+    assert result.stderr == (
+        "internal error: boom; report at https://github.com/barebonescyber/llamatune/issues\n"
+    )
+    assert "Traceback" not in result.output
+
+
+def test_internal_error_guard_reraises_keyboard_interrupt() -> None:
+    def callback() -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _guard_internal_errors(callback)()
+
+
+def test_internal_error_guard_passes_through_typer_exit() -> None:
+    def callback() -> None:
+        raise typer.Exit(code=2)
+
+    with pytest.raises(typer.Exit) as excinfo:
+        _guard_internal_errors(callback)()
+
+    assert excinfo.value.exit_code == 2
+
+
+def test_verbose_flag_emits_startup_diagnostics_on_success(
+    fake_bin_dir: Path, tiny_gguf: Path, tmp_path: Path
+) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "--verbose",
+            "tune",
+            str(tiny_gguf),
+            "--llama-bin",
+            str(fake_bin_dir),
+            "--sessions-dir",
+            str(tmp_path / "sessions"),
+            "--baseline-only",
+        ],
+    )
+    assert result.exit_code == 0
+    assert f"[verbose] model: {tiny_gguf}" in result.stderr
+    assert "[verbose] llama-bench:" in result.stderr
+    assert "[verbose] probe argv:" in result.stderr
+    assert "[verbose] capabilities:" in result.stderr
+
+
+def test_verbose_flag_emits_diagnostics_on_failing_command(tmp_path: Path) -> None:
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    result = runner.invoke(
+        app,
+        ["--verbose", "tune", "missing.gguf", "--llama-bin", str(empty_bin)],
+    )
+    assert result.exit_code == 3
+    assert f"[verbose] llama-bin: {empty_bin}" in result.stderr
+    assert "error: llama-bench not found" in result.stderr
+    assert "[verbose]" not in result.stdout
+
+
+def test_verbose_diagnostics_are_off_by_default(tmp_path: Path) -> None:
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    result = runner.invoke(
+        app,
+        ["tune", "missing.gguf", "--llama-bin", str(empty_bin)],
+    )
+    assert result.exit_code == 3
+    assert "[verbose]" not in result.stderr
+    assert "[verbose]" not in result.stdout
+
+
+def test_llamatune_verbose_env_var_equals_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    monkeypatch.setenv("LLAMATUNE_VERBOSE", "1")
+    result = runner.invoke(
+        app,
+        ["tune", "missing.gguf", "--llama-bin", str(empty_bin)],
+    )
+    assert result.exit_code == 3
+    assert f"[verbose] llama-bin: {empty_bin}" in result.stderr
+
+
+def test_verbose_resume_emits_session_diagnostics(tmp_path: Path) -> None:
+    missing = tmp_path / "gone-session"
+    result = runner.invoke(app, ["--verbose", "resume", str(missing)])
+    assert result.exit_code == 2
+    assert f"[verbose] session: {missing}" in result.stderr
+
+
+# --- UX-004: sessions command directory selection -------------------------
+
+
+def test_sessions_defaults_to_llamatune_sessions_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[Path] = []
+
+    def record(path: Path) -> list[dict[str, Any]]:
+        seen.append(path)
+        return []
+
+    monkeypatch.setattr("llamatune.session.list_sessions", record)
+
+    result = runner.invoke(app, ["sessions"])
+    assert result.exit_code == 0
+    assert seen[0] == Path("./llamatune-sessions")
+
+
+def test_sessions_accepts_sessions_dir_option(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen: list[Path] = []
+    row = {
+        "session_dir": "/sessions/a",
+        "model": "model",
+        "status": "complete",
+        "exit_code": 0,
+        "winner_trial_id": "w",
+        "confirmed": True,
+    }
+
+    def record(path: Path) -> list[dict[str, Any]]:
+        seen.append(path)
+        return [row]
+
+    monkeypatch.setattr("llamatune.session.list_sessions", record)
+
+    custom_root = tmp_path / "custom-root"
+    result = runner.invoke(app, ["sessions", "--sessions-dir", str(custom_root), "--json"])
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)[0]["session_dir"] == "/sessions/a"
+
+
+def test_sessions_positional_form_still_works(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["sessions", str(tmp_path), "--json"])
+    assert result.exit_code == 0
+    assert json.loads(result.output) == []
+
+
+def test_sessions_rejects_positional_and_option_together(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app, ["sessions", str(tmp_path), "--sessions-dir", str(tmp_path / "other")]
+    )
+    assert result.exit_code == 2
+    assert "pass the sessions directory once" in result.stderr
+
+
+# --- UX-003: best ctx-size CSV ladder --------------------------------------
+
+
+def test_best_ctx_size_accepts_csv_uses_first_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def capture(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        seen.update(kwargs)
+        return {"status": "hit", "record": {}, "stale_reasons": []}
+
+    monkeypatch.setattr("llamatune.model.inspect_model", lambda path: SimpleNamespace())
+    monkeypatch.setattr("llamatune.llama.discover_llama", lambda path: SimpleNamespace())
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", _fake_hardware)
+    monkeypatch.setattr("llamatune.config.hardware_signature", lambda hardware: ())
+    monkeypatch.setattr("llamatune.registry.lookup", capture)
+
+    csv_result = runner.invoke(app, ["best", str(tmp_path / "m.gguf"), "--ctx-size", "4096,8192"])
+    assert csv_result.exit_code == 0
+    assert seen["ctx_size"] == 4096
+
+    bare_result = runner.invoke(app, ["best", str(tmp_path / "m.gguf"), "--ctx-size", "8192"])
+    assert bare_result.exit_code == 0
+    assert seen["ctx_size"] == 8192
+
+
+def test_best_ctx_size_csv_validation_exits_2(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["best", str(tmp_path / "m.gguf"), "--ctx-size", "8192,4096"])
+    assert result.exit_code == 2
+    assert "distinct and ascending" in result.stderr
+
+
+# --- UX-009: --json aliases -------------------------------------------------
+
+
+def _write_exportable_session(session: Path) -> None:
+    session.mkdir(parents=True)
+    recommended = {
+        "config": {
+            "gpu_layers": 10,
+            "moe_cpu_layers": 0,
+            "flash_attn": False,
+            "ubatch": 512,
+            "batch": 2048,
+            "threads": 8,
+            "mmap": True,
+            "no_kv_offload": False,
+            "cache_type_k": "f16",
+            "cache_type_v": "f16",
+        },
+        "model": {"path": "/models/model.gguf"},
+    }
+    (session / "recommended.json").write_text(json.dumps(recommended))
+    (session / "session.json").write_text(json.dumps({"options": {"ctx_size": 4096}}))
+
+
+def test_export_json_alias_matches_format_json(tmp_path: Path) -> None:
+    session = tmp_path / "session"
+    _write_exportable_session(session)
+
+    aliased = runner.invoke(app, ["export", str(session), "--json"])
+    assert aliased.exit_code == 0
+    assert json.loads(aliased.stdout)["model"]["path"] == "/models/model.gguf"
+
+    explicit = runner.invoke(app, ["export", str(session), "--format", "json"])
+    assert explicit.exit_code == 0
+    assert aliased.stdout == explicit.stdout
+
+
+def test_export_rejects_json_with_explicit_format(tmp_path: Path) -> None:
+    session = tmp_path / "session"
+    _write_exportable_session(session)
+    result = runner.invoke(app, ["export", str(session), "--json", "--format", "llama-server"])
+    assert result.exit_code == 2
+    assert "pass either --json or --format" in result.stderr
+
+
+def test_calibrate_json_emits_machine_readable_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "samples": 3,
+        "weights_scale": 1.1,
+        "kv_scale": 1.1,
+        "compute_scale": 1.1,
+    }
+    monkeypatch.setattr("llamatune.calibrate.calibrate", lambda path: payload)
+    result = runner.invoke(app, ["calibrate", "--sessions-dir", str(tmp_path), "--json"])
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["samples"] == 3

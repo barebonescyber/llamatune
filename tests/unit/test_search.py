@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import errno
+import itertools
 import json
 import signal
 import sys
@@ -14,11 +15,13 @@ import pytest
 
 from llamatune import bench, config, executor, search
 from llamatune.bench import BenchParseError
+from llamatune.config import gpu_layer_cap
 from llamatune.llama import discover_llama
 from llamatune.model import inspect_model
 from llamatune.session import Session, SessionPathError
 from llamatune.types import (
     BaselineResult,
+    FeasibilityBoundary,
     GPUInfo,
     GpuSample,
     HardwareReport,
@@ -573,7 +576,7 @@ class TestLossy:
     ) -> None:
         session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
         engine = search._Engine(session, hw, model, llama, options)
-        metric = MetricStats(mean=1.0, stdev=0.0, cv=0.0, n=3)
+        metric = MetricStats(mean=50.0, stdev=0.0, cv=0.0, n=3)
         engine.baseline = BaselineResult(
             runs=3,
             pp=metric,
@@ -694,7 +697,7 @@ class TestFeasibilitySearch:
         assert boundary.min_fail_ngl == 0
         assert boundary.probes == 2
         engine.boundaries = [boundary]
-        assert engine._context_candidates(_envelope_config(33)) == []
+        assert list(engine._context_candidates(_envelope_config(33))) == []
 
     def test_no_successful_capped_config_emits_no_fabricated_recommendation(
         self,
@@ -1973,6 +1976,195 @@ def test_envelope_budget_exhaustion_marks_remaining_rows_skipped(
     assert truncated[0]["reason"] == "budget"
 
 
+def _legacy_context_candidates(engine: search._Engine, base: TrialConfig) -> list[TrialConfig]:
+    """The pre-PERF-010 eager enumeration, kept as the behavioral oracle."""
+    cap = gpu_layer_cap(engine.model, engine.options)
+    candidates = [base] if base.gpu_layers <= cap else []
+    for boundary in sorted(
+        (b for b in engine.boundaries if search._boundary_has_fit(b)),
+        key=lambda b: b.max_ok_ngl,
+        reverse=True,
+    ):
+        candidates.extend(
+            dataclasses.replace(base, gpu_layers=ngl, moe_cpu_layers=boundary.moe_cpu_layers)
+            for ngl in range(boundary.max_ok_ngl, -1, -1)
+        )
+    result: list[TrialConfig] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate.trial_id not in seen:
+            result.append(candidate)
+            seen.add(candidate.trial_id)
+    return result
+
+
+@pytest.mark.parametrize(
+    "boundaries",
+    (
+        [],
+        [
+            FeasibilityBoundary(moe_cpu_layers=0, max_ok_ngl=30, min_fail_ngl=31, probes=2),
+        ],
+        [
+            FeasibilityBoundary(moe_cpu_layers=0, max_ok_ngl=30, min_fail_ngl=31, probes=2),
+            FeasibilityBoundary(moe_cpu_layers=4, max_ok_ngl=28, min_fail_ngl=29, probes=2),
+            FeasibilityBoundary(moe_cpu_layers=0, max_ok_ngl=12, min_fail_ngl=13, probes=2),
+        ],
+        [
+            # Overlapping placements plus a fitless boundary that must be
+            # filtered out before ordering.
+            FeasibilityBoundary(moe_cpu_layers=8, max_ok_ngl=24, min_fail_ngl=25, probes=2),
+            FeasibilityBoundary(moe_cpu_layers=8, max_ok_ngl=6, min_fail_ngl=7, probes=2),
+            FeasibilityBoundary(moe_cpu_layers=2, max_ok_ngl=0, min_fail_ngl=0, probes=2),
+        ],
+    ),
+)
+def test_context_candidates_lazy_order_matches_legacy_oracle(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    boundaries: list[FeasibilityBoundary],
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    engine = search._Engine(session, hw, model, llama, options)
+    engine.boundaries = boundaries
+    base = _envelope_config(20)
+
+    oracle = _legacy_context_candidates(engine, base)
+
+    assert list(engine._context_candidates(base)) == oracle
+    for take in (1, 3, len(oracle)):
+        assert list(itertools.islice(engine._context_candidates(base), take)) == oracle[:take]
+
+
+def test_context_candidates_exclude_base_above_cap(
+    tmp_path: Path, fake_bin_dir: Path, tiny_gguf: Path
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf, max_gpu_layers=8)
+    engine = search._Engine(session, hw, model, llama, options)
+    engine.boundaries = [
+        FeasibilityBoundary(moe_cpu_layers=0, max_ok_ngl=5, min_fail_ngl=6, probes=2),
+    ]
+    base = _envelope_config(40)
+
+    oracle = _legacy_context_candidates(engine, base)
+
+    assert base.gpu_layers > gpu_layer_cap(engine.model, engine.options)
+    assert list(engine._context_candidates(base)) == oracle
+    assert all(candidate.gpu_layers <= 5 for candidate in engine._context_candidates(base))
+
+
+def test_pruned_by_matches_legacy_linear_scan_oracle(
+    tmp_path: Path, fake_bin_dir: Path, tiny_gguf: Path
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    engine = search._Engine(session, hw, model, llama, options)
+
+    def oom(ngl: int, moe: int, **overrides: Any) -> TrialConfig:
+        return dataclasses.replace(_envelope_config(ngl), moe_cpu_layers=moe, **overrides)
+
+    # Insertion order matters: A and B share a bucket (duplicate partial
+    # matches); C and E share another bucket with different bounds.
+    raw_points: list[tuple[dict[str, Any], str]] = []
+    points = [
+        (oom(20, 0), "A"),
+        (oom(24, 0), "B"),
+        (oom(30, 2, ubatch=256), "C"),
+        (oom(10, 4, mmap=False), "D"),
+        (oom(28, 6, ubatch=256), "E"),
+    ]
+    for oom_cfg, point_id in points:
+        engine._record_oom_point(oom_cfg.to_dict(), point_id)
+        raw_points.append((oom_cfg.to_dict(), point_id))
+
+    def legacy_pruned_by(cfg: TrialConfig) -> str | None:
+        cfg_dict = cfg.to_dict()
+        for oom_cfg, trial_id in raw_points:
+            if (
+                cfg.gpu_layers >= int(oom_cfg["gpu_layers"])
+                and cfg.moe_cpu_layers <= int(oom_cfg["moe_cpu_layers"])
+                and search._other_fields(cfg_dict) == search._other_fields(oom_cfg)
+            ):
+                return trial_id
+        return None
+
+    candidates = [
+        oom(25, 0),  # matches A and B; first inserted wins
+        oom(23, 0),
+        oom(19, 0),  # below every bound in its bucket
+        oom(29, 2, ubatch=256),  # misses C on gpu_layers, hits E
+        oom(31, 2, ubatch=256),  # hits C first
+        oom(27, 7, ubatch=256),  # moe above both bounds
+        oom(12, 3, mmap=False),
+        oom(12, 3),  # bucket with no points at all
+        oom(35, 9, mmap=False, threads_batch=4),  # distinct other-fields key
+    ]
+    for candidate in candidates:
+        assert engine._pruned_by(candidate) == legacy_pruned_by(candidate)
+
+
+def test_pair_check_counter_seeds_from_journal_and_replaces_entries_scan(
+    tmp_path: Path, fake_bin_dir: Path, tiny_gguf: Path
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    session.append({"type": "pair_check", "dim": "mmap"})
+    session.append({"type": "trial", "trial_id": "x", "status": "ok"})
+    session.append({"type": "pair_check", "dim": "mmap"})
+
+    engine = search._Engine(session, hw, model, llama, options)
+
+    journaled = sum(1 for e in session.entries if e.get("type") == "pair_check")
+    assert journaled == 2
+    assert engine.pair_checks == journaled
+
+
+def test_envelope_enumerates_candidates_once_per_distinct_base(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, model, llama, options = _setup(
+        tmp_path,
+        fake_bin_dir,
+        tiny_gguf,
+        ctx_size=8192,
+        ctx_ladder=(16384, 32768, 65536),
+    )
+    engine = search._Engine(session, hw, model, llama, options)
+    primary, mid, low = (_envelope_config(value) for value in (20, 12, 5))
+    engine.context_validation = {"ctx": 8192, "status": "ok", "evidence": "probes/required"}
+    monkeypatch.setattr(engine, "_context_candidates", lambda _base: [primary, mid, low])
+    enumerated: list[TrialConfig] = []
+    real_candidates = engine._context_envelope_candidates
+
+    def counting(base: TrialConfig) -> list[TrialConfig]:
+        enumerated.append(base)
+        return real_candidates(base)
+
+    monkeypatch.setattr(engine, "_context_envelope_candidates", counting)
+
+    def probe(_config: TrialConfig, _purpose: str, ctx: int | None) -> str:
+        assert ctx is not None
+        engine.executed_count += 1
+        return "oom"
+
+    monkeypatch.setattr(engine, "_probe", probe)
+    engine._run_context_envelope(primary, None)
+
+    # The fallback never improves, so the base stays `primary` across rungs;
+    # the historical code re-enumerated per failing rung.
+    assert enumerated == [primary]
+    assert engine.context_envelope is not None
+    statuses = [row["status"] for row in engine.context_envelope]
+    assert statuses == ["ok", "failed", "pruned", "pruned"]
+    assert [row["fallback_config"] for row in engine.context_envelope[1:]] == [None, None, None]
+    assert engine.context_envelope[1]["evidence"] == (
+        f"probes/{search._probe_id('context', primary, 16384)}"
+    )
+    assert engine.context_envelope[2]["evidence"] is None
+
+
 def test_depth_profile_reuses_cached_rows_and_ignores_failures(
     tmp_path: Path,
     fake_bin_dir: Path,
@@ -2364,6 +2556,324 @@ def test_confirmation_thermal_retry_progress_has_no_duplicate_original_id(
         f"{config.trial_id}-confirm-2",
         f"{config.trial_id}-confirm-3",
     ]
+
+
+def _confirmation_engine(
+    session: Session,
+    hw: HardwareReport,
+    model: ModelReport,
+    llama: LlamaCppReport,
+    options: TuneOptions,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run_child: Any,
+    measured: search._Measured | None = None,
+) -> search._Engine:
+    engine = search._Engine(session, hw, model, llama, options)
+    pp_metric = MetricStats(mean=50.0, stdev=0.0, cv=0.0, n=3)
+    tg_metric = MetricStats(mean=5.0, stdev=0.0, cv=0.0, n=3)
+    engine.baseline = BaselineResult(
+        runs=3,
+        pp=pp_metric,
+        tg=tg_metric,
+        noise_floor_cv=0.01,
+        fallback=None,
+        resolved_defaults=_envelope_config(1).to_dict(),
+    )
+    monkeypatch.setattr(engine, "_run_child", run_child)
+    monkeypatch.setattr(
+        engine, "_classify", lambda result, reps: measured or _measured(110.0, 11.0)
+    )
+    monkeypatch.setattr(engine, "_write_command", lambda *args: None)
+    monkeypatch.setattr(engine, "_record_load", lambda threads: None)
+    monkeypatch.setattr(engine, "_cooldown", lambda: None)
+    return engine
+
+
+def _recording_run_child(tmp_path: Path, calls: list[str], fail_on: int | None = None) -> Any:
+    attempt = {"count": 0}
+
+    def run_child(**kwargs: Any) -> tuple[executor.ExecResult, search._RunObservation]:
+        attempt["count"] += 1
+        if fail_on is not None and attempt["count"] >= fail_on:
+            raise KeyboardInterrupt
+        calls.append(str(kwargs["run_id"]))
+        return (
+            _exec_result(tmp_path, f"recorded-{len(calls)}"),
+            search._RunObservation(None, None, ()),
+        )
+
+    return run_child
+
+
+def test_confirmation_resume_reuses_journaled_runs_and_preserves_statistics(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_a, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    session_b, _, _, _, _ = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    config = _envelope_config(20)
+    fresh_calls: list[str] = []
+    fresh_engine = _confirmation_engine(
+        session_a,
+        hw,
+        model,
+        llama,
+        options,
+        monkeypatch,
+        run_child=_recording_run_child(tmp_path, fresh_calls),
+    )
+    fresh = fresh_engine._confirm(config)
+
+    interrupted_calls: list[str] = []
+    interrupted = _confirmation_engine(
+        session_b,
+        hw,
+        model,
+        llama,
+        options,
+        monkeypatch,
+        run_child=_recording_run_child(tmp_path, interrupted_calls, fail_on=3),
+    )
+    with pytest.raises(KeyboardInterrupt):
+        interrupted._confirm(config)
+    assert [run_id[-1] for run_id in interrupted_calls] == ["1", "2"]
+
+    resumed_calls: list[str] = []
+    resumed = _confirmation_engine(
+        session_b,
+        hw,
+        model,
+        llama,
+        options,
+        monkeypatch,
+        run_child=_recording_run_child(tmp_path, resumed_calls),
+    )
+    assert resumed.executed_count == 2
+    replayed = resumed._confirm(config)
+
+    assert resumed_calls == [f"{config.trial_id}-confirm-3"]
+    assert fresh.confirmed is True
+    assert replayed.confirmed is True
+    assert replayed.pp.mean == fresh.pp.mean
+    assert replayed.tg.mean == fresh.tg.mean
+    assert replayed.score == pytest.approx(fresh.score)
+    assert resumed.executed_count == 3
+    records = [entry for entry in session_b.entries if entry.get("type") == "confirmation_run"]
+    assert sorted(int(record["run"]) for record in records) == [1, 2, 3]
+
+
+def test_confirmation_ignores_records_for_other_trial_ids(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    config = _envelope_config(20)
+    for index in range(1, options.baseline_runs + 1):
+        session.append(
+            {
+                "type": "confirmation_run",
+                "trial_id": "0123456789abcdef",
+                "run": index,
+                "status": "ok",
+                "pp_mean": 555.0,
+                "tg_mean": 55.0,
+            }
+        )
+    calls: list[str] = []
+    engine = _confirmation_engine(
+        session,
+        hw,
+        model,
+        llama,
+        options,
+        monkeypatch,
+        run_child=_recording_run_child(tmp_path, calls),
+    )
+
+    confirmation = engine._confirm(config)
+
+    assert len(calls) == options.baseline_runs
+    assert confirmation.confirmed is True
+    assert confirmation.pp.mean == pytest.approx(110.0)
+    assert confirmation.tg.mean == pytest.approx(11.0)
+    assert engine.executed_count == options.baseline_runs + options.baseline_runs
+
+
+def test_confirmation_partial_journal_record_falls_back_to_execution(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    config = _envelope_config(20)
+    session.append(
+        {
+            "type": "confirmation_run",
+            "trial_id": config.trial_id,
+            "run": 1,
+            "status": "ok",
+            "pp_mean": 120.0,
+            "tg_mean": None,
+        }
+    )
+    session.append(
+        {
+            "type": "confirmation_run",
+            "trial_id": config.trial_id,
+            "run": 2,
+            "status": "ok",
+            "pp_mean": 111.0,
+            "tg_mean": 11.1,
+        }
+    )
+    calls: list[str] = []
+    engine = _confirmation_engine(
+        session,
+        hw,
+        model,
+        llama,
+        options,
+        monkeypatch,
+        run_child=_recording_run_child(tmp_path, calls),
+    )
+
+    confirmation = engine._confirm(config)
+
+    assert calls == [
+        f"{config.trial_id}-confirm-1",
+        f"{config.trial_id}-confirm-3",
+    ]
+    assert confirmation.pp.mean == pytest.approx((110.0 + 111.0 + 110.0) / 3)
+    assert confirmation.tg.mean == pytest.approx((11.0 + 11.1 + 11.0) / 3)
+
+
+@pytest.mark.parametrize(("exit_code", "expected_status"), [(0, "ok"), (1, "failed")])
+def test_cli_validation_resume_reuses_journaled_stage_record(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exit_code: int,
+    expected_status: str,
+) -> None:
+    session, hw, model, llama, options = _setup(
+        tmp_path, fake_bin_dir, tiny_gguf, validate_with_cli=True, ctx_size=8192
+    )
+    llama = dataclasses.replace(llama, cli_path=fake_bin_dir / "llama-cli")
+    config = _envelope_config(20)
+
+    def run_child(**kwargs: Any) -> tuple[executor.ExecResult, search._RunObservation]:
+        result = dataclasses.replace(
+            _exec_result(tmp_path, str(kwargs["run_id"])), exit_code=exit_code
+        )
+        return (result, search._RunObservation(None, None, ()))
+
+    engine = search._Engine(session, hw, model, llama, options)
+    monkeypatch.setattr(engine, "_run_child", run_child)
+    monkeypatch.setattr(engine, "_write_command", lambda *args: None)
+    monkeypatch.setattr(engine, "_record_load", lambda threads: None)
+    engine._validate_with_cli(config)
+    first = engine.cli_validation
+    assert first is not None
+    assert first["status"] == expected_status
+    record = next(entry for entry in session.entries if entry.get("stage") == "cli_validation")
+    assert record["trial_id"] == config.trial_id
+
+    entries_before = tuple(session.entries)
+    resumed = search._Engine(session, hw, model, llama, options)
+
+    def forbidden(**_kwargs: Any) -> Any:
+        pytest.fail("cli validation must not re-execute on resume")
+
+    monkeypatch.setattr(resumed, "_run_child", forbidden)
+    resumed._validate_with_cli(config)
+    assert resumed.cli_validation == first
+    assert tuple(session.entries) == entries_before
+    if expected_status != "ok":
+        assert any("failed llama-cli" in warning for warning in resumed.extra_warnings)
+
+
+def test_quality_gate_resume_reuses_journaled_ppl_values(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus = tmp_path / "quality.txt"
+    corpus.write_text("quality corpus")
+    session, hw, model, llama, options = _setup(
+        tmp_path, fake_bin_dir, tiny_gguf, quality_corpus=corpus, observe_vram=False
+    )
+    llama = dataclasses.replace(llama, perplexity_path=fake_bin_dir / "llama-perplexity")
+    config = TrialConfig(
+        gpu_layers=0,
+        moe_cpu_layers=0,
+        flash_attn=True,
+        ubatch=512,
+        batch=2048,
+        threads=8,
+        mmap=True,
+        no_kv_offload=False,
+        cache_type_k="q8_0",
+        cache_type_v="f16",
+    )
+    outputs = iter(("10.0", "9.0"))
+    calls: list[str] = []
+
+    def run_child(**kwargs: Any) -> tuple[executor.ExecResult, search._RunObservation]:
+        run_id = str(kwargs["run_id"])
+        calls.append(run_id)
+        stdout = tmp_path / f"{run_id}.json"
+        stderr = tmp_path / f"{run_id}.log"
+        stdout.write_text(f"Final estimate: PPL = {next(outputs)}\n")
+        stderr.write_text("")
+        result = executor.ExecResult(
+            exit_code=0,
+            wall_s=1.0,
+            timed_out=False,
+            stdout=executor.CaptureInfo(stdout, "hash", stdout.stat().st_size, False),
+            stderr=executor.CaptureInfo(stderr, "hash", 0, False),
+            started="start",
+            ended="end",
+            env_names=(),
+        )
+        return (result, search._RunObservation(None, None, ()))
+
+    engine = search._Engine(session, hw, model, llama, options)
+    monkeypatch.setattr(engine, "_run_child", run_child)
+    monkeypatch.setattr(engine, "_write_command", lambda *args: None)
+    monkeypatch.setattr(engine, "_record_load", lambda threads: None)
+    engine._run_quality_gate(config)
+    assert len(calls) == 2
+    gate = engine.quality_gate
+    assert gate is not None
+    assert gate["status"] == "ok"
+    assert gate["ppl_lossy"] == 10.0
+    assert gate["ppl_f16"] == 9.0
+    assert gate["delta_pct"] == pytest.approx(100 / 9)
+    journaled = [entry for entry in session.entries if entry.get("type") == "quality_gate_run"]
+    assert [entry["ppl"] for entry in journaled] == [10.0, 9.0]
+
+    resumed = search._Engine(session, hw, model, llama, options)
+
+    def forbidden(**_kwargs: Any) -> Any:
+        pytest.fail("quality gate must not re-execute on resume")
+
+    monkeypatch.setattr(resumed, "_run_child", forbidden)
+    resumed._run_quality_gate(config)
+    replayed = resumed.quality_gate
+    assert replayed is not None
+    assert replayed["status"] == "ok"
+    assert replayed["ppl_lossy"] == 10.0
+    assert replayed["ppl_f16"] == 9.0
+    assert replayed["delta_pct"] == pytest.approx(100 / 9)
+    assert len([e for e in session.entries if e.get("type") == "quality_gate_run"]) == 2
 
 
 def test_thermal_retest_requires_opted_in_successful_run_samples(
@@ -2841,3 +3351,160 @@ def test_thermal_cooldown_honors_clock_throttle_while_gpu_is_cool(
     assert len(pauses) == 6
     assert all(entry["reason"] == "throttle" for entry in pauses)
     assert pauses[-1]["cap_reached"] is True
+
+
+def test_hill_climb_moe_patience_counts_only_executed_misses_on_resume(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    model = dataclasses.replace(model, moe=True, n_layer=40, ngl_all=41, expert_count=8)
+    incumbent = dataclasses.replace(_envelope_config(20), moe_cpu_layers=10)
+    better_cached = dataclasses.replace(incumbent, moe_cpu_layers=11)
+    worse_cached = dataclasses.replace(incumbent, moe_cpu_layers=13)
+
+    def journal_trial(trial_cfg: TrialConfig, pp: float, tg: float, score: float) -> None:
+        session.append(
+            {
+                "type": "trial",
+                "trial_id": trial_cfg.trial_id,
+                "config": trial_cfg.to_dict(),
+                "status": "ok",
+                "pp_mean": pp,
+                "tg_mean": tg,
+                "score": score,
+                "dim": "joint_refine",
+            }
+        )
+
+    journal_trial(better_cached, 200.0, 40.0, 2.0)
+    journal_trial(worse_cached, 50.0, 10.0, 0.5)
+
+    engine = search._Engine(session, hw, model, llama, options)
+    resume_executed = engine.executed_count
+    baseline_metric = MetricStats(mean=100.0, stdev=0.0, cv=0.0, n=3)
+    tg_metric = MetricStats(mean=20.0, stdev=0.0, cv=0.0, n=3)
+    engine.baseline = BaselineResult(
+        runs=3,
+        pp=baseline_metric,
+        tg=tg_metric,
+        noise_floor_cv=0.01,
+        fallback=None,
+        resolved_defaults=incumbent.to_dict(),
+    )
+    engine._set_incumbent(incumbent, 100.0, 20.0, 1.0)
+
+    executed: list[TrialConfig] = []
+
+    def execute(trial_cfg: TrialConfig, dim: str) -> search._Trial:
+        assert dim == "joint_refine"
+        executed.append(trial_cfg)
+        engine.executed_count += 1
+        if trial_cfg == dataclasses.replace(incumbent, moe_cpu_layers=12):
+            return search._Trial("ok", 400.0, 80.0, 4.0)
+        return search._Trial("ok", 100.0, 20.0, 0.1)
+
+    monkeypatch.setattr(engine, "_execute_trial", execute)
+
+    engine._hill_climb_moe(direction=1)
+
+    assert executed == [
+        dataclasses.replace(incumbent, moe_cpu_layers=12),
+        dataclasses.replace(incumbent, moe_cpu_layers=14),
+    ]
+    assert worse_cached not in executed
+    assert engine.executed_count == resume_executed + 2
+    assert engine.incumbent_config == dataclasses.replace(incumbent, moe_cpu_layers=12)
+    assert engine.incumbent_score == pytest.approx(4.0)
+
+
+class TestEngineEmitContract:
+    """Focused tests for the reporter-failure policy on ``_Engine._emit``."""
+
+    @staticmethod
+    def _engine(tmp_path: Path, reporter: Any) -> search._Engine:
+        hardware = HardwareReport(
+            os_name="Linux",
+            arch="x86_64",
+            cpu_model="c",
+            physical_cores=2,
+            logical_cores=2,
+            perf_cores=None,
+            ram_mb=1024,
+            gpus=(),
+            warnings=(),
+        )
+        model = ModelReport(
+            path=tmp_path / "m.gguf",
+            size_bytes=8,
+            architecture="llama",
+            n_layer=1,
+            ngl_all=0,
+            expert_count=0,
+            moe=False,
+            name="m",
+            fingerprint="ab" * 32,
+            full_sha256=None,
+        )
+        llama = LlamaCppReport(
+            bench_path=tmp_path / "llama-bench",
+            cli_path=None,
+            server_path=None,
+            capabilities=frozenset(),
+            help_sha256="h" * 64,
+            build_commit=None,
+            build_number=None,
+        )
+        options = TuneOptions(
+            target="balanced",
+            budget_trials=2,
+            budget_minutes=None,
+            reps_search=1,
+            reps_confirm=1,
+            baseline_runs=3,
+            pp=512,
+            tg=128,
+            allow_lossy=False,
+            cooldown_s=0.0,
+            baseline_only=True,
+            llama_bin=tmp_path / "llama-bench",
+            sessions_dir=tmp_path / "sessions",
+            full_hash=False,
+        )
+        session = Session.create(
+            tmp_path / "sessions",
+            model=model,
+            hardware=hardware,
+            llama=llama,
+            options=options,
+            argv=["llamatune", "tune"],
+        )
+        return search._Engine(session, hardware, model, llama, options, reporter=reporter)
+
+    def test_expected_reporter_failures_degrade_then_disable(self, tmp_path: Path) -> None:
+        class FailingReporter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def emit(self, event: Any) -> None:
+                self.calls += 1
+                raise ValueError(f"boom {self.calls}")
+
+        engine = self._engine(tmp_path, FailingReporter())
+        engine._emit("stage", stage="one")
+        engine._emit("stage", stage="two")
+        assert engine.reporter is not None
+        assert any("progress reporter failed" in warning for warning in engine.extra_warnings)
+        engine._emit("stage", stage="three")
+        assert engine.reporter is None
+
+    def test_unexpected_reporter_exception_propagates(self, tmp_path: Path) -> None:
+        class BrokenReporter:
+            def emit(self, event: Any) -> None:
+                raise KeyError("payload")
+
+        engine = self._engine(tmp_path, BrokenReporter())
+        with pytest.raises(KeyError):
+            engine._emit("stage", stage="one")

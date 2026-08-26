@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import runpy
 from collections.abc import Callable
 from dataclasses import replace
@@ -236,7 +237,7 @@ def test_refresh_roots_recovers_when_existing_artifact_is_unreadable(
     def unreadable(path: Path) -> Never:
         raise PermissionError(f"unreadable: {path}")
 
-    monkeypatch.setattr(resultsmatrix, "load_artifact", unreadable)
+    monkeypatch.setattr(resultsmatrix, "_artifact_roots", unreadable)
 
     assert resultsmatrix._refresh_roots(owner) == (owner.resolve(),)
     assert "unreadable" in capsys.readouterr().err
@@ -269,3 +270,119 @@ def test_current_tie_break_uses_evidence_directory_name(tmp_path: Path) -> None:
     marked = resultsmatrix._mark_current((original, duplicate))
 
     assert [row.current for row in marked] == [False, True]
+
+
+def _counted_readers(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    calls = {"session": 0, "marathon": 0, "nightshift": 0, "quality": 0}
+
+    def install(name: str) -> None:
+        original = getattr(resultsmatrix, f"_{name}_rows")
+
+        def counting(root: Path, path: Path) -> list[ResultRow]:
+            calls[name] += 1
+            rows = original(root, path)
+            return list(rows)
+
+        monkeypatch.setattr(resultsmatrix, f"_{name}_rows", counting)
+
+    for name in calls:
+        install(name)
+    return calls
+
+
+def test_refresh_with_no_changes_reparses_nothing_and_matches_fresh_harvest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "sessions"
+    write_matrix_evidence(root)
+    output = root / "matrix"
+    resultsmatrix.build((root,), output)
+    calls = _counted_readers(monkeypatch)
+
+    resultsmatrix.refresh(root)
+
+    assert calls == {"session": 0, "marathon": 0, "nightshift": 0, "quality": 0}
+    refreshed = resultsmatrix.load_artifact(output / "results-matrix.json")
+    assert refreshed == resultsmatrix.harvest((root,))
+
+
+def test_refresh_reparses_only_the_source_whose_journal_was_touched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "sessions"
+    paths = write_matrix_evidence(root)
+    duplicate = root / "session-b"
+    duplicate.mkdir()
+    for name in (
+        "session.json",
+        "model.json",
+        "hardware.json",
+        "llamacpp.json",
+        "analysis.json",
+        "journal.jsonl",
+    ):
+        (duplicate / name).write_bytes((paths["session"] / name).read_bytes())
+    output = root / "matrix"
+    resultsmatrix.build((root,), output)
+    calls = _counted_readers(monkeypatch)
+    stamp = 1_700_000_000_000_000_000
+    journal = paths["session"] / "journal.jsonl"
+    os.utime(journal, ns=(stamp, stamp))
+
+    resultsmatrix.refresh(root)
+
+    assert calls == {"session": 1, "marathon": 0, "nightshift": 0, "quality": 0}
+    refreshed = resultsmatrix.load_artifact(output / "results-matrix.json")
+    assert refreshed == resultsmatrix.harvest((root,))
+
+
+def test_missing_or_malformed_cache_falls_back_to_full_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "sessions"
+    write_matrix_evidence(root)
+    output = root / "matrix"
+    resultsmatrix.build((root,), output)
+    artifact = output / "results-matrix.json"
+    document = json.loads(artifact.read_text())
+
+    del document["source_cache"]
+    artifact.write_text(json.dumps(document))
+    calls = _counted_readers(monkeypatch)
+    resultsmatrix.refresh(root)
+    assert sum(calls.values()) == 4
+    assert resultsmatrix.load_artifact(artifact) == resultsmatrix.harvest((root,))
+
+    document = json.loads(artifact.read_text())
+    document["source_cache"] = {"version": 999, "sources": {}}
+    artifact.write_text(json.dumps(document))
+    calls = _counted_readers(monkeypatch)
+    resultsmatrix.refresh(root)
+    assert sum(calls.values()) == 4
+    assert resultsmatrix.load_artifact(artifact) == resultsmatrix.harvest((root,))
+
+
+def test_changed_rows_flow_through_cache_after_reparse(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "sessions"
+    write_matrix_evidence(root)
+    output = root / "matrix"
+    resultsmatrix.build((root,), output)
+
+    analysis_path = root / "session-a" / "analysis.json"
+    payload = json.loads(analysis_path.read_text())
+    payload["winner"]["confirmation"]["pp"] = {"mean": 999.0, "runs": 5}
+    before = analysis_path.stat().st_mtime_ns
+    analysis_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    if analysis_path.stat().st_mtime_ns == before:
+        os.utime(analysis_path, ns=(before + 1, before + 1))
+
+    resultsmatrix.refresh(root)
+
+    recommendation = next(
+        row
+        for row in resultsmatrix.load_artifact(output / "results-matrix.json").rows
+        if row.kind == "recommendation"
+    )
+    assert recommendation.metrics["perf.pp"] == 999.0

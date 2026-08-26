@@ -14,12 +14,13 @@ import contextlib
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import signal
 import statistics
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -54,6 +55,7 @@ from llamatune.types import (
     GpuSample,
     HardwareReport,
     LlamaCppReport,
+    MetricStats,
     ModelReport,
     ProgressEvent,
     Reporter,
@@ -274,7 +276,7 @@ def _load_calibration(sessions_dir: Path) -> VramCalibration | None:
     try:
         data = json.loads((sessions_dir / "calibration.json").read_text(encoding="utf-8"))
         return VramCalibration(**data)
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    except (OSError, TypeError, ValueError):
         return None
 
 
@@ -394,14 +396,20 @@ class _Engine:
 
         self.known: dict[str, dict[str, Any]] = {}
         self.probes: dict[str, dict[str, Any]] = {}
-        self.oom_points: list[tuple[dict[str, Any], str]] = []
+        # OOM points indexed by their reduced comparison key (PERF-009): the
+        # other-fields JSON is computed once at insertion instead of per
+        # (candidate, point) pair. Buckets preserve insertion order.
+        self.oom_index: dict[str, list[tuple[int, int, str]]] = {}
+        self.pair_checks = 0
         for entry in session.entries:
             if entry.get("type") == "trial" and "trial_id" in entry:
                 self.known[entry["trial_id"]] = entry
                 if entry.get("status") in ("oom", "gpu_resource"):
-                    self.oom_points.append((dict(entry["config"]), entry["trial_id"]))
+                    self._record_oom_point(dict(entry["config"]), entry["trial_id"])
             elif entry.get("type") == "probe" and "probe_id" in entry:
                 self.probes[entry["probe_id"]] = entry
+            elif entry.get("type") == "pair_check":
+                self.pair_checks += 1
 
         self.executed_count = _count_executed(session.entries)
         self.start = _monotonic()
@@ -441,11 +449,34 @@ class _Engine:
         self.validated_configs: set[str] = set()
         self.default_probe: dict[str, Any] | None = self._find_stage("default_probe")
 
-        # Populated by _establish_baseline / _seed_incumbent.
-        self.baseline: BaselineResult
-        self.default_config: TrialConfig
-        self.measured_default: TrialConfig
-        self.incumbent_config: TrialConfig
+        # Populated by _establish_baseline / _load_baseline_stage /
+        # _seed_incumbent. Seeded with inert placeholders so attribute
+        # existence never depends on call order; ``baseline.kind`` stays
+        # "unestablished" until real evidence lands (GitHub #20).
+        placeholder = TrialConfig(
+            gpu_layers=0,
+            moe_cpu_layers=0,
+            flash_attn=False,
+            ubatch=512,
+            batch=2048,
+            threads=1,
+            mmap=True,
+            no_kv_offload=False,
+            cache_type_k="f16",
+            cache_type_v="f16",
+        )
+        self.baseline = BaselineResult(
+            runs=0,
+            pp=MetricStats(mean=0.0, stdev=0.0, cv=0.0, n=0),
+            tg=MetricStats(mean=0.0, stdev=0.0, cv=0.0, n=0),
+            noise_floor_cv=0.0,
+            fallback=None,
+            resolved_defaults={},
+            kind="unestablished",
+        )
+        self.default_config = placeholder
+        self.measured_default = placeholder
+        self.incumbent_config = placeholder
         self.incumbent_pp = 0.0
         self.incumbent_tg = 0.0
         self.incumbent_score = 1.0
@@ -576,7 +607,11 @@ class _Engine:
             self.reporter.emit(
                 ProgressEvent(kind=event_kind, ts=datetime.now(UTC).isoformat(), payload=payload)
             )
-        except Exception:
+        except (OSError, TypeError, ValueError):
+            # Progress output is best-effort: degrade on stream failures
+            # (OSError) and renderer formatting/serialization bugs (TypeError/
+            # ValueError). Any other exception is a programming error and
+            # propagates instead of being swallowed (issue #11).
             self._reporter_failures += 1
             if not self._reporter_warning_added:
                 self.extra_warnings.append("progress reporter failed; tuning continued")
@@ -1241,8 +1276,7 @@ class _Engine:
         failed, used = None, 0
         limit = 2 * max(1, max(1, self.model.ngl_all).bit_length()) + 4
         baseline_verified = (
-            hasattr(self, "baseline")
-            and self.baseline.kind == "defaults"
+            self.baseline.kind == "defaults"
             and base.trial_id == self.default_config.trial_id
             and base.gpu_layers <= cap
         )
@@ -1363,7 +1397,6 @@ class _Engine:
             if value == current.moe_cpu_layers:
                 break
             cfg = dataclasses.replace(current, moe_cpu_layers=value)
-            before = self.executed_count
             trial = self._evaluate(cfg, "joint_refine")
             improved = bool(
                 trial.status in ("ok", "unstable")
@@ -1388,8 +1421,6 @@ class _Engine:
             else:
                 misses += 1
                 step_index = 0
-            if self.executed_count == before:
-                misses += 1
 
     def _probe(
         self,
@@ -1486,7 +1517,7 @@ class _Engine:
         self._emit_exec_end(label, probe_id, result, measured)
         self.probes[probe_id] = record
         if measured.status in ("oom", "gpu_resource"):
-            self.oom_points.append((cfg.to_dict(), probe_id))
+            self._record_oom_point(cfg.to_dict(), probe_id)
         self._cooldown()
         return measured.status
 
@@ -1874,7 +1905,9 @@ class _Engine:
     ) -> bool:
         if not self._can_execute():
             return False
-        pair_no = sum(1 for e in self.session.entries if e.get("type") == "pair_check") + 1
+        # Running counter seeded from the journal at engine construction
+        # (PERF-011): avoids copying the whole entries tuple per pair check.
+        pair_no = self.pair_checks + 1
         argv = bench.build_bench_argv(
             bench_path=self.llama.bench_path,
             model_path=self.model.path,
@@ -1929,9 +1962,22 @@ class _Engine:
                 "evidence": rel,
             }
         )
+        self.pair_checks += 1
         self._emit_exec_end(label, run_id, result, measured, pair_score)
         self._cooldown()
         return accepted
+
+    def _record_oom_point(self, config: dict[str, Any], point_id: str) -> None:
+        """Index one OOM point for :meth:`_pruned_by` (PERF-009).
+
+        The reduced comparison fields are computed once here; buckets keep
+        insertion order so the first matching ancestor is identical to the
+        historical linear scan over ``gpu_layers``/``moe_cpu_layers``.
+        """
+        key = json.dumps(_other_fields(config), sort_keys=True, separators=(",", ":"))
+        self.oom_index.setdefault(key, []).append(
+            (int(config["gpu_layers"]), int(config["moe_cpu_layers"]), point_id)
+        )
 
     def _pruned_by(self, cfg: TrialConfig) -> str | None:
         """Monotone OOM pruning ancestor for `cfg`, or None (DESIGN §10 step 4).
@@ -1940,14 +1986,15 @@ class _Engine:
         gpu_layers >= g and moe_cpu_layers <= c only when every other
         (memory-relevant) field is equal -- the most conservative reading.
         """
-        cfg_dict = cfg.to_dict()
-        for oom_cfg, trial_id in self.oom_points:
-            if (
-                cfg.gpu_layers >= int(oom_cfg["gpu_layers"])
-                and cfg.moe_cpu_layers <= int(oom_cfg["moe_cpu_layers"])
-                and _other_fields(cfg_dict) == _other_fields(oom_cfg)
-            ):
-                return trial_id
+        key = json.dumps(_other_fields(cfg.to_dict()), sort_keys=True, separators=(",", ":"))
+        bucket = self.oom_index.get(key)
+        if not bucket:
+            return None
+        gpu_layers = cfg.gpu_layers
+        moe_cpu_layers = cfg.moe_cpu_layers
+        for oom_gpu_layers, oom_moe_cpu_layers, point_id in bucket:
+            if gpu_layers >= oom_gpu_layers and moe_cpu_layers <= oom_moe_cpu_layers:
+                return point_id
         return None
 
     def _hard_cap_ancestor(self, cfg: TrialConfig) -> str | None:
@@ -2078,7 +2125,7 @@ class _Engine:
             else None
         )
         if measured.status in ("oom", "gpu_resource"):
-            self.oom_points.append((cfg.to_dict(), cfg.trial_id))
+            self._record_oom_point(cfg.to_dict(), cfg.trial_id)
 
         record = {
             "type": "trial",
@@ -2260,25 +2307,31 @@ class _Engine:
             "evidence": None,
         }
 
-    def _context_candidates(self, base: TrialConfig) -> list[TrialConfig]:
+    def _context_candidates(self, base: TrialConfig) -> Iterator[TrialConfig]:
+        """Yield context-probe candidates lazily in the historical order.
+
+        Order and trial_id-based dedup are identical to the former eager
+        list build (PERF-010); consumers that stop early no longer pay for
+        the tail.
+        """
         cap = gpu_layer_cap(self.model, self.options)
-        candidates = [base] if base.gpu_layers <= cap else []
-        for boundary in sorted(
+        seen: set[str] = set()
+        if base.gpu_layers <= cap:
+            seen.add(base.trial_id)
+            yield base
+        boundaries = sorted(
             (boundary for boundary in self.boundaries if _boundary_has_fit(boundary)),
             key=lambda b: b.max_ok_ngl,
             reverse=True,
-        ):
-            candidates.extend(
-                dataclasses.replace(base, gpu_layers=ngl, moe_cpu_layers=boundary.moe_cpu_layers)
-                for ngl in range(boundary.max_ok_ngl, -1, -1)
-            )
-        result: list[TrialConfig] = []
-        seen: set[str] = set()
-        for candidate in candidates:
-            if candidate.trial_id not in seen:
-                result.append(candidate)
-                seen.add(candidate.trial_id)
-        return result
+        )
+        for boundary in boundaries:
+            for ngl in range(boundary.max_ok_ngl, -1, -1):
+                candidate = dataclasses.replace(
+                    base, gpu_layers=ngl, moe_cpu_layers=boundary.moe_cpu_layers
+                )
+                if candidate.trial_id not in seen:
+                    seen.add(candidate.trial_id)
+                    yield candidate
 
     def _context_envelope_candidates(self, base: TrialConfig) -> list[TrialConfig]:
         """Return placement fallbacks with opt-in, least-lossy KV tiers interleaved."""
@@ -2410,6 +2463,11 @@ class _Engine:
         rows = [required]
         original_failed_at: int | None = None
         fallback: TrialConfig | None = None
+        # Envelope enumeration depends only on its base config (boundaries,
+        # caps, and options are fixed across rungs), so it is computed once
+        # per distinct base and reused while `fallback` stays the same.
+        envelope_candidates: list[TrialConfig] = []
+        envelope_base_id: str | None = None
         total_start = self.executed_count
         truncated = False
         budget_exhausted = False
@@ -2466,8 +2524,11 @@ class _Engine:
 
             passing = config if primary_status == "ok" else None
             if passing is None:
-                candidates = self._context_envelope_candidates(fallback or config)
-                for candidate in candidates:
+                envelope_base = fallback or config
+                if envelope_base.trial_id != envelope_base_id:
+                    envelope_candidates = self._context_envelope_candidates(envelope_base)
+                    envelope_base_id = envelope_base.trial_id
+                for candidate in envelope_candidates:
                     if candidate.trial_id == config.trial_id:
                         continue
                     if (
@@ -2763,6 +2824,24 @@ class _Engine:
             and self.options.ctx_size is not None
         ):
             return
+        journaled = self._find_stage("cli_validation")
+        if (
+            journaled is not None
+            and journaled.get("trial_id") == config.trial_id
+            and journaled.get("status") in ("ok", "failed")
+            and isinstance(journaled.get("evidence"), str)
+        ):
+            status = str(journaled["status"])
+            evidence = str(journaled["evidence"])
+            self.cli_validation = {"status": status, "evidence": evidence}
+            if status != "ok":
+                warning = (
+                    "recommendation passed llama-bench context probe but failed llama-cli; "
+                    "see cli_validation evidence"
+                )
+                self.extra_warnings.append(warning)
+                self._emit("warning", message=warning)
+            return
         argv = bench.build_cli_context_argv(
             cli_path=self.llama.cli_path,
             model_path=self.model.path,
@@ -2789,7 +2868,14 @@ class _Engine:
             evidence, argv, result, 1, self._record_load(config.threads), observation
         )
         self.cli_validation = {"status": status, "evidence": evidence}
-        self._append({"type": "stage", "stage": "cli_validation", **self.cli_validation})
+        self._append(
+            {
+                "type": "stage",
+                "stage": "cli_validation",
+                "trial_id": config.trial_id,
+                **self.cli_validation,
+            }
+        )
         measured = _Measured(status, None, None, None, None)
         self._emit_exec_end(label, run_id, result, measured)
         if status != "ok":
@@ -2810,10 +2896,26 @@ class _Engine:
         ):
             return
         results: dict[str, float | None] = {}
+        journaled = {
+            str(entry["run_id"]): entry
+            for entry in self.session.entries
+            if entry.get("type") == "quality_gate_run" and isinstance(entry.get("run_id"), str)
+        }
         for name, candidate in (
             ("lossy", config),
             ("f16", dataclasses.replace(config, cache_type_k="f16", cache_type_v="f16")),
         ):
+            run_id = f"ppl-{name}-{candidate.trial_id}"
+            prior = journaled.get(run_id)
+            if (
+                prior is not None
+                and prior.get("name") == name
+                and prior.get("trial_id") == candidate.trial_id
+                and prior.get("status") == "ok"
+                and _is_finite_number(prior.get("ppl"))
+            ):
+                results[name] = float(prior["ppl"])
+                continue
             argv = bench.build_perplexity_argv(
                 perplexity_path=self.llama.perplexity_path,
                 model_path=self.model.path,
@@ -2822,7 +2924,6 @@ class _Engine:
                 ctx=self.options.ctx_size or self.options.pp + self.options.tg,
                 capabilities=self.caps,
             )
-            run_id = f"ppl-{name}-{candidate.trial_id}"
             probe_dir = self.session.probe_dir(run_id)
             result, observation = self._run_child(
                 kind="probe",
@@ -2842,6 +2943,8 @@ class _Engine:
                 self._record_load(candidate.threads),
                 observation,
             )
+            raw = result.stdout.path.read_bytes() + b"\n" + result.stderr.path.read_bytes()
+            ppl = bench.parse_perplexity_output(raw)
             self._append(
                 {
                     "type": "quality_gate_run",
@@ -2852,10 +2955,10 @@ class _Engine:
                         "ok" if result.exit_code == 0 and not result.timed_out else "failed"
                     ),
                     "evidence": f"probes/{run_id}",
+                    "ppl": ppl,
                 }
             )
-            raw = result.stdout.path.read_bytes() + b"\n" + result.stderr.path.read_bytes()
-            results[name] = bench.parse_perplexity_output(raw)
+            results[name] = ppl
         self.quality_gate = {
             "status": "ok" if all(value is not None for value in results.values()) else "failed",
             "ppl_lossy": results["lossy"],
@@ -2941,7 +3044,7 @@ class _Engine:
         return result
 
     def _complete_coverage(self) -> None:
-        if not hasattr(self, "incumbent_config"):
+        if self.baseline.kind == "unestablished":
             return
         applicable = applicable_dimensions(
             hardware=self.hardware,
@@ -3076,7 +3179,24 @@ class _Engine:
             return _Confirm(False, None, None, 0.0)
         pp_means: list[float] = []
         tg_means: list[float] = []
+        journaled = {
+            int(entry["run"]): entry
+            for entry in self.session.entries
+            if entry.get("type") == "confirmation_run"
+            and entry.get("trial_id") == config.trial_id
+            and isinstance(entry.get("run"), int)
+        }
         for index in range(1, self.options.baseline_runs + 1):
+            prior = journaled.get(index)
+            if (
+                prior is not None
+                and prior.get("status") == "ok"
+                and _is_finite_number(prior.get("pp_mean"))
+                and _is_finite_number(prior.get("tg_mean"))
+            ):
+                pp_means.append(float(prior["pp_mean"]))
+                tg_means.append(float(prior["tg_mean"]))
+                continue
             if not self._can_execute():
                 warning = "confirmation skipped because trial budget was exhausted"
                 if warning not in self.extra_warnings:
@@ -3579,6 +3699,14 @@ def _opt_int(value: Any) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _is_finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
 def _sign(value: int) -> int:

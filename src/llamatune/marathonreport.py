@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
+from llamatune.sanitize import markdown_cell, markdown_text
+
 
 def _value(value: Any) -> str:
     if value is None:
         return "—"
     if isinstance(value, float):
         return f"{value:.3f}"
-    return str(value)
+    return markdown_cell(str(value))
 
 
 def _config(config: Any) -> str:
@@ -195,7 +197,7 @@ def render(summary: dict[str, Any]) -> str:
         lines.append("None.")
     lines.extend(["", "## Warnings", ""])
     warnings = summary.get("warnings", [])
-    lines.extend(f"- {warning}" for warning in warnings)
+    lines.extend(f"- {markdown_text(warning)}" for warning in warnings)
     if not warnings:
         lines.append("None.")
     return "\n".join(lines) + "\n"

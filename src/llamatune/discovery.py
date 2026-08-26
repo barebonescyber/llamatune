@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import fnmatch
 import hashlib
 import json
@@ -14,12 +15,16 @@ from pathlib import Path
 import gguf
 
 from llamatune.model import ModelInspectionError, inspect_model
+from llamatune.sanitize import strip_control_chars
 from llamatune.types import DiscoveredModel, ModelReport
 
 _SHARD_RE = re.compile(
     r"^(?P<stem>.+?)(?P<separator>[-_])(?P<index>\d{1,5})-of-(?P<total>\d{1,5})\.gguf$",
     re.I,
 )
+
+#: One shard's parsed tensor table; ``None`` marks an unreadable file.
+_TensorRows = tuple[tuple[str, tuple[int, ...], str], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,10 +36,10 @@ class _Candidate:
     payload_size: int
 
 
-def _paths(models_dir: Path) -> tuple[Path, ...]:
+def _paths(models_dir: Path, follow_symlinks: bool) -> tuple[Path, ...]:
     found: list[Path] = []
     seen_dirs: set[Path] = set()
-    for root, dirs, files in os.walk(models_dir, followlinks=True):
+    for root, dirs, files in os.walk(models_dir, followlinks=follow_symlinks):
         root_path = Path(root)
         try:
             real_root = root_path.resolve()
@@ -64,21 +69,53 @@ def _selected(path: Path, include: tuple[str, ...], exclude: tuple[str, ...]) ->
     )
 
 
-def _tensor_table_sha(paths: tuple[Path, ...]) -> str | None:
+def _tensor_rows(path: Path, cache: dict[str, _TensorRows | None]) -> _TensorRows | None:
+    """Parse one shard's tensor table once per scan (cached by resolved path).
+
+    Returns ``None`` for a file that cannot be read as a GGUF tensor table,
+    mirroring the previous fresh-reader-per-call behavior.
+    """
+    try:
+        key = str(path.resolve())
+    except OSError:
+        key = str(path)
+    if key in cache:
+        return cache[key]
     rows: list[tuple[str, tuple[int, ...], str]] = []
     try:
-        for path in paths:
-            reader = gguf.GGUFReader(str(path), "r")
-            for tensor in reader.tensors:
-                rows.append(
-                    (
-                        str(tensor.name),
-                        tuple(int(value) for value in tensor.shape),
-                        str(tensor.tensor_type),
-                    )
+        reader = gguf.GGUFReader(str(path), "r")
+        for tensor in reader.tensors:
+            rows.append(
+                (
+                    str(tensor.name),
+                    tuple(int(value) for value in tensor.shape),
+                    str(tensor.tensor_type),
                 )
+            )
     except (OSError, TypeError, ValueError, AttributeError):
+        cache[key] = None
         return None
+    table = tuple(rows)
+    cache[key] = table
+    return table
+
+
+def _tensor_table_sha(
+    paths: tuple[Path, ...],
+    rows_cache: dict[str, _TensorRows | None] | None = None,
+) -> str | None:
+    """SHA-256 over the sorted union of every shard's tensor-table rows.
+
+    Each distinct shard file is opened and parsed at most once per scan when a
+    shared ``rows_cache`` is supplied; the hash recipe is unchanged.
+    """
+    cache: dict[str, _TensorRows | None] = {} if rows_cache is None else rows_cache
+    rows: list[tuple[str, tuple[int, ...], str]] = []
+    for path in paths:
+        shard_rows = _tensor_rows(path, cache)
+        if shard_rows is None:
+            return None
+        rows.extend(shard_rows)
     if not rows:
         return None
     encoded = json.dumps(sorted(rows), separators=(",", ":"), ensure_ascii=True).encode()
@@ -103,11 +140,20 @@ def discover_models(
     *,
     duplicates: str = "one",
     full_hash: bool = False,
+    follow_symlinks: bool = False,
 ) -> tuple[DiscoveredModel, ...]:
-    """Discover deterministic benchmark entries below ``models_dir``."""
+    """Discover deterministic benchmark entries below ``models_dir``.
+
+    Symbolic directories are not followed unless ``follow_symlinks`` is set
+    (SEC-008): by default a symlink pointing outside ``models_dir`` cannot
+    pull external paths into the scan. The resolved-directory cycle guard
+    applies on either setting.
+    """
     if duplicates not in {"one", "both"}:
         raise ValueError("duplicates must be 'one' or 'both'")
-    paths = tuple(path for path in _paths(models_dir) if _selected(path, include, exclude))
+    paths = tuple(
+        path for path in _paths(models_dir, follow_symlinks) if _selected(path, include, exclude)
+    )
     shard_groups: dict[tuple[Path, str], list[tuple[int, int, Path, str, str, str]]] = {}
     singles: list[Path] = []
     for path in paths:
@@ -134,8 +180,10 @@ def discover_models(
         totals = {total for _index, total, _path, _separator, _index_text, _total_text in shards}
         if len(totals) != 1:
             warnings.warn(
-                f"skipping inconsistent shard group {stem}; mixed declared totals: "
-                + ", ".join(str(total) for total in sorted(totals)),
+                strip_control_chars(
+                    f"skipping inconsistent shard group {stem}; mixed declared totals: "
+                    + ", ".join(str(total) for total in sorted(totals))
+                ),
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -143,7 +191,9 @@ def discover_models(
         total = totals.pop()
         if total < 1 or any(index < 1 or index > total for index, *_rest in shards):
             warnings.warn(
-                f"skipping inconsistent shard group {stem}; shard index outside declared total",
+                strip_control_chars(
+                    f"skipping inconsistent shard group {stem}; shard index outside declared total"
+                ),
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -157,7 +207,9 @@ def discover_models(
             members[index] = path
         if duplicate_index:
             warnings.warn(
-                f"skipping inconsistent shard group {stem}; duplicate numeric shard index",
+                strip_control_chars(
+                    f"skipping inconsistent shard group {stem}; duplicate numeric shard index"
+                ),
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -190,7 +242,9 @@ def discover_models(
                 for index in missing
             )
             warnings.warn(
-                f"skipping incomplete shard group; missing: {names}", RuntimeWarning, stacklevel=2
+                strip_control_chars(f"skipping incomplete shard group; missing: {names}"),
+                RuntimeWarning,
+                stacklevel=2,
             )
             continue
         shard_paths = tuple(members[index] for index in range(1, total + 1))
@@ -204,12 +258,16 @@ def discover_models(
             physical_paths = shard_paths or (path,)
             payload_size = sum(member.stat().st_size for member in physical_paths)
         except (ModelInspectionError, OSError, ValueError) as exc:
-            warnings.warn(f"skipping unreadable GGUF {path}: {exc}", RuntimeWarning, stacklevel=2)
+            warnings.warn(
+                strip_control_chars(f"skipping unreadable GGUF {path}: {exc}"),
+                RuntimeWarning,
+                stacklevel=2,
+            )
             continue
         previous = seen_fingerprints.get(report.fingerprint)
         if previous is not None:
             warnings.warn(
-                f"deduplicating identical GGUF {path}; kept {previous}",
+                strip_control_chars(f"deduplicating identical GGUF {path}; kept {previous}"),
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -220,10 +278,32 @@ def discover_models(
                 path=path,
                 report=report,
                 shard_paths=shard_paths,
-                tensor_sha=_tensor_table_sha(physical_paths),
+                tensor_sha=None,
                 payload_size=payload_size,
             )
         )
+
+    # PERF-014: tensor tables are parsed only where content-duplicate grouping
+    # can apply — a group needs two members sharing the cheap report metadata —
+    # and each distinct shard file is parsed at most once per scan through the
+    # shared rows cache. Group outcomes are identical to eager computation.
+    pre_groups: dict[tuple[object, ...], list[_Candidate]] = {}
+    for candidate in candidates:
+        report = candidate.report
+        pre_groups.setdefault(
+            (report.architecture, report.name, report.n_layer, report.expert_count),
+            [],
+        ).append(candidate)
+    rows_cache: dict[str, _TensorRows | None] = {}
+    resolved_candidates: list[_Candidate] = []
+    for twin_members in pre_groups.values():
+        if len(twin_members) >= 2:
+            for index, member in enumerate(twin_members):
+                physical_paths = member.shard_paths or (member.path,)
+                sha = _tensor_table_sha(physical_paths, rows_cache=rows_cache)
+                twin_members[index] = dataclasses.replace(member, tensor_sha=sha)
+        resolved_candidates.extend(twin_members)
+    candidates = resolved_candidates
 
     groups: dict[tuple[object, ...], list[_Candidate]] = {}
     for candidate in candidates:

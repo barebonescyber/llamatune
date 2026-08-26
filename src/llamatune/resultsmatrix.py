@@ -3,21 +3,54 @@
 from __future__ import annotations
 
 import hashlib
-import importlib
 import json
 import os
 import re
-import sys
 import tempfile
-from collections.abc import Callable, Iterable
+import warnings
+from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
+
+import typer
 
 from llamatune.config import hardware_signature
-from llamatune.types import GPUInfo, HardwareReport, ResultRow, ResultsMatrix, TrialConfig
+from llamatune.evidence import PathEscapeError, confined_path, read_journal_lines
+from llamatune.types import (
+    GPUInfo,
+    HardwareReport,
+    MatrixBuildSummary,
+    ResultRow,
+    ResultsMatrix,
+    TrialConfig,
+)
 
 _SCHEMA_VERSION = 1
+REFRESH_EXIT_CODES = frozenset({0, 1, 4})
+
+# Files whose (size, mtime_ns) identity decides whether a cached source's
+# rows may be reused instead of re-reading and re-parsing its evidence.
+_SESSION_FILES = (
+    "session.json",
+    "model.json",
+    "hardware.json",
+    "llamacpp.json",
+    "analysis.json",
+    "journal.jsonl",
+)
+_MARATHON_FILES = ("marathon.json", "run.json", "model.json", "hardware.json", "llamacpp.json")
+_NIGHTSHIFT_FILES = ("nightshift.json", "run.json", "hardware.json", "llamacpp.json")
+_QUALITY_FILES = ("quality.json",)
+
+_CACHE_VERSION = 1
+_SourceCache = dict[str, dict[str, Any]]
+
+
+class MatrixPathError(PathEscapeError):
+    """A matrix artifact path escaped its output directory."""
+
+
 _KINDS = frozenset(
     {
         "baseline",
@@ -42,19 +75,9 @@ def _json(path: Path) -> dict[str, Any]:
 
 
 def _journal(path: Path) -> list[dict[str, Any]]:
-    entries: list[dict[str, Any]] = []
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    for index, line in enumerate(lines):
-        if not line.strip():
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            if index == len(lines) - 1:
-                break
-            raise
-        if isinstance(value, dict):
-            entries.append(value)
+    entries, corruption = read_journal_lines(path)
+    for warning in corruption:
+        warnings.warn(warning, RuntimeWarning, stacklevel=2)
     return entries
 
 
@@ -613,7 +636,7 @@ def _reference_config(root: Path, calibration: dict[str, Any]) -> TrialConfig | 
         return None
     try:
         analysis = _json(reference_path / "analysis.json")
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return None
     winner = analysis.get("winner")
     return _config(winner.get("config")) if isinstance(winner, dict) else None
@@ -793,27 +816,38 @@ def _sort_key(row: ResultRow) -> tuple[Any, ...]:
     )
 
 
-def harvest(roots: tuple[Path, ...]) -> ResultsMatrix:
-    """Read all named evidence under ``roots`` into a deterministic matrix."""
-    resolved = tuple(root.resolve() for root in roots)
-    rows: list[ResultRow] = []
-    warnings: list[str] = []
-    for root in resolved:
-        if not root.is_dir():
-            warnings.append(f"{root}: root is not a readable directory")
+def _source_digest(source: Path, names: tuple[str, ...]) -> list[list[Any]]:
+    """Return a change-detecting fingerprint of one source's evidence files."""
+    digest: list[list[Any]] = []
+    for name in names:
+        try:
+            info = (source / name).stat()
+        except OSError:
+            digest.append([name, None, None])
             continue
-        sources = (
-            ((_session_rows, path) for path in _ordinary_sessions(root)),
-            ((_marathon_rows, path) for path in _units(root, "marathon", "marathon.json")),
-            ((_nightshift_rows, path) for path in _units(root, "nightshift", "nightshift.json")),
-            ((_quality_rows, path) for path in _units(root, "quality", "quality.json")),
-        )
-        for group in sources:
-            for reader, path in group:
-                try:
-                    rows.extend(reader(root, path))
-                except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-                    warnings.append(f"{path}: {exc}")
+        digest.append([name, info.st_size, info.st_mtime_ns])
+    return digest
+
+
+def _revive_rows(raw_rows: object) -> list[ResultRow] | None:
+    """Deserialize cached row dicts, or None when they are unusable."""
+    if not isinstance(raw_rows, list):
+        return None
+    try:
+        return [ResultRow.from_dict(row) for row in raw_rows if isinstance(row, dict)]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def harvest(roots: tuple[Path, ...]) -> ResultsMatrix:
+    """Read all named evidence under ``roots`` into a deterministic matrix.
+
+    Sources are read serially on purpose.  Deterministic warning and row
+    ordering under test substitution outweighs the wall-time gain from
+    parallel reads on local disks (#22 PERF-016).
+    """
+    resolved = tuple(root.resolve() for root in roots)
+    rows, warnings_list, _cache = _harvest(resolved, None)
     current = sorted(_mark_current(rows), key=_sort_key)
     generated = max((row.ts for row in current), default="")
     return ResultsMatrix(
@@ -821,8 +855,83 @@ def harvest(roots: tuple[Path, ...]) -> ResultsMatrix:
         generated=generated,
         roots=resolved,
         rows=tuple(current),
-        warnings=tuple(warnings),
+        warnings=tuple(warnings_list),
     )
+
+
+def _harvest(
+    resolved: tuple[Path, ...],
+    prior_cache: _SourceCache | None,
+) -> tuple[list[ResultRow], list[str], _SourceCache]:
+    """Collect rows per source in deterministic order, reusing cached rows.
+
+    ``prior_cache`` maps an evidence directory to its last digest and
+    serialized rows; unchanged sources skip re-parsing entirely. Passing
+    ``None`` performs a pure from-scratch read with no digest overhead.
+    """
+    rows: list[ResultRow] = []
+    warnings: list[str] = []
+    cache: _SourceCache = {}
+    for root in resolved:
+        if not root.is_dir():
+            warnings.append(f"{root}: root is not a readable directory")
+            continue
+        sources = (
+            ((_session_rows, path, _SESSION_FILES) for path in _ordinary_sessions(root)),
+            (
+                (_marathon_rows, path, _MARATHON_FILES)
+                for path in _units(root, "marathon", "marathon.json")
+            ),
+            (
+                (_nightshift_rows, path, _NIGHTSHIFT_FILES)
+                for path in _units(root, "nightshift", "nightshift.json")
+            ),
+            (
+                (_quality_rows, path, _QUALITY_FILES)
+                for path in _units(root, "quality", "quality.json")
+            ),
+        )
+        for group in sources:
+            for reader, path, names in group:
+                cached = prior_cache.get(str(path)) if prior_cache is not None else None
+                digest = _source_digest(path, names)
+                revived = None if cached is None else _revive_rows(cached.get("rows"))
+                if cached is not None and revived is not None and cached.get("digest") == digest:
+                    rows.extend(revived)
+                    cache[str(path)] = {"digest": digest, "rows": cached["rows"]}
+                    continue
+                try:
+                    produced = reader(root, path)
+                except (OSError, ValueError, TypeError, KeyError) as exc:
+                    warnings.append(f"{path}: {exc}")
+                    continue
+                rows.extend(produced)
+                cache[str(path)] = {
+                    "digest": digest,
+                    "rows": [row.to_dict() for row in produced],
+                }
+    return rows, warnings, cache
+
+
+def _load_source_cache(artifact: Path) -> _SourceCache | None:
+    """Load the incremental-refresh cache from an existing artifact, if any.
+
+    Missing, stale-versioned, or malformed caches yield ``None`` so callers
+    fall back to a full rebuild; older artifacts stay fully readable.
+    """
+    try:
+        data = json.loads(artifact.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    cache = data.get("source_cache")
+    if not isinstance(cache, dict) or cache.get("version") != _CACHE_VERSION:
+        return None
+    sources = cache.get("sources")
+    if not isinstance(sources, dict):
+        return None
+    return {str(key): value for key, value in sources.items() if isinstance(value, dict)}
 
 
 def _document(matrix: ResultsMatrix) -> dict[str, Any]:
@@ -837,20 +946,8 @@ def _document(matrix: ResultsMatrix) -> dict[str, Any]:
     }
 
 
-def _canonical_json(matrix: ResultsMatrix) -> str:
-    return json.dumps(_document(matrix), indent=2, sort_keys=True) + "\n"
-
-
-def _confined(output_dir: Path, name: str) -> Path:
-    root = output_dir.resolve()
-    target = (root / name).resolve()
-    if target.parent != root:
-        raise ValueError(f"matrix output escapes output directory: {name}")
-    return target
-
-
 def _atomic_text(output_dir: Path, name: str, content: str) -> None:
-    target = _confined(output_dir, name)
+    target = confined_path(output_dir, name, error=MatrixPathError)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{name}.", dir=output_dir)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
@@ -862,37 +959,65 @@ def _atomic_text(output_dir: Path, name: str, content: str) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def build(roots: tuple[Path, ...], output_dir: Path) -> dict[str, Any]:
-    """Harvest roots and atomically materialize the JSON and Markdown artifacts."""
-    matrix = harvest(roots)
+def build(roots: tuple[Path, ...], output_dir: Path) -> MatrixBuildSummary:
+    """Harvest roots and atomically materialize the JSON and Markdown artifacts.
+
+    When a previous artifact with a current-version source cache exists in
+    ``output_dir``, unchanged sources reuse their cached rows instead of
+    being re-parsed; the resulting rows are identical to a full rebuild.
+    """
+    resolved = tuple(root.resolve() for root in roots)
+    prior_cache = _load_source_cache(output_dir / "results-matrix.json")
+    rows, warnings_list, cache = _harvest(resolved, prior_cache)
+    current = sorted(_mark_current(rows), key=_sort_key)
+    generated = max((row.ts for row in current), default="")
+    matrix = ResultsMatrix(
+        schema_version=_SCHEMA_VERSION,
+        generated=generated,
+        roots=resolved,
+        rows=tuple(current),
+        warnings=tuple(warnings_list),
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     if not output_dir.is_dir():
         raise OSError(f"matrix output is not a directory: {output_dir}")
     if any((output_dir / marker).exists() for marker in ("session.json", "run.json")):
         raise ValueError(f"matrix output cannot be a session or run directory: {output_dir}")
-    try:
-        module = importlib.import_module("llamatune.matrixreport")
-        renderer = cast(
-            Callable[[ResultsMatrix], str],
-            module.render_markdown,
-        )
-        markdown = renderer(matrix)
-    except ImportError:
-        markdown = f"# Results Matrix\n\nRows: {len(matrix.rows)}\n"
-    _atomic_text(output_dir, "results-matrix.json", _canonical_json(matrix))
+    from llamatune.matrixreport import render_markdown
+
+    markdown = render_markdown(matrix)
+    document = _document(matrix)
+    document["source_cache"] = {"version": _CACHE_VERSION, "sources": cache}
+    _atomic_text(
+        output_dir,
+        "results-matrix.json",
+        json.dumps(document, indent=2, sort_keys=True) + "\n",
+    )
     _atomic_text(output_dir, "results-matrix.md", markdown)
     kinds: dict[str, int] = {}
     for row in matrix.rows:
         kinds[row.kind] = kinds.get(row.kind, 0) + 1
-    return {
-        "output": str(output_dir.resolve()),
-        "rows": len(matrix.rows),
-        "current_rows": sum(row.current for row in matrix.rows),
-        "models": len({row.model_fingerprint for row in matrix.rows}),
-        "roots": [str(root) for root in matrix.roots],
-        "kinds": dict(sorted(kinds.items())),
-        "warnings": list(matrix.warnings),
-    }
+    return MatrixBuildSummary(
+        output=str(output_dir.resolve()),
+        rows=len(matrix.rows),
+        current_rows=sum(row.current for row in matrix.rows),
+        models=len({row.model_fingerprint for row in matrix.rows}),
+        roots=[str(root) for root in matrix.roots],
+        kinds=dict(sorted(kinds.items())),
+        warnings=list(matrix.warnings),
+    )
+
+
+def _artifact_roots(artifact: Path) -> tuple[Path, ...]:
+    """Read just an artifact's schema and roots without materializing rows."""
+    data = _json(artifact)
+    version = data.get("schema_version")
+    if version != _SCHEMA_VERSION:
+        raise ValueError(f"unsupported results matrix schema version: {version}")
+    roots = data.get("roots")
+    if not isinstance(roots, list) or not all(isinstance(root, str) and root for root in roots):
+        raise ValueError("invalid results matrix roots")
+    return tuple(Path(str(root)) for root in roots)
 
 
 def _refresh_roots(root: Path) -> tuple[Path, ...]:
@@ -902,12 +1027,15 @@ def _refresh_roots(root: Path) -> tuple[Path, ...]:
     if not artifact.is_file():
         return (resolved,)
     try:
-        configured = load_artifact(artifact).roots
-    except Exception as exc:
-        print(
+        configured = _artifact_roots(artifact)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        # Legacy matrix artifacts may be malformed; fall back to the owner
+        # root. Anything outside these parse/error types is a programming
+        # error and is caught by refresh()'s best-effort guard instead.
+        typer.echo(
             f"warning: existing results matrix configuration ignored; "
             f"refreshing only {resolved}: {exc}",
-            file=sys.stderr,
+            err=True,
         )
         return (resolved,)
     normalized = tuple(dict.fromkeys(path.resolve() for path in configured))
@@ -916,11 +1044,13 @@ def _refresh_roots(root: Path) -> tuple[Path, ...]:
 
 def refresh(root: Path) -> None:
     """Best-effort artifact refresh used by terminal command epilogues."""
+    resolved = root.resolve()
     try:
-        resolved = root.resolve()
         build(_refresh_roots(resolved), resolved / "matrix")
-    except Exception as exc:  # refresh must never alter the owning command's outcome
-        print(f"warning: results matrix refresh failed: {exc}", file=sys.stderr)
+    except Exception as exc:
+        # Broad by design: this runs in a terminal-command epilogue, so it
+        # must never alter the owning command's outcome.
+        typer.echo(f"warning: results matrix refresh failed: {exc}", err=True)
 
 
 def load_artifact(path: Path) -> ResultsMatrix:

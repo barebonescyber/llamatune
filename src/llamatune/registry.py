@@ -204,7 +204,7 @@ def _wall_seconds(entries: list[dict[str, Any]]) -> float | None:
     return (max(timestamps) - min(timestamps)).total_seconds() if len(timestamps) >= 2 else None
 
 
-def _record(session_dir: Path) -> RegistryRecord:
+def _record(session_dir: Path, entries: list[dict[str, Any]]) -> RegistryRecord:
     session = _json_object(session_dir / "session.json")
     model = _json_object(session_dir / "model.json")
     llama = _json_object(session_dir / "llamacpp.json")
@@ -223,7 +223,6 @@ def _record(session_dir: Path) -> RegistryRecord:
         pp = float(baseline["pp"]["mean"])
         tg = float(baseline["tg"]["mean"])
         outcome = "defaults_optimal"
-    entries = _journal(session_dir / "journal.jsonl")
     trial_walls = [
         float(entry["wall_s"])
         for entry in entries
@@ -279,8 +278,8 @@ def build_registry(sessions_dir: Path, *, ctx_size: int | None = None) -> dict[s
             entries = _journal(session_dir / "journal.jsonl")
             if not _completed(entries, session_dir / "analysis.json"):
                 continue
-            record = _record(session_dir)
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            record = _record(session_dir, entries)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
             warnings.warn(
                 f"skipping corrupt session {session_dir}: {exc}",
                 RuntimeWarning,
@@ -295,6 +294,40 @@ def build_registry(sessions_dir: Path, *, ctx_size: int | None = None) -> dict[s
     return records
 
 
+def absorb_session(
+    records: dict[str, RegistryRecord],
+    session_dir: Path,
+    *,
+    ctx_size: int | None = None,
+) -> bool:
+    """Fold one just-finished session into ``records`` without a full rescan.
+
+    Applies the same completion, corruption, context-filter, and
+    newest-``created`` rules as :func:`build_registry` so incremental folds
+    converge to exactly the from-scratch registry under serial scheduling.
+    Returns whether ``records`` gained or updated a fingerprint.
+    """
+    try:
+        entries = _journal(session_dir / "journal.jsonl")
+        if not _completed(entries, session_dir / "analysis.json"):
+            return False
+        record = _record(session_dir, entries)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        warnings.warn(
+            f"skipping corrupt session {session_dir}: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return False
+    if ctx_size is not None and (record.ctx_size is None or record.ctx_size < ctx_size):
+        return False
+    previous = records.get(record.fingerprint)
+    if previous is not None and record.created <= previous.created:
+        return False
+    records[record.fingerprint] = record
+    return True
+
+
 def incomplete_sessions(sessions_dir: Path) -> tuple[Path, ...]:
     """Return incomplete ordinary tuning sessions, oldest first."""
     candidates: list[tuple[str, Path]] = []
@@ -304,7 +337,7 @@ def incomplete_sessions(sessions_dir: Path) -> tuple[Path, ...]:
             entries = _journal(session_dir / "journal.jsonl")
             if not _completed(entries, session_dir / "analysis.json"):
                 candidates.append((str(session["created"]), session_dir))
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, TypeError, KeyError) as exc:
             warnings.warn(
                 f"skipping corrupt session {session_dir}: {exc}",
                 RuntimeWarning,

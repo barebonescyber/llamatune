@@ -7,7 +7,30 @@ import sys
 from dataclasses import dataclass, field
 from typing import TextIO
 
+from llamatune.sanitize import strip_control_chars
 from llamatune.types import ProgressEvent, Reporter
+
+_verbose = False
+
+
+def set_verbose(enabled: bool) -> None:
+    """Enable or disable extra stderr diagnostics."""
+    global _verbose
+    _verbose = enabled
+
+
+def is_verbose() -> bool:
+    """Return True when extra stderr diagnostics are enabled."""
+    return _verbose
+
+
+def emit_diagnostic(message: str, *, err: TextIO | None = None) -> None:
+    """Write one diagnostic line to stderr in verbose mode."""
+    if not _verbose:
+        return
+    stream = sys.stderr if err is None else err
+    stream.write(f"[verbose] {message}\n")
+    stream.flush()
 
 
 def make_reporter(mode: str, *, err: TextIO | None = None) -> Reporter | None:
@@ -85,7 +108,7 @@ class PlainReporter:
         elif event.kind == "session_end":
             line = f"[done] exit={p.get('exit_code')} winner={p.get('winner_trial_id') or 'none'}"
         if line is not None:
-            self.err.write(line + "\n")
+            self.err.write(strip_control_chars(line) + "\n")
             self.err.flush()
 
 
@@ -105,21 +128,31 @@ class RichReporter:
         p = event.payload
         if event.kind == "session_start":
             self._lines = [
-                f"[bold]{p['model_name']}[/bold]",
-                str(p["session_dir"]),
-                str(p.get("stop_hint", "Ctrl-C twice to abort")),
+                f"[bold]{strip_control_chars(str(p['model_name']))}[/bold]",
+                strip_control_chars(str(p["session_dir"])),
+                strip_control_chars(str(p.get("stop_hint", "Ctrl-C twice to abort"))),
             ]
         elif event.kind == "stage":
-            self._replace("phase:", f"phase: {p.get('stage', 'unknown')}")
+            self._replace("phase:", f"phase: {strip_control_chars(str(p.get('stage', 'unknown')))}")
         elif event.kind in ("exec_start", "exec_heartbeat"):
             elapsed = float(p.get("elapsed_s", 0.0))
-            self._replace("activity:", f"activity: {p.get('label', '')} ({elapsed:.0f}s)")
+            self._replace(
+                "activity:",
+                f"activity: {strip_control_chars(str(p.get('label', '')))} ({elapsed:.0f}s)",
+            )
         elif event.kind == "exec_end":
-            self._replace("result:", f"result: {p.get('status')} — {p.get('label', '')}")
+            self._replace(
+                "result:",
+                "result: "
+                f"{strip_control_chars(str(p.get('status')))} — "
+                f"{strip_control_chars(str(p.get('label', '')))}",
+            )
         elif event.kind == "incumbent":
             self._replace("incumbent:", f"incumbent: {float(p.get('score', 0.0)):.3f}x")
         elif event.kind == "warning":
-            self._lines.append(f"[yellow]warning: {p.get('message', '')}[/yellow]")
+            self._lines.append(
+                f"[yellow]warning: {strip_control_chars(str(p.get('message', '')))}[/yellow]"
+            )
             self._lines = self._lines[-12:]
         elif event.kind == "session_end":
             self._lines.append(f"done: exit {p.get('exit_code')}")

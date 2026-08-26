@@ -193,6 +193,17 @@ def run_calibration(
                     runs=0,
                     reason=f"capability_lost:{capability}",
                 )
+    if record.reference_pp <= 0 or record.reference_tg <= 0:
+        field = "pp" if record.reference_pp <= 0 else "tg"
+        return _result(
+            record=record,
+            model=model,
+            llama=llama,
+            threshold=threshold,
+            verdict="error",
+            runs=0,
+            reason=f"invalid_reference:{field}",
+        )
 
     argv = _build_argv(record, model, llama)
     pp_values: list[float] = []
@@ -294,7 +305,7 @@ def calibrate(sessions_dir: Path) -> dict[str, Any]:
                 actual = float(observed.get("observed_used_delta_mb") or 0.0)
                 if estimated > 0 and actual > 0:
                     ratios.append(actual / estimated)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            except (OSError, ValueError, TypeError):
                 continue
     scale = statistics.median(ratios) if len(ratios) >= 3 else 1.0
     result = {

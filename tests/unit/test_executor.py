@@ -317,7 +317,7 @@ class TestTerminateGroup:
         proc = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
         proc.wait()
         # Must not raise even though the process (and group) is gone.
-        executor._terminate_group(proc)
+        executor.terminate_group(proc)
 
     def test_windows_job_is_assigned(self, monkeypatch: pytest.MonkeyPatch) -> None:
         api = _FakeWindowsApi()
@@ -352,9 +352,9 @@ class TestTerminateGroup:
         monkeypatch.setattr(executor, "_windows_api", lambda: api)
         proc = subprocess.Popen([sys.executable, "-c", "pass"])
         proc.wait()
-        control = executor._ProcessControl(windows=True, job_handle="job")
+        control = executor.ProcessControl(windows=True, job_handle="job")
 
-        executor._terminate_group(proc, control)
+        executor.terminate_group(proc, control)
 
         assert api.terminated == ["job"]
         assert api.closed == ["job"]
@@ -370,7 +370,7 @@ class TestTerminateGroup:
         proc = subprocess.Popen([sys.executable, "-c", "pass"])
         proc.wait()
 
-        executor._terminate_group(proc, executor._ProcessControl(windows=True, job_handle="job"))
+        executor.terminate_group(proc, executor.ProcessControl(windows=True, job_handle="job"))
 
         assert killed == [proc.pid]
 
@@ -382,7 +382,7 @@ class TestTerminateGroup:
         proc = subprocess.Popen([sys.executable, "-c", "pass"])
         proc.wait()
 
-        executor._terminate_group(proc, executor._ProcessControl(windows=True))
+        executor.terminate_group(proc, executor.ProcessControl(windows=True))
 
         assert killed == [proc.pid]
 
@@ -432,7 +432,7 @@ class TestTaskkillFallback:
         proc = subprocess.Popen([sys.executable, "-c", "pass"])
         proc.wait()
 
-        executor._terminate_group(proc, executor._ProcessControl(windows=True, job_handle="job"))
+        executor.terminate_group(proc, executor.ProcessControl(windows=True, job_handle="job"))
 
         assert api.terminated == ["job"]
         assert killed == []
@@ -442,7 +442,7 @@ def test_windows_spawn_attaches_job(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(executor, "_WINDOWS", True)
     monkeypatch.setattr(executor, "_create_windows_job", lambda pid: f"job-{pid}")
 
-    proc, control = executor._spawn(
+    proc, control = executor.spawn_supervised(
         [sys.executable, "-c", "pass"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -471,15 +471,13 @@ def test_memory_drain_continues_after_capture_cap() -> None:
 
 def test_platform_spawn_kwargs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(executor, "_WINDOWS", True)
-    assert executor._popen_platform_kwargs() == {
-        "creationflags": executor._CREATE_NEW_PROCESS_GROUP
-    }
+    assert executor.popen_platform_kwargs() == {"creationflags": executor._CREATE_NEW_PROCESS_GROUP}
     monkeypatch.setattr(executor, "_WINDOWS", False)
 
     def marker() -> None:
         pass
 
-    assert executor._popen_platform_kwargs(marker) == {
+    assert executor.popen_platform_kwargs(marker) == {
         "start_new_session": True,
         "preexec_fn": marker,
     }

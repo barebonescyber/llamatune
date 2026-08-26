@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from llamatune.registry import build_registry, incomplete_sessions
+from llamatune.types import RegistryRecord
 
 
 def _write_session(
@@ -169,3 +170,67 @@ def test_torn_journal_tail_is_tolerated(tmp_path: Path) -> None:
     with (session / "journal.jsonl").open("a") as handle:
         handle.write('{"type":')
     assert build_registry(tmp_path)["fp"].session_dir == session
+
+
+def test_incremental_absorb_converges_to_from_scratch_registry(tmp_path: Path) -> None:
+    from llamatune.registry import absorb_session
+
+    records: dict[str, RegistryRecord] = {}
+    assert build_registry(tmp_path) == {}
+
+    first = _write_session(tmp_path, "first", created="2026-01-01T00:00:00+00:00")
+    assert absorb_session(records, first) is True
+    assert records == build_registry(tmp_path)
+
+    # A newer completed session replaces the fingerprint's record.
+    second = _write_session(tmp_path, "second", created="2026-01-02T00:00:00+00:00")
+    assert absorb_session(records, second) is True
+    assert records["fp"].session_dir == second
+    assert records == build_registry(tmp_path)
+
+    # An older session never displaces the newer record.
+    older = _write_session(tmp_path, "older", created="2026-01-01T06:00:00+00:00")
+    assert absorb_session(records, older) is False
+    assert records == build_registry(tmp_path)
+
+    # An incomplete session is ignored, exactly as a full rescan would.
+    incomplete = _write_session(
+        tmp_path, "incomplete", created="2026-01-03T00:00:00+00:00", complete=False
+    )
+    assert absorb_session(records, incomplete) is False
+    assert records == build_registry(tmp_path)
+
+
+def test_incremental_absorb_applies_context_filter(tmp_path: Path) -> None:
+    from llamatune.registry import absorb_session
+
+    records: dict[str, RegistryRecord] = {}
+    small = _write_session(tmp_path, "small", created="2026-01-01T00:00:00+00:00", ctx_size=8192)
+    large = _write_session(tmp_path, "large", created="2026-01-02T00:00:00+00:00", ctx_size=32768)
+
+    assert absorb_session(records, small, ctx_size=16384) is False
+    assert records == {}
+    assert absorb_session(records, large, ctx_size=16384) is True
+    assert records == build_registry(tmp_path, ctx_size=16384)
+    unfiltered: dict[str, RegistryRecord] = {}
+    absorb_session(unfiltered, small)
+    absorb_session(unfiltered, large)
+    assert unfiltered == build_registry(tmp_path)
+
+
+def test_incremental_absorb_warns_and_skips_corrupt_session(tmp_path: Path) -> None:
+    from llamatune.registry import absorb_session
+
+    records: dict[str, RegistryRecord] = {}
+    good = _write_session(tmp_path, "good")
+    corrupt = _write_session(tmp_path, "corrupt", created="2026-01-02T00:00:00+00:00")
+    (corrupt / "analysis.json").write_text("{")
+    with pytest.warns(RuntimeWarning, match="corrupt session"):
+        assert absorb_session(records, corrupt) is False
+    assert absorb_session(records, good) is True
+    torn = _write_session(tmp_path, "torn", created="2026-01-03T00:00:00+00:00")
+    with torn.joinpath("journal.jsonl").open("a") as handle:
+        handle.write('{"type":')
+    assert absorb_session(records, torn) is True
+    with pytest.warns(RuntimeWarning, match="corrupt session"):
+        assert records == build_registry(tmp_path)

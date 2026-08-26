@@ -29,8 +29,8 @@ classifiers = [
     "Topic :: System :: Benchmark",
 ]
 dependencies = [
-    "typer<1",
-    "gguf<1",
+    "typer>=0.16,<1",
+    "gguf>=0.18,<1",
     "rich>=15.0.0,<16",
 ]
 

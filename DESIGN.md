@@ -101,24 +101,53 @@ for machine-readable output on stdout (human text otherwise).
 - `llamatune resume SESSION_DIR [--json] [--progress ...] [--tui] [--quiet]` — re-validates identity, skips
   journaled trials, continues within the recorded budgets.
 - `llamatune report SESSION_DIR` — regenerate `report.md` from evidence.
+- `llamatune nightshift MODELS_DIR [--json] [--progress ...] [--tui] [--quiet]
+  [--follow-symlinks]` and `llamatune marathon MODEL [--json] [--progress ...]
+  [--tui] [--quiet]` accept the same progress trio as `tune`; per-item or
+  per-phase lines go to stderr in plain mode, structured events in JSON mode,
+  and nothing when quiet. `--follow-symlinks` opts Night Shift's model
+  discovery into following symbolic directories (default: skip them).
 - `export`, `sessions`, `best`, `revalidate`, and `calibrate` provide runtime
   export, registry lookup/reconfirmation, and advisory estimator calibration.
+  `sessions` takes `--sessions-dir` (default `./llamatune-sessions`); the
+  legacy positional path still works. Passing both forms is an error.
+  `calibrate --json`, `export --json`, and `matrix export --json` emit JSON on
+  stdout; on the exports, `--json` is an alias of `--format json` and the two
+  options are mutually exclusive. `quality` and `best` accept `--ctx-size` as
+  a CSV list like `tune` and apply its first value.
 
 Exit codes: `0` success with a confirmed improvement (or scan/report
-success); `1` tuning completed but no confirmed improvement over defaults
-(evidence and a defaults-recommendation are still written); `2` usage or
-configuration error; `3` environment error (missing/unusable llama-bench,
-unreadable model); `4` interrupted or failed mid-run with a resumable
-session.
+success); `1` completed with a valid negative result — per command:
+`tune`/`resume` finished but no confirmed improvement over defaults;
+`nightshift` stopped by its circuit breaker after repeated tune failures
+(evidence and defaults recommendations are still written); `marathon`
+round failures or an unreplicated final champion; `quality` harness task
+errors; `best` no matching current record for the request; `2` usage or
+configuration error; `3` environment error — missing/unusable llama-bench,
+unreadable model, session directory that cannot be created (for example no
+space), or a `scan` whose llama.cpp toolchain probe failed; `4` interrupted
+by a user signal mid-run; the session stays resumable.
 
 An exit-3 tuning outcome is rendered as `tuning did not start`, with its
 failure stage, reason, and session evidence path. It is never described as a
-completed search with no confirmed improvement.
+completed search with no confirmed improvement. `scan` prints its hardware
+report plus `llama-bench: NOT FOUND` (or the same shape under `--json`) and
+exits 3 so scripts can distinguish a missing toolchain from success.
 
 For `tune`, `resume`, and `revalidate`, a `--json` failure before a result
 analysis exists emits an object with `status: "failed"`, `exit_code`,
 `session_dir` (null when no session was created), `failure_stage`,
 `failure_reason`, and `resumable`. Exit 4 is resumable; exits 2 and 3 are not.
+
+Human-readable failure renderings go to stderr. Successful results and
+machine-readable `--json` payloads go to stdout. Piping stdout therefore
+captures results without diagnostics. Progress renderers also write only to
+stderr.
+
+`llamatune --version` prints `llamatune <version>` on stdout and exits 0.
+The global `--verbose/-v` flag, or the equivalent environment variable
+`LLAMATUNE_VERBOSE=1`, prints extra startup diagnostics (resolved binaries,
+model path, probe argv) on stderr.
 
 ## 4. Hardware and environment assessment (`hardware.py`)
 
@@ -489,6 +518,13 @@ warning. (v1 deliberately does not hash-chain the journal — it is
 honest-operator evidence, not tamper-proof; documented divergence from
 infer-tune.)
 
+**Journal corruption policy** (`evidence.read_journal_lines`, shared by all
+orchestrator readers): unparseable lines are skipped and reported as
+warnings. Valid entries before and after a corrupt line still load.
+Nothing is silently truncated or hidden. A torn final line follows the
+same rule and is named in a warning. Session resume stays stricter:
+mid-file corruption stops resume with a corruption error.
+
 Thermally observed `trial` and `confirmation_run` records carry contamination,
 retry, and replacement-contamination state. A final trial rejected for thermal
 provenance additionally carries `thermal_rejected: true` and has `score: null`.
@@ -518,28 +554,74 @@ does not restore budget consumed by auxiliary measurements.
 
 ```
 pyproject.toml
-src/llamatune/
-  __init__.py  _version.py  __main__.py
-  types.py      # frozen dataclasses shared by all modules (below)
-  config.py     # search-space construction, constraints, feasibility (pure)
-  hardware.py   # §4      model.py  # §5      llama.py  # binary discovery/probe
-  executor.py   # §7      bench.py  # command build + JSON parse (never executes)
-  session.py    # §12     search.py # §10 orchestration incl. baseline/confirm
-  stats.py      # §6/§11 statistics
-  recommend.py  # §11 scoring, pareto, analysis.json, recommended.*
-  report.py     # report.md rendering from analysis.json content
-  ui.py         # stderr-only progress renderers; no execution or session writes
-  cli.py        # Typer app; thin; heavy imports lazy inside commands
+src/llamatune/            # flat package; groups mark layers, not directories
+  __init__.py  _version.py
+
+  cli
+    __main__.py           # entry point for python -m llamatune
+    cli.py                # Typer app; argument handling, output formats,
+                          # exit-code mapping, command glue; heavy imports lazy
+  orchestrators
+    search.py             # tune/resume: baseline, coordinate ascent, confirmation
+    nightshift.py         # unattended multi-model shifts; plans, breaker, summary
+    marathon.py           # serial multi-round orchestration with confined writer
+    quality.py            # strictly serial quality-run orchestration, frozen output
+  engine
+    config.py             # search-space construction, constraints, feasibility
+    stats.py              # metric aggregation, noise floor, scoring, Pareto front
+    recommend.py          # analysis assembly, scoring roll-up, recommendation files
+    calibrate.py          # VRAM-estimator calibration fit from completed sessions
+    coverage.py           # Marathon search-space enumeration, coverage accounting
+    abtest.py             # interleaved A/B measurement design for Marathon rounds
+    matrix.py             # context-by-depth operating-point measurements
+    matrixquery.py        # deterministic matrix filtering, ranking, use cases
+  bench-exec
+    bench.py              # llama-bench argv construction and JSON parsing only
+    executor.py           # bounded subprocess execution: timeouts, caps, cleanup
+    sandbox.py            # opt-in POSIX accident barrier for generated code
+                          # (keeps its own kill/drain plumbing: SIGKILL-only,
+                          # rlimit preexec, PATH-only env; see module docstring)
+  evidence-io
+    evidence.py           # shared services: journal reader, jsonable, confinement,
+                          # unique dirs, deadlines, interrupt handlers (§13.4)
+    session.py            # session layout, journal, resume; sole in-session writer
+    registry.py           # append-only registry of confirmed recommendations
+    resultsmatrix.py      # matrix harvesting from evidence; JSON/MD materialization
+  reports
+    report.py             # report.md rendering from analysis.json content
+    nightreport.py        # Night Shift summary Markdown rendering
+    marathonreport.py     # Marathon summary Markdown rendering
+    qualityreport.py      # quality-report rendering from quality.json content
+    matrixreport.py       # Results Matrix Markdown and CSV rendering
+  quality-harness
+    qualserver.py         # supervised loopback llama-server, bounded HTTP client
+    qualsuites.py         # suite schema validation, bundled suites, haystacks
+    qualscore.py          # answer extraction, grading, replay, aggregation
+  discovery-model
+    discovery.py          # Night Shift GGUF discovery, content-duplicate grouping
+    hardware.py           # platform and GPU assessment
+    model.py              # GGUF inspection and fingerprinting
+    llama.py              # llama.cpp binary discovery and capability probing
+  support
+    types.py              # frozen dataclasses shared by all modules
+    ui.py                 # ephemeral stderr progress renderers; no writes
+    sanitize.py           # output-boundary escaping for untrusted strings
+
 tests/
   conftest.py  fixtures/fake_llama_bench.py  unit/  integration/
 ```
 
-Layering rules: `types`/`config`/`stats` import nothing above stdlib;
-`bench` builds argv and parses bytes but never executes; `executor` executes
-but never parses benchmark semantics; only `session` writes inside the
-session directory; `ui` consumes ephemeral events and writes only stderr;
-`cli` contains no logic beyond argument handling and
-output formatting.
+Layering rules: `types`, `config`, and `stats` import nothing above stdlib.
+`bench` builds argv and parses bytes but never executes. `executor`
+executes but never parses benchmark semantics. Only `session` writes inside
+the session directory. `ui` consumes ephemeral events and writes only
+stderr. `sanitize` escapes model-controlled strings at report and terminal
+boundaries.
+
+The `cli` layer owns argument handling, output formatting, exit-code
+mapping, and command glue that connects commands to orchestrators.
+Business logic lives in orchestrator and engine modules, not in `cli`.
+`cli` defers heavy imports to command bodies so startup stays fast.
 
 ### 13.1 `types.py` dataclasses (frozen, slots, kw_only — exact fields)
 
@@ -596,7 +678,21 @@ output formatting.
 ### 13.3 Entry points (implemented by `search.py`)
 
 `run_tuning(session, hardware, model, llama, options) -> TuneOutcome` and
-`resume_tuning(session_dir) -> TuneOutcome`.
+`resume_tuning(session_dir, *, reporter: Reporter | None = None) ->
+TuneOutcome`. The optional `reporter` receives progress events during
+resume.
+
+### 13.4 Shared evidence services (`evidence.py`)
+
+Orchestrators share their evidence plumbing through one module.
+`evidence.py` provides `jsonable` conversion, `utc_iso` timestamps,
+`confined_path`, unique-directory creation with `CREATE_RETRIES` retries,
+journal reading, deadline resolution, the `EvidenceWriter`, and interrupt
+handlers. Journal reading follows the single corruption policy in §12:
+unparseable lines are skipped and reported as warnings. Naming is uniform:
+modules import `utc_iso` and `CREATE_RETRIES` from `evidence` instead of
+private copies. Every module imports `__version__` from
+`llamatune._version`. The package root re-exports it for callers.
 
 ## 14. Safety invariants
 

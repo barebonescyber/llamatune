@@ -5,9 +5,91 @@ All notable changes to llamatune will be documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and releases use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Tag spelling note
+
+Released tags use the spelling `v0.1.0-beta.N`. This equals the PEP 440 canonical
+spelling `0.1.0bN`. For example, tag `v0.1.0-beta.3` and version `0.1.0b3` name
+the same release.
+
 ## [Unreleased]
 
-No changes yet.
+### Added
+
+- A continuous-integration job that resolves the lowest allowed direct dependency
+  versions into a clean environment and smoke-tests the installed command line
+  against them (#16).
+- A `--version` flag, a stderr stream policy, remediation hints,
+  command-level exception containment, and `--verbose` diagnostics (#21).
+- Progress output for long-running orchestrators with `--progress`/`--quiet`
+  control (#25).
+- Regression tests for every bug found by the v0.1.0b2 audit (#18).
+
+### Changed
+
+- Explicit dependency floors: `typer>=0.16,<1` and `gguf>=0.18,<1`. Older typer
+  releases fail with current click releases, and older gguf releases either fail
+  to import or require an undeclared extra (#16).
+- The security audit workflow now runs its local dependency, source, and secret
+  audits on every push to main, every pull request, and a weekly schedule.
+  CodeQL runs by default on the schedule and on pushes to main. It stays opt-in
+  through manual dispatch elsewhere (#16).
+- Removed verified dead code across the package (#6).
+- Consolidated duplicated orchestration helpers into a shared `evidence.py`
+  module: journal reading, JSON conversion, path confinement, unique-directory
+  creation, deadline resolution, and interrupt handlers (#7).
+- Replaced clock monkey-patching, private executor API reuse, and loop-internal
+  imports with injected clocks, a public executor API (`spawn_supervised`), and
+  single-pass discovery (#14).
+- Memoized Marathon matrix context probes across depth cells (#15).
+- Decomposed the `run_nightshift`, `run_marathon`, `_Engine`, and
+  `_evaluate_http_side` complexity hotspots into phase units and helpers (#20).
+- Made the evidence pipeline incremental: ledgers, registry, matrix refresh,
+  tail reads, and coverage accounting prevent repeated full-journal parsing
+  (#22).
+- Added micro-optimizations: memoized trial ids, a precomputed prune index,
+  lazy candidate materialization, and linear Pareto passes (#26).
+- Rewrote DESIGN.md §13 as a complete module map, corrected the CLI boundary
+  statement, documented the current resume signature, and documented shared
+  evidence services and unified helper naming (#29).
+
+### Fixed
+
+- The `quality --exec` sandbox fails closed when network isolation is
+  unavailable instead of running model code with possible network egress (#5).
+- macOS sandboxes apply real memory limits and surface degraded limits as
+  warnings instead of skipping them silently (#28).
+- All journal readers share one tolerant corruption policy. Corrupt lines are
+  skipped and reported as recorded warnings, never silently truncated (#8).
+- Report and terminal boundaries escape Markdown-sensitive characters and strip
+  control characters from model-controlled strings (#9).
+- Night Shift maps each stop cause to its documented exit code (breaker 1,
+  interrupt 4) (#10).
+- Resume reuses journaled confirmation, CLI-validation, and quality-gate
+  results like the baseline and depth-profile phases (#17).
+- The local quality server requires authenticated loopback health checks and
+  closes the port-allocation race window (#12).
+- `recommended.sh` emits the complete tuned flag set, matching the flags
+  rendered in reports (#13).
+- CLI options follow one convention for `--ctx-size`, sessions arguments,
+  `--json` output, and exit codes (#19).
+- Every option carries help text, tables align on terminals, and experimental
+  surfaces carry labels (#23).
+- Config lines render tuned runtime flags once, without `None` placeholders
+  (#24).
+- Matrix queries rank rows with missing metrics as unknown rather than zero
+  (#27).
+- Calibration guards against zero reference scores in corrupt registry records
+  (#30).
+- MoE hill-climb patience counts only executed misses, so cached hits cannot
+  end the climb early (#31).
+- `scan` fails cleanly when llama-bench is missing, and table and version
+  surfaces match CLI conventions (#32).
+- Cross-module result dicts carry typed contracts, per-item handlers catch
+  only expected failures so programming errors surface instead of feeding
+  circuit breakers, and redundant exception tuples and casts are removed
+  (#11).
+- Quality-server API keys always start with a literal character so argparse
+  cannot read a hyphen-led key as an option flag.
 
 ## [0.1.0-beta.3] - 2026-08-01
 

@@ -86,7 +86,17 @@ def discover_llama(llama_bin: Path | None = None) -> LlamaCppReport:
     bench_path = _resolve_binary("llama-bench", llama_bin)
     if bench_path is None:
         location = str(llama_bin) if llama_bin is not None else "PATH"
-        msg = f"llama-bench not found in {location}"
+        if llama_bin is None:
+            msg = (
+                f"llama-bench not found in {location}. Install llama.cpp, or pass "
+                "--llama-bin DIR (the directory containing the binaries, "
+                "not the binary itself)."
+            )
+        else:
+            msg = (
+                f"llama-bench not found in {location}. Pass --llama-bin DIR as the "
+                "directory containing the binaries, not the binary itself."
+            )
         raise LlamaDiscoveryError(msg)
 
     cli_path = _resolve_binary("llama-cli", llama_bin)
@@ -99,7 +109,10 @@ def discover_llama(llama_bin: Path | None = None) -> LlamaCppReport:
         max_output_bytes=_HELP_MAX_BYTES,
     )
     if result is None or result.timed_out:
-        msg = f"failed to run '{bench_path} --help'"
+        msg = (
+            f"failed to run '{bench_path} --help'. Check that the file is executable, "
+            "or pass --llama-bin DIR (the directory containing the binaries)."
+        )
         raise LlamaDiscoveryError(msg)
 
     # Usage text normally goes to stdout; fall back to stderr for builds

@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from llamatune import matrix
+from llamatune import bench, matrix
 from llamatune.matrix import _fallbacks, _refinements, run_matrix
-from llamatune.types import LlamaCppReport, MarathonOptions, ModelReport, TrialConfig
+from llamatune.types import (
+    LlamaCppReport,
+    MarathonOptions,
+    MatrixCell,
+    ModelReport,
+    TrialConfig,
+)
 
 
 def config() -> TrialConfig:
@@ -247,3 +254,128 @@ def test_matrix_prunes_larger_context_after_all_placements_fail(
         remaining_minutes_fn=lambda: 60.0,
     )
     assert [row.status for row in rows] == ["failed", "pruned"]
+
+
+def _llama_report(tmp_path: Path) -> LlamaCppReport:
+    return LlamaCppReport(
+        bench_path=tmp_path / "bench",
+        cli_path=None,
+        server_path=None,
+        capabilities=frozenset({"d"}),
+        help_sha256="h",
+        build_commit=None,
+        build_number=None,
+        backends=None,
+    )
+
+
+def _probe_harness(
+    monkeypatch: pytest.MonkeyPatch, probe_results: list[tuple[float, float] | None]
+) -> Callable[[], int]:
+    real_build = bench.build_context_probe_argv
+    tagged: set[tuple[str, ...]] = set()
+    outcomes = iter(probe_results)
+    counts = {"probe": 0}
+
+    def counting_build(**kwargs: Any) -> tuple[str, ...]:
+        argv = real_build(**kwargs)
+        tagged.add(argv)
+        return argv
+
+    def fake_execute(
+        _run: Any, _directory: Path, argv: tuple[str, ...], _timeout: float
+    ) -> tuple[float, float] | None:
+        if argv not in tagged:
+            return (1.0, 1.0)
+        counts["probe"] += 1
+        return next(outcomes)
+
+    monkeypatch.setattr(bench, "build_context_probe_argv", counting_build)
+    monkeypatch.setattr(matrix, "_execute", fake_execute)
+    return lambda: counts["probe"]
+
+
+def test_probe_invocations_capped_at_context_count_and_rows_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    llama = _llama_report(tmp_path)
+    probe_count = _probe_harness(monkeypatch, probe_results=[(0.5, 0.5), (0.5, 0.5)])
+    reference = tuple(
+        MatrixCell(
+            ctx=ctx,
+            depth=depth,
+            status="ok",
+            config=config(),
+            pp=1.0,
+            tg=1.0,
+            refined=False,
+            evidence=tmp_path / f"{ctx}-{depth}-None",
+        )
+        for ctx in (8192, 16384)
+        for depth in (0, 8192)
+    )
+    run = Run(tmp_path)
+    rows = run_matrix(
+        run,
+        config(),
+        model(tmp_path),
+        llama,
+        options(tmp_path),
+        remaining_minutes_fn=lambda: 60.0,
+    )
+    assert probe_count() == 2
+    assert probe_count() <= len({(config().trial_id, ctx) for ctx in (8192, 16384)})
+    assert rows == reference
+    assert [(entry["type"], entry.get("reused", False)) for entry in run.entries] == [
+        ("matrix_cell", False)
+    ] * 4
+    assert (tmp_path / "8192-0--1").is_dir()
+    assert not (tmp_path / "8192-8192--1").exists()
+    assert (tmp_path / "16384-0--1").is_dir()
+    assert not (tmp_path / "16384-8192--1").exists()
+
+
+def test_failed_fallback_verdicts_cached_across_depth_cells(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    llama = _llama_report(tmp_path)
+    ladder = _fallbacks(config(), model(tmp_path))
+    probe_count = _probe_harness(monkeypatch, probe_results=[None, None, (0.5, 0.5)])
+    opts = dataclasses.replace(options(tmp_path), ctx_ladder=())
+    rows = run_matrix(
+        Run(tmp_path),
+        config(),
+        model(tmp_path),
+        llama,
+        opts,
+        remaining_minutes_fn=lambda: 60.0,
+    )
+    assert probe_count() == 3
+    assert probe_count() <= 1 + len(ladder)
+    assert [(row.depth, row.status, row.config, row.pp, row.tg, row.refined) for row in rows] == [
+        (0, "ok", ladder[1], 1.0, 1.0, False),
+        (8192, "ok", ladder[1], 1.0, 1.0, False),
+    ]
+    assert (tmp_path / "8192-0--2").is_dir()
+    assert (tmp_path / "8192-0--3").is_dir()
+    assert not (tmp_path / "8192-8192--2").exists()
+    assert not (tmp_path / "8192-8192--3").exists()
+
+
+def test_exhausted_ladder_probes_once_per_context_across_depths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    llama = _llama_report(tmp_path)
+    ladder = _fallbacks(config(), model(tmp_path))
+    probe_count = _probe_harness(monkeypatch, probe_results=[None] * (1 + 2 * len(ladder)))
+    rows = run_matrix(
+        Run(tmp_path),
+        config(),
+        model(tmp_path),
+        llama,
+        options(tmp_path),
+        remaining_minutes_fn=lambda: 60.0,
+    )
+    assert probe_count() == 1 + 2 * len(ladder)
+    assert [row.status for row in rows] == ["failed", "failed", "pruned", "pruned"]
+    assert all(row.config is None and row.pp is None and row.tg is None for row in rows)

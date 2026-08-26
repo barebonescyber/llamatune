@@ -5,9 +5,11 @@ from pathlib import Path
 
 import pytest
 
+from llamatune.evidence import InterruptState
 from llamatune.nightshift import (
     NightshiftPathError,
     NightshiftRun,
+    _ShiftState,
     build_initial_plan,
     deepen_order,
     deepening_changes_profile,
@@ -18,6 +20,8 @@ from llamatune.nightshift import (
 )
 from llamatune.types import (
     DiscoveredModel,
+    HardwareReport,
+    LlamaCppReport,
     ModelReport,
     NightshiftOptions,
     RegistryRecord,
@@ -195,3 +199,116 @@ def test_writer_rejects_traversal(tmp_path: Path) -> None:
     run = NightshiftRun.load(run_dir)
     with pytest.raises(NightshiftPathError):
         run.write_text("../escape", "bad")
+
+
+def _hardware_report() -> HardwareReport:
+    return HardwareReport(
+        os_name="test",
+        arch="x86_64",
+        cpu_model="c",
+        physical_cores=1,
+        logical_cores=1,
+        perf_cores=None,
+        ram_mb=64,
+        gpus=(),
+        warnings=(),
+    )
+
+
+def _llama_report(tmp_path: Path) -> LlamaCppReport:
+    return LlamaCppReport(
+        bench_path=tmp_path / "llama-bench",
+        cli_path=None,
+        server_path=None,
+        capabilities=frozenset(),
+        help_sha256="h" * 64,
+        build_commit=None,
+        build_number=None,
+    )
+
+
+def _tune_class_harness(
+    tmp_path: Path,
+) -> tuple[NightshiftRun, _ShiftState, InterruptState]:
+    """Return (run, state, interrupt_state) for per-item helper tests."""
+    run = NightshiftRun.create(
+        tmp_path / "sessions",
+        options=_options(tmp_path),
+        hardware=_hardware_report(),
+        llama=_llama_report(tmp_path),
+        argv=["llamatune", "nightshift"],
+    )
+    return run, _ShiftState(), InterruptState()
+
+
+def test_missing_fingerprint_records_error_without_feeding_breaker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plan item whose fingerprint is undiscovered is an 'error', not a model failure."""
+    from llamatune.nightshift import _run_tune_class_item
+
+    run, state, interrupt_state = _tune_class_harness(tmp_path)
+    item = WorkItem(
+        kind="tune",
+        model_path=tmp_path / "ghost.gguf",
+        fingerprint="f" * 64,
+        session_dir=None,
+        reference_fingerprint=None,
+        estimated_minutes=None,
+        reason="no completed session",
+    )
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", _hardware_report)
+
+    def fail_execution(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("execution must not be attempted for an unknown fingerprint")
+
+    monkeypatch.setattr("llamatune.search.run_tuning", fail_execution)
+
+    record, post_records, transfers = _run_tune_class_item(
+        run,
+        state,
+        item,
+        options=_options(tmp_path),
+        models=(),
+        by_fingerprint={},
+        records={},
+        llama=_llama_report(tmp_path),
+        reporter=None,
+        remaining=None,
+        interrupt_state=interrupt_state,
+    )
+
+    assert record["outcome"] == "error"
+    assert "plan invariant violated" in str(record.get("error"))
+    assert post_records == []
+    assert transfers == []
+    # The breaker history must be untouched by programming errors (#11).
+    assert state.tune_failure_models == []
+
+
+def test_summary_counts_accept_typed_item_summaries() -> None:
+    """TypedDict migration spot-check: counters consume NightshiftItemSummary."""
+    from llamatune.nightshift import _summary_counts, _total_invocations
+    from llamatune.types import NightshiftItemSummary
+
+    items: list[NightshiftItemSummary] = [
+        NightshiftItemSummary(
+            kind="tune",
+            model_path=None,
+            fingerprint="a" * 64,
+            reference_fingerprint=None,
+            reason="r",
+            outcome="succeeded",
+        ),
+        NightshiftItemSummary(
+            kind="calibrate",
+            model_path=None,
+            fingerprint="b" * 64,
+            reference_fingerprint=None,
+            reason="r",
+            outcome="failed",
+            calibration={"runs": 3},
+        ),
+    ]
+    assert _summary_counts(items) == {"tune:succeeded": 1, "calibrate:failed": 1}
+    assert _total_invocations(items) == 3

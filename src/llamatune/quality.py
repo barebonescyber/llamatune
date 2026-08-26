@@ -5,65 +5,84 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import fnmatch
+import hashlib
 import importlib
 import json
 import math
-import os
 import re
-import secrets
 import signal
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Self, cast
 
-from llamatune import __version__, executor
+# The sandbox module is called through its module object so substitution of
+# ``sandbox.run_python`` / ``sandbox.describe_isolation`` remains possible;
+# only --exec paths touch it at runtime.
+from llamatune import executor, sandbox
+from llamatune._version import __version__
+from llamatune.bench import build_perplexity_argv, parse_perplexity_output
 from llamatune.config import hardware_signature
+from llamatune.evidence import (
+    EvidenceWriter,
+    PathEscapeError,
+    confined_path,
+    create_unique_dir,
+)
+from llamatune.evidence import (
+    jsonable as _jsonable,
+)
+from llamatune.evidence import (
+    utc_iso as _utc_now,
+)
 from llamatune.hardware import assess_hardware
 from llamatune.llama import LlamaDiscoveryError, discover_llama
 from llamatune.model import ModelInspectionError, inspect_model
+from llamatune.qualityreport import render as _render_report
+from llamatune.qualscore import (
+    aggregate,
+    combine_repetitions,
+    extract_call,
+    grade_task,
+    replay_agentic,
+)
 from llamatune.qualserver import (
+    REAL_TIMING,
+    ServerError,
     ServerHandle,
     ServerProtocolError,
     ServerStartError,
     ServerUnavailableError,
+    Timing,
     start,
 )
 from llamatune.qualsuites import SuiteSpec, build_haystack, load_suite
+from llamatune.registry import lookup
+from llamatune.sanitize import strip_control_chars
 from llamatune.types import (
     HardwareReport,
     LlamaCppReport,
     ModelReport,
+    ProgressEvent,
     QualityOptions,
     QualityOutcome,
+    Reporter,
     SuiteResult,
     TaskGrade,
     TrialConfig,
 )
 
 _SCHEMA_VERSION = 1
-_CREATE_RETRIES = 10
 _SAFE_COMPONENT = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
-def _utc_now() -> str:
-    return datetime.now(UTC).isoformat()
+class QualityPathError(PathEscapeError, ValueError):
+    """A quality artifact path escaped its run directory (also a ValueError)."""
 
 
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, frozenset):
-        return sorted(value)
-    if isinstance(value, tuple):
-        return [_jsonable(item) for item in value]
-    if isinstance(value, list):
-        return [_jsonable(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    return value
+def _confine(root: Path, *parts: str) -> Path:
+    return confined_path(root, *parts, error=QualityPathError)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -73,22 +92,12 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _confine(root: Path, *parts: str) -> Path:
-    resolved = root.resolve()
-    target = resolved.joinpath(*parts).resolve()
-    if target != resolved and resolved not in target.parents:
-        raise ValueError(f"quality path escapes run directory: {'/'.join(parts)}")
-    return target
-
-
 def _component(value: str) -> str:
     safe = _SAFE_COMPONENT.sub("_", value).strip("._")
     if not safe:
         safe = "item"
     if safe == value:
         return safe
-    import hashlib
-
     return f"{safe}-{hashlib.sha256(value.encode()).hexdigest()[:8]}"
 
 
@@ -123,8 +132,10 @@ def _options_from_dict(value: dict[str, Any]) -> QualityOptions:
     )
 
 
-class QualityRun:
+class QualityRun(EvidenceWriter):
     """Sole writer for one path-confined quality evidence directory."""
+
+    path_error: type[PathEscapeError] = QualityPathError
 
     def __init__(
         self,
@@ -170,19 +181,7 @@ class QualityRun:
         argv: list[str],
     ) -> Self:
         root = sessions_dir.resolve() / "quality"
-        root.mkdir(parents=True, exist_ok=True)
-        run_dir: Path | None = None
-        for _ in range(_CREATE_RETRIES):
-            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-            candidate = root / f"{_component(model.path.stem)}-{stamp}-{secrets.token_hex(3)}"
-            try:
-                candidate.mkdir(exist_ok=False)
-            except FileExistsError:
-                continue
-            run_dir = candidate
-            break
-        if run_dir is None:
-            raise OSError(f"could not allocate a quality run under {root}")
+        run_dir = create_unique_dir(root, _component(model.path.stem), error=OSError)
         created = _utc_now()
         metadata = {
             "schema_version": _SCHEMA_VERSION,
@@ -237,13 +236,8 @@ class QualityRun:
         self.write_json("run.json", self._metadata)
 
     def append(self, entry: dict[str, Any]) -> None:
-        record = _jsonable(dict(entry))
-        record.setdefault("ts", _utc_now())
-        path = _confine(self.dir, "journal.jsonl")
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        record = self._journal_record(entry)
+        self._append_record(record)
         self._entries.append(record)
 
     def task_dir(self, suite: str, task_id: str, rep: int, side: str) -> Path:
@@ -273,19 +267,6 @@ class QualityRun:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def write_json(self, name: str, payload: dict[str, Any]) -> None:
-        path = _confine(self.dir, name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(_jsonable(payload), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-
-    def write_text(self, name: str, text: str) -> None:
-        path = _confine(self.dir, name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
-
 
 @dataclass(frozen=True, slots=True)
 class _Resolved:
@@ -303,6 +284,27 @@ class _Resolved:
 
 class _ForcedInterrupt(BaseException):
     pass
+
+
+class _RunTiming:
+    """Virtual-time :class:`Timing` driven by an injected test clock.
+
+    ``monotonic`` reads the injected tick; ``sleep`` advances a virtual offset
+    instead of blocking the real event loop, so readiness polling consumes
+    simulated time deterministically.
+    """
+
+    __slots__ = ("_offset", "_tick")
+
+    def __init__(self, tick: Callable[[], float]) -> None:
+        self._tick = tick
+        self._offset = 0.0
+
+    def monotonic(self) -> float:
+        return self._tick() + self._offset
+
+    def sleep(self, seconds: float) -> None:
+        self._offset += max(0.0, seconds)
 
 
 @dataclass(slots=True)
@@ -412,8 +414,6 @@ def _resolve_config(
         )
     if options.config_mode != "best":
         raise ValueError(f"unknown config mode: {options.config_mode}")
-    from llamatune.registry import lookup
-
     result = lookup(
         options.sessions_dir / "registry.jsonl",
         model,
@@ -552,7 +552,7 @@ def _grade_dict(grade: TaskGrade) -> dict[str, Any]:
         "id": grade.task_id,
         "score": grade.score,
         "status": grade.status,
-        "reason": grade.reason,
+        "reason": strip_control_chars(grade.reason) if grade.reason is not None else None,
         "unstable": grade.unstable,
         "graders": list(grade.grader_results),
     }
@@ -680,7 +680,7 @@ def _chat(
             seed=seed,
             timeout_s=timeout_s,
         )
-    except Exception as exc:
+    except (ServerError, OSError) as exc:
         run.write_json(str(relative / f"response-{turn}.json"), {"error": str(exc)})
         raise
     run.write_json(str(relative / f"response-{turn}.json"), {"content": response})
@@ -721,8 +721,6 @@ def _drive_task(
                 messages.append({"role": "assistant", "content": response})
                 turn_number += 1
             elif "tool_result" in step:
-                from llamatune.qualscore import extract_call
-
                 call = extract_call(responses[-1]) if responses else None
                 expected = step.get("expect", {})
                 expected_tool = expected.get("tool") if isinstance(expected, dict) else None
@@ -766,8 +764,6 @@ def _drive_task(
         responses.append(response)
         if suite.kind != "agentic":
             break
-        from llamatune.qualscore import replay_agentic
-
         replay = replay_agentic(task, tuple(responses))
         if replay.get("done"):
             break
@@ -781,7 +777,7 @@ def _error_grade(task_id: str, reason: str) -> TaskGrade:
         task_id=task_id,
         score=0.0,
         status="error",
-        reason=reason,
+        reason=strip_control_chars(reason),
         unstable=False,
         grader_results=(),
     )
@@ -792,7 +788,7 @@ def _skipped_grade(task_id: str, reason: str) -> TaskGrade:
         task_id=task_id,
         score=0.0,
         status="skipped",
-        reason=reason,
+        reason=strip_control_chars(reason),
         unstable=False,
         grader_results=(),
     )
@@ -821,14 +817,389 @@ def _record_grade(
     )
 
 
-def _launch(run: QualityRun, argv: tuple[str, ...], timeout_s: float) -> ServerHandle:
+def _launch(
+    run: QualityRun,
+    argv: tuple[str, ...],
+    timeout_s: float,
+    timing: Timing,
+) -> ServerHandle:
     errors: list[str] = []
     for _ in range(2):
         try:
-            return start(run, argv, start_timeout_s=timeout_s)
+            return start(run, argv, start_timeout_s=timeout_s, timing=timing)
         except ServerStartError as exc:
             errors.append(str(exc))
     raise ServerStartError("; ".join(errors))
+
+
+def _announce_task(
+    reporter: Reporter | None,
+    message: str,
+    payload: dict[str, Any],
+) -> None:
+    """Emit one concise task-level progress line for interactive reporters."""
+    if reporter is None:
+        return
+    message = strip_control_chars(message)
+    reporter.emit(
+        ProgressEvent(
+            kind="quality_task",
+            ts=_utc_now(),
+            payload={"message": message, **payload},
+        )
+    )
+    from llamatune import ui
+
+    if isinstance(reporter, ui.PlainReporter):
+        reporter.err.write(message + "\n")
+        reporter.err.flush()
+
+
+class _ServerSession:
+    """Owns the llama-server handle lifecycle for one HTTP evaluation side."""
+
+    __slots__ = ("_config", "_resolved", "_run", "_signals", "_timing", "handle")
+
+    def __init__(
+        self,
+        run: QualityRun,
+        resolved: _Resolved,
+        config: TrialConfig | None,
+        timing: Timing,
+        signals: _SignalState,
+    ) -> None:
+        self._run = run
+        self._resolved = resolved
+        self._config = config
+        self._timing = timing
+        self._signals = signals
+        self.handle: ServerHandle | None = None
+
+    def launch(self) -> ServerHandle:
+        """Start the server (two attempts), registering it for signal cleanup."""
+        self.handle = _launch(
+            self._run,
+            _server_argv(self._resolved, self._config),
+            self._resolved.options.server_start_timeout_s,
+            self._timing,
+        )
+        self._signals.handle = self.handle
+        return self.handle
+
+    def relaunch(self) -> bool:
+        """Restart after a crash (single attempt); False when it fails."""
+        try:
+            self.handle = start(
+                self._run,
+                _server_argv(self._resolved, self._config),
+                start_timeout_s=self._resolved.options.server_start_timeout_s,
+                timing=self._timing,
+            )
+        except ServerStartError:
+            return False
+        self._signals.handle = self.handle
+        return True
+
+    def stop(self) -> None:
+        """Stop the server if running and clear signal registration."""
+        if self.handle is not None:
+            self.handle.stop()
+            self.handle = None
+        self._signals.handle = None
+
+
+@dataclasses.dataclass
+class _TaskProgress:
+    """Shared per-side announcement counters across suites and tasks."""
+
+    total: int
+    announced: int = 0
+    keys: set[tuple[str, str]] = dataclasses.field(default_factory=set)
+
+    def announce(
+        self,
+        reporter: Reporter | None,
+        side: str,
+        suite_id: str,
+        task_id: str,
+    ) -> None:
+        """Announce a task the first time any of its repetitions will run."""
+        if (suite_id, task_id) in self.keys:
+            return
+        self.keys.add((suite_id, task_id))
+        self.announced += 1
+        _announce_task(
+            reporter,
+            f"[quality] {side} task {self.announced}/{self.total} {task_id} ({suite_id})",
+            {
+                "side": side,
+                "suite_id": suite_id,
+                "task_id": task_id,
+                "index": self.announced,
+                "total": self.total,
+            },
+        )
+
+
+def _side_progress(
+    suites: Sequence[SuiteSpec],
+    options: QualityOptions,
+    side: str,
+    prior: dict[tuple[str, str, int, str], TaskGrade],
+) -> tuple[_TaskProgress, bool]:
+    """Count pending tasks on one side and report whether any exist."""
+    selected_ids = {
+        (suite.suite_id, str(task["id"]))
+        for suite in suites
+        for task in suite.tasks
+        if _task_selected(str(task["id"]), options.task_filters)
+    }
+    total_tasks = sum(
+        1
+        for suite_id, task_id in selected_ids
+        if any(
+            _task_key(suite_id, task_id, rep, side) not in prior
+            for rep in range(1, options.reps + 1)
+        )
+    )
+    pending = any(
+        _task_selected(str(task["id"]), options.task_filters)
+        and any(
+            _task_key(suite.suite_id, str(task["id"]), rep, side) not in prior
+            for rep in range(1, options.reps + 1)
+        )
+        for suite in suites
+        for task in suite.tasks
+    )
+    return _TaskProgress(total=total_tasks), pending
+
+
+def grade_one_task(
+    run: QualityRun,
+    resolved: _Resolved,
+    suite: SuiteSpec,
+    task: dict[str, Any],
+    side: str,
+    prior: dict[tuple[str, str, int, str], TaskGrade],
+    signals: _SignalState,
+    session: _ServerSession,
+    progress: _TaskProgress,
+    reporter: Reporter | None,
+    relaunch_used: bool,
+) -> tuple[list[TaskGrade], bool, bool, bool]:
+    """Grade every pending repetition of one task against the live server.
+
+    Returns ``(rep_grades, harness_error, abort, relaunch_used)``.
+    """
+    task_id = str(task["id"])
+    rep_grades: list[TaskGrade] = []
+    deferred_exec: list[tuple[int, tuple[str, str, int, str], tuple[str, ...]]] = []
+    needs_exec = resolved.options.exec_enabled and any(
+        isinstance(grader, dict) and grader.get("type") == "exec_python"
+        for grader in task.get("graders", ())
+    )
+    harness_error = False
+    abort = False
+    for rep in range(1, resolved.options.reps + 1):
+        key = _task_key(suite.suite_id, task_id, rep, side)
+        if key in prior:
+            rep_grades.append(prior[key])
+            continue
+        progress.announce(reporter, side, suite.suite_id, task_id)
+        run.append(
+            {
+                "type": "task_start",
+                "suite_id": suite.suite_id,
+                "task_id": task_id,
+                "rep": rep,
+                "side": side,
+            }
+        )
+        ctx_min = task.get("ctx_min")
+        if isinstance(ctx_min, int) and resolved.options.ctx_size < ctx_min:
+            grade = _skipped_grade(
+                task_id,
+                f"ctx_size {resolved.options.ctx_size} is below ctx_min {ctx_min}",
+            )
+            _record_grade(run, suite, task_id, rep, side, grade)
+            prior[key] = grade
+            rep_grades.append(grade)
+            continue
+        current_grade: TaskGrade | None = None
+        while True:
+            try:
+                handle = session.handle if session.handle is not None else session.launch()
+                responses = _drive_task(
+                    run,
+                    handle,
+                    suite,
+                    task,
+                    rep,
+                    side,
+                    resolved.options,
+                )
+                if needs_exec:
+                    deferred_exec.append((rep, key, responses))
+                else:
+                    current_grade = grade_task(task, responses, None)
+            except ServerUnavailableError as exc:
+                run.append(
+                    {
+                        "type": "server_exit",
+                        "suite_id": suite.suite_id,
+                        "reason": strip_control_chars(str(exc)),
+                        "stderr_tail": (
+                            strip_control_chars(session.handle.stderr_tail)
+                            if session.handle
+                            else ""
+                        ),
+                    }
+                )
+                session.stop()
+                if relaunch_used:
+                    current_grade = _error_grade(task_id, "server_unavailable")
+                    harness_error = True
+                    abort = True
+                    break
+                relaunch_used = True
+                if not session.relaunch():
+                    current_grade = _error_grade(task_id, "server_unavailable")
+                    harness_error = True
+                    abort = True
+                    break
+                continue
+            except (ServerProtocolError, OSError, ValueError) as exc:
+                current_grade = _error_grade(task_id, str(exc))
+                harness_error = True
+            break
+        if current_grade is not None:
+            _record_grade(run, suite, task_id, rep, side, current_grade)
+            prior[key] = current_grade
+            rep_grades.append(current_grade)
+        if abort:
+            break
+        if signals.stop_requested:
+            break
+    if abort:
+        deferred_exec.clear()
+        for remaining_rep in range(1, resolved.options.reps + 1):
+            remaining_key = _task_key(suite.suite_id, task_id, remaining_rep, side)
+            if remaining_key in prior:
+                continue
+            grade = _error_grade(task_id, "server_unavailable")
+            _record_grade(run, suite, task_id, remaining_rep, side, grade)
+            prior[remaining_key] = grade
+        rep_grades = [
+            prior[_task_key(suite.suite_id, task_id, rep, side)]
+            for rep in range(1, resolved.options.reps + 1)
+        ]
+    if deferred_exec and not abort:
+        session.stop()
+
+        def exec_runner(code: str) -> Any:
+            return sandbox.run_python(
+                code,
+                timeout_s=resolved.options.request_timeout_s,
+            )
+
+        for rep, key, responses in deferred_exec:
+            try:
+                grade = grade_task(task, responses, exec_runner)
+            except (OSError, RuntimeError, ValueError) as exc:
+                grade = _error_grade(task_id, str(exc))
+                harness_error = True
+            _record_grade(run, suite, task_id, rep, side, grade)
+            prior[key] = grade
+            rep_grades.append(grade)
+    return rep_grades, harness_error, abort, relaunch_used
+
+
+def _evaluate_suite(
+    run: QualityRun,
+    resolved: _Resolved,
+    suite: SuiteSpec,
+    side: str,
+    prior: dict[tuple[str, str, int, str], TaskGrade],
+    signals: _SignalState,
+    session: _ServerSession,
+    progress: _TaskProgress,
+    reporter: Reporter | None,
+) -> tuple[SuiteResult, bool, bool]:
+    """Evaluate one suite on one side; returns (result, harness_error, abort)."""
+    grades: list[TaskGrade] = []
+    relaunch_used = False
+    harness_error = False
+    abort = False
+    tasks = [
+        task
+        for task in suite.tasks
+        if _task_selected(str(task["id"]), resolved.options.task_filters)
+    ]
+    for task_index, task in enumerate(tasks):
+        rep_grades, task_harness_error, abort, relaunch_used = grade_one_task(
+            run,
+            resolved,
+            suite,
+            task,
+            side,
+            prior,
+            signals,
+            session,
+            progress,
+            reporter,
+            relaunch_used,
+        )
+        harness_error = harness_error or task_harness_error
+        if rep_grades:
+            grades.append(combine_repetitions(tuple(rep_grades)))
+        if abort or signals.stop_requested:
+            if abort:
+                for remaining in tasks[task_index + 1 :]:
+                    remaining_id = str(remaining["id"])
+                    remaining_grades: list[TaskGrade] = []
+                    for remaining_rep in range(1, resolved.options.reps + 1):
+                        remaining_key = _task_key(
+                            suite.suite_id,
+                            remaining_id,
+                            remaining_rep,
+                            side,
+                        )
+                        remaining_grade = prior.get(remaining_key)
+                        if remaining_grade is None:
+                            remaining_grade = _error_grade(remaining_id, "server_unavailable")
+                            _record_grade(
+                                run,
+                                suite,
+                                remaining_id,
+                                remaining_rep,
+                                side,
+                                remaining_grade,
+                            )
+                            prior[remaining_key] = remaining_grade
+                        remaining_grades.append(remaining_grade)
+                    grades.append(combine_repetitions(tuple(remaining_grades)))
+            break
+    metrics = aggregate(
+        suite.kind,
+        tuple(grades),
+        exec_enabled=resolved.options.exec_enabled,
+    )
+    result = SuiteResult(
+        suite_id=suite.suite_id,
+        name=suite.name,
+        kind=suite.kind,
+        metrics=metrics,
+        tasks=tuple(grades),
+    )
+    run.append(
+        {
+            "type": "suite_summary",
+            "side": side,
+            "suite_id": suite.suite_id,
+            "metrics": metrics,
+        }
+    )
+    return result, harness_error, abort
 
 
 def _evaluate_http_side(
@@ -838,233 +1209,32 @@ def _evaluate_http_side(
     side: str,
     prior: dict[tuple[str, str, int, str], TaskGrade],
     signals: _SignalState,
+    timing: Timing,
+    reporter: Reporter | None = None,
 ) -> tuple[tuple[SuiteResult, ...], bool, bool]:
-    from llamatune.qualscore import aggregate, combine_repetitions, grade_task
-
     suites = tuple(suite for suite in resolved.suites if suite.kind != "perplexity")
     if not suites:
         return (), False, False
-    pending = any(
-        _task_selected(str(task["id"]), resolved.options.task_filters)
-        and any(
-            _task_key(suite.suite_id, str(task["id"]), rep, side) not in prior
-            for rep in range(1, resolved.options.reps + 1)
-        )
-        for suite in suites
-        for task in suite.tasks
-    )
-    handle: ServerHandle | None = None
+    progress, pending = _side_progress(suites, resolved.options, side, prior)
+    session = _ServerSession(run, resolved, config, timing, signals)
     results: list[SuiteResult] = []
     harness_error = False
     abort = False
     try:
         if pending:
-            handle = _launch(
-                run,
-                _server_argv(resolved, config),
-                resolved.options.server_start_timeout_s,
-            )
-            signals.handle = handle
+            session.launch()
         for suite in suites:
-            grades: list[TaskGrade] = []
-            relaunch_used = False
-            tasks = [
-                task
-                for task in suite.tasks
-                if _task_selected(str(task["id"]), resolved.options.task_filters)
-            ]
-            for task_index, task in enumerate(tasks):
-                task_id = str(task["id"])
-                rep_grades: list[TaskGrade] = []
-                deferred_exec: list[tuple[int, tuple[str, str, int, str], tuple[str, ...]]] = []
-                needs_exec = resolved.options.exec_enabled and any(
-                    isinstance(grader, dict) and grader.get("type") == "exec_python"
-                    for grader in task.get("graders", ())
-                )
-                for rep in range(1, resolved.options.reps + 1):
-                    key = _task_key(suite.suite_id, task_id, rep, side)
-                    if key in prior:
-                        rep_grades.append(prior[key])
-                        continue
-                    run.append(
-                        {
-                            "type": "task_start",
-                            "suite_id": suite.suite_id,
-                            "task_id": task_id,
-                            "rep": rep,
-                            "side": side,
-                        }
-                    )
-                    ctx_min = task.get("ctx_min")
-                    if isinstance(ctx_min, int) and resolved.options.ctx_size < ctx_min:
-                        grade = _skipped_grade(
-                            task_id,
-                            f"ctx_size {resolved.options.ctx_size} is below ctx_min {ctx_min}",
-                        )
-                        _record_grade(run, suite, task_id, rep, side, grade)
-                        prior[key] = grade
-                        rep_grades.append(grade)
-                        continue
-                    current_grade: TaskGrade | None = None
-                    while True:
-                        try:
-                            if handle is None:
-                                handle = _launch(
-                                    run,
-                                    _server_argv(resolved, config),
-                                    resolved.options.server_start_timeout_s,
-                                )
-                                signals.handle = handle
-                            responses = _drive_task(
-                                run,
-                                handle,
-                                suite,
-                                task,
-                                rep,
-                                side,
-                                resolved.options,
-                            )
-                            if needs_exec:
-                                deferred_exec.append((rep, key, responses))
-                            else:
-                                current_grade = grade_task(task, responses, None)
-                        except ServerUnavailableError as exc:
-                            run.append(
-                                {
-                                    "type": "server_exit",
-                                    "suite_id": suite.suite_id,
-                                    "reason": str(exc),
-                                    "stderr_tail": handle.stderr_tail if handle else "",
-                                }
-                            )
-                            if handle is not None:
-                                handle.stop()
-                                handle = None
-                                signals.handle = None
-                            if relaunch_used:
-                                current_grade = _error_grade(task_id, "server_unavailable")
-                                harness_error = True
-                                abort = True
-                                break
-                            relaunch_used = True
-                            try:
-                                handle = start(
-                                    run,
-                                    _server_argv(resolved, config),
-                                    start_timeout_s=resolved.options.server_start_timeout_s,
-                                )
-                                signals.handle = handle
-                            except ServerStartError:
-                                current_grade = _error_grade(task_id, "server_unavailable")
-                                harness_error = True
-                                abort = True
-                                break
-                            continue
-                        except (ServerProtocolError, OSError, ValueError) as exc:
-                            current_grade = _error_grade(task_id, str(exc))
-                            harness_error = True
-                        break
-                    if current_grade is not None:
-                        _record_grade(run, suite, task_id, rep, side, current_grade)
-                        prior[key] = current_grade
-                        rep_grades.append(current_grade)
-                    if abort:
-                        break
-                    if signals.stop_requested:
-                        break
-                if abort:
-                    deferred_exec.clear()
-                    for remaining_rep in range(1, resolved.options.reps + 1):
-                        remaining_key = _task_key(suite.suite_id, task_id, remaining_rep, side)
-                        if remaining_key in prior:
-                            continue
-                        grade = _error_grade(task_id, "server_unavailable")
-                        _record_grade(run, suite, task_id, remaining_rep, side, grade)
-                        prior[remaining_key] = grade
-                    rep_grades = [
-                        prior[_task_key(suite.suite_id, task_id, rep, side)]
-                        for rep in range(1, resolved.options.reps + 1)
-                    ]
-                if deferred_exec and not abort:
-                    if handle is not None:
-                        handle.stop()
-                        handle = None
-                        signals.handle = None
-                    from llamatune.sandbox import run_python
-
-                    def exec_runner(code: str) -> Any:
-                        return run_python(
-                            code,
-                            timeout_s=resolved.options.request_timeout_s,
-                        )
-
-                    for rep, key, responses in deferred_exec:
-                        try:
-                            grade = grade_task(task, responses, exec_runner)
-                        except (OSError, RuntimeError, ValueError) as exc:
-                            grade = _error_grade(task_id, str(exc))
-                            harness_error = True
-                        _record_grade(run, suite, task_id, rep, side, grade)
-                        prior[key] = grade
-                        rep_grades.append(grade)
-                if rep_grades:
-                    grades.append(combine_repetitions(tuple(rep_grades)))
-                if abort or signals.stop_requested:
-                    if abort:
-                        for remaining in tasks[task_index + 1 :]:
-                            remaining_id = str(remaining["id"])
-                            remaining_grades: list[TaskGrade] = []
-                            for remaining_rep in range(1, resolved.options.reps + 1):
-                                remaining_key = _task_key(
-                                    suite.suite_id,
-                                    remaining_id,
-                                    remaining_rep,
-                                    side,
-                                )
-                                remaining_grade = prior.get(remaining_key)
-                                if remaining_grade is None:
-                                    remaining_grade = _error_grade(
-                                        remaining_id, "server_unavailable"
-                                    )
-                                    _record_grade(
-                                        run,
-                                        suite,
-                                        remaining_id,
-                                        remaining_rep,
-                                        side,
-                                        remaining_grade,
-                                    )
-                                    prior[remaining_key] = remaining_grade
-                                remaining_grades.append(remaining_grade)
-                            grades.append(combine_repetitions(tuple(remaining_grades)))
-                    break
-            metrics = aggregate(
-                suite.kind,
-                tuple(grades),
-                exec_enabled=resolved.options.exec_enabled,
-            )
-            result = SuiteResult(
-                suite_id=suite.suite_id,
-                name=suite.name,
-                kind=suite.kind,
-                metrics=metrics,
-                tasks=tuple(grades),
+            result, suite_harness_error, suite_abort = _evaluate_suite(
+                run, resolved, suite, side, prior, signals, session, progress, reporter
             )
             results.append(result)
-            run.append(
-                {
-                    "type": "suite_summary",
-                    "side": side,
-                    "suite_id": suite.suite_id,
-                    "metrics": metrics,
-                }
-            )
+            harness_error = harness_error or suite_harness_error
+            if suite_abort:
+                abort = True
             if abort or signals.stop_requested:
                 break
     finally:
-        if handle is not None:
-            handle.stop()
-        signals.handle = None
+        session.stop()
     return tuple(results), harness_error, abort
 
 
@@ -1080,8 +1250,6 @@ def _perplexity_result(
     if resolved.llama.perplexity_path is None or resolved.options.quality_corpus is None:
         raise RuntimeError("perplexity suite was not fully resolved")
     directory = run.perplexity_dir(side)
-    from llamatune.bench import build_perplexity_argv, parse_perplexity_output
-
     argv = build_perplexity_argv(
         perplexity_path=resolved.llama.perplexity_path,
         model_path=resolved.model.path,
@@ -1185,9 +1353,10 @@ def _summary(
     evaluated: tuple[SuiteResult, ...],
     comparison: dict[str, Any] | None,
     warnings: Sequence[str],
+    exec_isolation: str | None = None,
 ) -> dict[str, Any]:
     scores = [suite.metrics["score"] for suite in evaluated if "score" in suite.metrics]
-    return {
+    summary = {
         "schema_version": _SCHEMA_VERSION,
         "run_dir": str(run.dir),
         "created": str(run.metadata["created"]),
@@ -1215,19 +1384,20 @@ def _summary(
         "suites": [_suite_dict(suite) for suite in evaluated],
         "overall": sum(scores) / len(scores) if scores else 0.0,
         "comparison": comparison,
-        "warnings": list(warnings),
+        "warnings": [strip_control_chars(warning) for warning in warnings],
     }
+    if exec_isolation is not None:
+        summary["exec_isolation"] = exec_isolation
+    return summary
 
 
-def _refresh_matrix(root: Path) -> None:
+def _refresh_matrix(root: Path, exit_code: int) -> None:
     try:
         module = importlib.import_module("llamatune.resultsmatrix")
     except ImportError:
         return
-    try:
+    if exit_code in module.REFRESH_EXIT_CODES:
         module.refresh(root)
-    except Exception as exc:  # Phase 4 refresh can never alter the quality result
-        print(f"warning: results matrix refresh failed: {exc}", file=sys.stderr)
 
 
 def _phase4(
@@ -1237,17 +1407,15 @@ def _phase4(
     comparison: dict[str, Any] | None,
     warnings: list[str],
     exit_code: int,
+    exec_isolation: str | None = None,
 ) -> QualityOutcome:
     if comparison is not None and comparison.get("degradation_warning"):
         warnings.append("lossy cache measurably degrades quality on this machine")
-    summary = _summary(run, resolved, evaluated, comparison, warnings)
+    summary = _summary(run, resolved, evaluated, comparison, warnings, exec_isolation)
     run.write_json("quality.json", summary)
-    from llamatune.qualityreport import render
-
-    run.write_text("quality-report.md", render(summary))
+    run.write_text("quality-report.md", _render_report(summary))
     run.append({"type": "quality_end", "exit_code": exit_code})
-    if exit_code in {0, 1, 4}:
-        _refresh_matrix(resolved.options.sessions_dir)
+    _refresh_matrix(resolved.options.sessions_dir, exit_code)
     return QualityOutcome(run_dir=run.dir, summary=summary, exit_code=exit_code)
 
 
@@ -1300,6 +1468,8 @@ def _dry_run(resolved: _Resolved) -> QualityOutcome:
         ),
         "warnings": list(resolved.warnings),
     }
+    if resolved.options.exec_enabled:
+        plan["exec_isolation"] = sandbox.describe_isolation().summary
     return QualityOutcome(run_dir=Path(), summary=plan, exit_code=0)
 
 
@@ -1307,7 +1477,8 @@ def _execute(
     resolved: _Resolved,
     *,
     run: QualityRun | None,
-    now_fn: Callable[[], Any] | None,
+    now_fn: Callable[[], float] | None,
+    reporter: Reporter | None = None,
 ) -> QualityOutcome:
     if resolved.options.dry_run:
         return _dry_run(resolved)
@@ -1377,14 +1548,22 @@ def _execute(
             old_handlers[signum] = signal.getsignal(signum)
             signal.signal(signum, signals.receive)
     warnings = list(resolved.warnings)
+    exec_isolation: str | None = None
+    if resolved.options.exec_enabled:
+        report = sandbox.describe_isolation()
+        exec_isolation = report.summary
+        warnings.extend(report.warnings)
+        if report.warnings:
+            print(
+                f"WARNING: quality --exec degraded isolation: {'; '.join(report.warnings)}",
+                file=sys.stderr,
+            )
     evaluated: tuple[SuiteResult, ...] = ()
     lossless: tuple[SuiteResult, ...] = ()
     comparison = None
     harness_error = False
     interrupted = False
-    from llamatune import qualserver as qualserver_module
-
-    previous_clock = qualserver_module._swap_monotonic(now_fn) if now_fn is not None else None
+    timing: Timing = _RunTiming(now_fn) if now_fn is not None else REAL_TIMING
     try:
         evaluated, failed, abort = _evaluate_http_side(
             run,
@@ -1393,6 +1572,8 @@ def _execute(
             "evaluated",
             prior,
             signals,
+            timing,
+            reporter=reporter,
         )
         harness_error |= failed
         if not abort and not signals.stop_requested:
@@ -1408,6 +1589,8 @@ def _execute(
                 "lossless",
                 prior,
                 signals,
+                timing,
+                reporter=reporter,
             )
             harness_error |= failed
             if not abort:
@@ -1427,10 +1610,8 @@ def _execute(
         interrupted = True
     except ServerStartError as exc:
         warnings.append(str(exc))
-        return _phase4(run, resolved, evaluated, comparison, warnings, 3)
+        return _phase4(run, resolved, evaluated, comparison, warnings, 3, exec_isolation)
     finally:
-        if previous_clock is not None:
-            qualserver_module._swap_monotonic(previous_clock)
         if signals.handle is not None:
             signals.handle.stop()
             signals.handle = None
@@ -1438,14 +1619,23 @@ def _execute(
             signal.signal(signum, handler)
     if interrupted:
         run.append({"type": "interrupted", "forced": signals.forced})
-        return _phase4(run, resolved, evaluated, comparison, warnings, 4)
-    return _phase4(run, resolved, evaluated, comparison, warnings, 1 if harness_error else 0)
+        return _phase4(run, resolved, evaluated, comparison, warnings, 4, exec_isolation)
+    return _phase4(
+        run,
+        resolved,
+        evaluated,
+        comparison,
+        warnings,
+        1 if harness_error else 0,
+        exec_isolation,
+    )
 
 
 def run_quality(
     options: QualityOptions,
     *,
-    now_fn: Callable[[], Any] | None = None,
+    now_fn: Callable[[], float] | None = None,
+    reporter: Reporter | None = None,
 ) -> QualityOutcome:
     """Resolve and execute one deterministic quality evaluation."""
     try:
@@ -1454,14 +1644,15 @@ def run_quality(
         return QualityOutcome(run_dir=Path(), summary={"error": str(exc)}, exit_code=2)
     except (LlamaDiscoveryError, ModelInspectionError, OSError, RuntimeError) as exc:
         return QualityOutcome(run_dir=Path(), summary={"error": str(exc)}, exit_code=3)
-    return _execute(resolved, run=None, now_fn=now_fn)
+    return _execute(resolved, run=None, now_fn=now_fn, reporter=reporter)
 
 
 def resume_quality(
     run_dir: Path,
     *,
     llama_bin: Path | None = None,
-    now_fn: Callable[[], Any] | None = None,
+    now_fn: Callable[[], float] | None = None,
+    reporter: Reporter | None = None,
 ) -> QualityOutcome:
     """Resume one identity-bound run, skipping exact journaled task tuples."""
     try:
@@ -1513,4 +1704,4 @@ def resume_quality(
         return QualityOutcome(run_dir=Path(run_dir), summary={"error": str(exc)}, exit_code=2)
     except (LlamaDiscoveryError, ModelInspectionError, OSError, RuntimeError) as exc:
         return QualityOutcome(run_dir=Path(run_dir), summary={"error": str(exc)}, exit_code=3)
-    return _execute(resolved, run=run, now_fn=now_fn)
+    return _execute(resolved, run=run, now_fn=now_fn, reporter=reporter)

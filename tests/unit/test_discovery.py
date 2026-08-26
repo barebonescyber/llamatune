@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import shutil
 from pathlib import Path
 
+import gguf
 import pytest
 
 from llamatune import discovery
@@ -177,7 +180,7 @@ def test_duplicate_policy_marks_one_or_both_representatives(
     shutil.copy2(tiny_gguf, merged)
     with merged.open("ab") as handle:
         handle.write(b"x")
-    monkeypatch.setattr(discovery, "_tensor_table_sha", lambda _paths: "a" * 64)
+    monkeypatch.setattr(discovery, "_tensor_table_sha", lambda _paths, **_kwargs: "a" * 64)
 
     one = discovery.discover_models(models, (), (), duplicates="one")
     assert [model.path for model in one if model.representative] == [merged]
@@ -237,7 +240,7 @@ def test_different_tensor_table_or_type_is_not_grouped(
     monkeypatch.setattr(
         discovery,
         "_tensor_table_sha",
-        lambda paths: "a" * 64 if paths[0] == merged else "b" * 64,
+        lambda paths, **_kwargs: "a" * 64 if paths[0] == merged else "b" * 64,
     )
     found = discovery.discover_models(models, (), ())
     assert len(found) == 2
@@ -251,7 +254,7 @@ def test_unavailable_tensor_table_is_not_grouped(
     monkeypatch.setattr(
         discovery,
         "_tensor_table_sha",
-        lambda paths: None if paths[0] == merged else "a" * 64,
+        lambda paths, **_kwargs: None if paths[0] == merged else "a" * 64,
     )
     found = discovery.discover_models(models, (), ())
     assert len(found) == 2
@@ -264,7 +267,7 @@ def test_payload_size_difference_over_one_percent_is_not_grouped(
     models, _shard, merged = _layout_pair(tmp_path, tiny_gguf)
     with merged.open("ab") as handle:
         handle.write(b"padding" * max(1, tiny_gguf.stat().st_size // 50))
-    monkeypatch.setattr(discovery, "_tensor_table_sha", lambda _paths: "a" * 64)
+    monkeypatch.setattr(discovery, "_tensor_table_sha", lambda _paths, **_kwargs: "a" * 64)
     found = discovery.discover_models(models, (), ())
     assert len(found) == 2
     assert all(model.group_key is None and model.representative for model in found)
@@ -274,8 +277,108 @@ def test_excluding_merged_shifts_representative_to_shard_head(
     tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     models, shard, _merged = _layout_pair(tmp_path, tiny_gguf)
-    monkeypatch.setattr(discovery, "_tensor_table_sha", lambda _paths: "a" * 64)
+    monkeypatch.setattr(discovery, "_tensor_table_sha", lambda _paths, **_kwargs: "a" * 64)
     found = discovery.discover_models(models, (), ("*-merged.gguf",))
     assert len(found) == 1
     assert found[0].path == shard
     assert found[0].representative
+
+
+def test_symlink_escape_is_not_followed_by_default(tmp_path: Path, tiny_gguf: Path) -> None:
+    models = tmp_path / "models"
+    models.mkdir()
+    shutil.copy2(tiny_gguf, models / "inside.gguf")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escaped = outside / "escaped.gguf"
+    shutil.copy2(tiny_gguf, escaped)
+    with escaped.open("ab") as handle:
+        handle.write(b"different-content")
+    try:
+        (models / "link").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+
+    found = discovery.discover_models(models, (), ())
+
+    assert [model.path.name for model in found] == ["inside.gguf"]
+
+
+def test_symlink_following_requires_explicit_opt_in(tmp_path: Path, tiny_gguf: Path) -> None:
+    models = tmp_path / "models"
+    models.mkdir()
+    shutil.copy2(tiny_gguf, models / "inside.gguf")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escaped = outside / "escaped.gguf"
+    shutil.copy2(tiny_gguf, escaped)
+    with escaped.open("ab") as handle:
+        handle.write(b"different-content")
+    try:
+        (models / "link").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+
+    found = discovery.discover_models(models, (), (), follow_symlinks=True)
+
+    assert sorted(model.path.name for model in found) == ["escaped.gguf", "inside.gguf"]
+
+
+def test_tensor_table_sha_recipe_is_unchanged(tiny_gguf: Path) -> None:
+    """PERF-014 guard: the parse-once refactor must not alter hash output."""
+    reader = gguf.GGUFReader(str(tiny_gguf), "r")
+    rows = [
+        (str(tensor.name), tuple(int(value) for value in tensor.shape), str(tensor.tensor_type))
+        for tensor in reader.tensors
+    ]
+    encoded = json.dumps(sorted(rows), separators=(",", ":"), ensure_ascii=True).encode()
+    expected = hashlib.sha256(encoded).hexdigest()
+
+    assert expected == "f8f58845d6ce8fabc456c32a2544b9a44cfbae1d781c8257fd943dde48af31f3"
+    assert discovery._tensor_table_sha((tiny_gguf,), {}) == expected
+
+
+def test_tensor_table_sha_union_matches_independent_recipe(tmp_path: Path, tiny_gguf: Path) -> None:
+    models = tmp_path / "models"
+    models.mkdir()
+    first = models / "part-00001-of-00002.gguf"
+    second = models / "part-00002-of-00002.gguf"
+    shutil.copy2(tiny_gguf, first)
+    shutil.copy2(tiny_gguf, second)
+    rows: list[tuple[str, tuple[int, ...], str]] = []
+    for path in (first, second):
+        reader = gguf.GGUFReader(str(path), "r")
+        for tensor in reader.tensors:
+            rows.append(
+                (
+                    str(tensor.name),
+                    tuple(int(value) for value in tensor.shape),
+                    str(tensor.tensor_type),
+                )
+            )
+    expected = hashlib.sha256(
+        json.dumps(sorted(rows), separators=(",", ":"), ensure_ascii=True).encode()
+    ).hexdigest()
+
+    cache: dict[str, discovery._TensorRows | None] = {}
+    assert discovery._tensor_table_sha((first, second), cache) == expected
+    # The scan-scoped cache parsed each distinct file exactly once.
+    assert sorted(cache) == [str(first.resolve()), str(second.resolve())]
+
+
+def test_tensor_rows_are_parsed_once_per_unique_file_per_scan(
+    tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    models, _shard, _merged = _layout_pair(tmp_path, tiny_gguf)
+    calls: list[str] = []
+    original = discovery._tensor_rows
+
+    def counting(path: Path, cache: dict[str, discovery._TensorRows | None]) -> object:
+        calls.append(path.name)
+        return original(path, cache)
+
+    monkeypatch.setattr(discovery, "_tensor_rows", counting)
+
+    discovery.discover_models(models, (), ())
+
+    assert sorted(calls) == ["same-00001-of-00001.gguf", "same-merged.gguf"]

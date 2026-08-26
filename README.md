@@ -391,9 +391,13 @@ and confirmation—not only final trial records.
 ### List sessions
 
 ```bash
-uv run llamatune sessions ./llamatune-sessions
-uv run llamatune sessions ./llamatune-sessions --json
+uv run llamatune sessions --sessions-dir ./llamatune-sessions
+uv run llamatune sessions --sessions-dir ./llamatune-sessions --json
 ```
+
+`--sessions-dir` defaults to `./llamatune-sessions`. The older positional form
+(`llamatune sessions ./llamatune-sessions`) still works; pass the directory
+only once.
 
 ### Regenerate a report
 
@@ -411,6 +415,9 @@ uv run llamatune export ./llamatune-sessions/SESSION_DIRECTORY --format llama-sw
 uv run llamatune export ./llamatune-sessions/SESSION_DIRECTORY --format json
 ```
 
+`--json` is an alias of `--format json`. Pass either `--json` or `--format`, not both.
+Without either, the export defaults to `--format llama-server`.
+
 ### Look up the best compatible result
 
 ```bash
@@ -421,7 +428,8 @@ uv run llamatune best /path/to/model.gguf \
 ```
 
 The lookup checks the model, hardware, llama.cpp identity, and requested context. An older
-or undersized result is reported as stale instead of being returned as current.
+or undersized result is reported as stale instead of being returned as current. Like
+`tune` and `quality`, `--ctx-size` accepts a comma-separated list and uses its first value.
 
 ### Revalidate and calibrate
 
@@ -436,6 +444,8 @@ Fit conservative VRAM correction factors from completed sessions:
 ```bash
 uv run llamatune calibrate --sessions-dir ./llamatune-sessions
 ```
+
+Add `--json` to print the fitted correction factors as JSON on stdout.
 
 Calibration is experimental during the initial public beta. It writes `calibration.json`;
 later searches load it automatically when valid.
@@ -481,6 +491,12 @@ uv run llamatune nightshift ./models \
 - `--include` and `--exclude` filter model names.
 - `--duplicates one|both` controls duplicate-layout handling.
 - `--drift-threshold` and `--calibration-runs` control revalidation/calibration behavior.
+- `--follow-symlinks` follows symbolic directories while scanning the models directory.
+  By default symlinks pointing outside the tree are skipped. [default: False]
+- `--progress auto|plain|rich|json`, `--tui`, and `--quiet` work like `tune`. Plain mode
+  prints one concise line per work item to stderr, for example
+  `[nightshift] item 2/7 tune Qwen3-4B`; quiet suppresses it; JSON mode emits structured
+  events on stderr only, keeping stdout pure.
 - Spare-time deepening runs at most once per eligible model and is skipped when explicit
   overrides make its resolved profile identical to the initial tune.
 
@@ -508,6 +524,10 @@ or `--rounds-max` is reached, so it is never unbounded. Night Shift distributes 
 across a model directory, while Marathon spends the window exhaustively on one model.
 Use `--dry-run` to inspect the resolved work without benchmarking.
 
+Marathon accepts `--progress auto|plain|rich|json`, `--tui`, and `--quiet` like `tune`.
+Plain mode prints phase and round lines to stderr, for example `[marathon] round 2/6
+budget=360`; quiet suppresses them.
+
 Each run writes `marathon.json` and `marathon-report.md` beneath
 `SESSION_DIR/marathon/<model-and-run-id>/`; ordinary tuning-round evidence remains in the
 top-level sessions directory.
@@ -525,6 +545,9 @@ uv run llamatune matrix show --sessions-dir ./llamatune-sessions
 uv run llamatune matrix query --sessions-dir ./llamatune-sessions --use-case max-tg
 uv run llamatune matrix export --sessions-dir ./llamatune-sessions --format csv
 ```
+
+On `matrix export`, `--json` is an alias of `--format json`; pass one of `--format` or
+`--json`. Unlike the session `export` command, `matrix export` has no default format.
 
 To select a result compatible with the machine and llama.cpp build being used now, probe
 that build and request only current matches:
@@ -572,13 +595,56 @@ KV-cache recommendation, add `--compare-lossless` to run the evaluated and lossl
 configurations serially and report per-suite deltas. Select `perplexity` only with a local
 `--quality-corpus PATH`.
 
-Generated Python is always data unless the operator explicitly enables `--exec`. That
-option runs declared coding assertions in a fresh, resource-limited POSIX subprocess with
-bounded output and time. This is an accident barrier, not a security boundary: POSIX
-limits do not inherently block network system calls, and unprivileged network namespaces
-may be unavailable. On macOS, the platform's unreliable `RLIMIT_AS` implementation is
-reported and that single address-space cap is omitted; the CPU, file-size, descriptor, and
-core-dump limits remain active. Do not enable it for an adversarial model.
+Quality runs accept `--progress auto|plain|rich|json`, `--tui`, and `--quiet` like `tune`.
+In plain mode each started task prints one concise line to stderr, for example
+`[quality] evaluated task 3/20 clamp (coding@1+abc)`; quiet suppresses these lines and
+JSON mode keeps stdout clean. `--ctx-size` accepts a comma-separated list like `tune`;
+the first value sets the server context window.
+
+### `quality --exec` trust boundary
+
+Generated Python is always data unless the operator explicitly enables `--exec`. With
+`--exec`, llamatune extracts fenced Python blocks from model responses and executes them
+in a child process. Each child runs one suite assertion in a fresh temporary directory.
+The child gets an allowlisted environment, bounded runtime, and bounded captured output.
+
+What the sandbox confines:
+
+| Limit | Linux | macOS | Windows |
+|---|---|---|---|
+| CPU time | 10 s rlimit | 10 s rlimit | not available (`--exec` refuses) |
+| File size | 1 MiB rlimit | 1 MiB rlimit | not available |
+| Open files | 32 rlimit | 32 rlimit | not available |
+| Core dumps | disabled | disabled | not available |
+| Memory | 512 MiB address-space rlimit | data-segment and RSS rlimits where honored; no address-space cap | not available |
+| Network | confirmed network namespace (`unshare -rn`) | none | none |
+| Filesystem | bubblewrap sandbox when available | none | none |
+
+Before any execution, llamatune probes network-namespace support with a real `unshare -rn`
+test process. The probe must confirm isolation. If it does not, `--exec` refuses to run
+and llamatune exits with code `3`. Pass `--exec-allow-network` to run anyway. Isolation
+is still applied when available, even with `--exec-allow-network`.
+
+When bubblewrap (`bwrap`) is installed and works, the child sees `/usr`, `/lib`, and
+`/lib64` read-only, gets private tmpfs mounts for `/tmp`, `/home`, and `/run`, and can
+write only its own run directory. Without bubblewrap, there is no filesystem confinement.
+
+What the sandbox does NOT confine:
+
+- Without a confirmed namespace: the child can open network connections.
+- Without bubblewrap: the child reads and writes files with your account's permissions,
+  including `$HOME`.
+- On macOS and Windows: no network or filesystem confinement.
+- A confirmed namespace does not confine the filesystem. Bubblewrap does not confine
+  the network by itself here.
+
+The run summary records `exec_isolation`: `network-namespace` when confirmed active,
+or `none (allowed by flag)` after opt-in. Degraded runs add entries to the summary
+`warnings` list and print `WARNING:` lines to stderr.
+
+> WARNING: With `--exec-allow-network`, model-generated code runs with network access.
+> That code can exfiltrate files, credentials, and session evidence to remote systems.
+> Do not use it with an adversarial model.
 
 Each run writes under `<sessions-dir>/quality/<run>/`, including identity/config metadata,
 an fsynced journal, bounded request/response evidence, `quality.json`, and
@@ -611,15 +677,22 @@ Session evidence is designed to be auditable and resumable; avoid editing it man
 | Code | Meaning |
 |---:|---|
 | `0` | Confirmed improvement, or successful non-tuning command |
-| `1` | Tuning completed but no improvement was confirmed over measured defaults |
+| `1` | Valid negative result; per command: `tune`/`resume` no improvement confirmed over measured defaults, `nightshift` circuit breaker stopped the shift, `marathon` round failures or an unreplicated champion, `quality` harness task errors, `best` no matching current record |
 | `2` | Usage or configuration error |
-| `3` | Environment/model/baseline error; tuning could not start or complete normally |
-| `4` | Interrupted or failed mid-run with a resumable session |
+| `3` | Environment/model/baseline error: tuning could not start or complete normally, session storage is unwritable (for example full disk), or `scan` found no usable llama.cpp toolchain |
+| `4` | Interrupted by a user signal mid-run; rerun the command to resume |
 
 Exit code `1` is a valid result: defaults were optimal within measured noise, and the
-session still contains recommendation and evidence files.
+session still contains recommendation and evidence files. Exit code `3` from `scan`
+keeps printing the hardware report and the `llama-bench: NOT FOUND` line (or the same
+shape under `--json`) so scripts can detect a missing toolchain.
 
 ## Troubleshooting
+
+### `llama-bench not found in PATH`
+
+Install llama.cpp, or pass `--llama-bin DIR`. `DIR` is the directory containing the
+binaries, not the `llama-bench` executable itself.
 
 ### CUDA is detected but no GPU layers are used
 
@@ -679,6 +752,10 @@ llamatune calibrate   Experimental: fit VRAM estimator corrections
 ```
 
 Run `llamatune COMMAND --help` for the authoritative option list.
+
+Global options: `--version` prints the version and exits. `--verbose/-v` prints extra
+diagnostics on stderr. Set `LLAMATUNE_VERBOSE=1` to get the same diagnostics as
+`--verbose`.
 
 ## Contributing
 

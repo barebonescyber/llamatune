@@ -9,6 +9,10 @@ from typing import Any
 import pytest
 
 from llamatune import marathon as marathon_module
+from llamatune.coverage import build_ledger
+from llamatune.evidence import (
+    jsonable as _jsonable,
+)
 from llamatune.marathon import (
     MarathonPathError,
     MarathonRun,
@@ -236,7 +240,7 @@ def _patch_runtime(
         return SimpleNamespace(dir=session_dir)
 
     monkeypatch.setattr(
-        "llamatune.session.Session",
+        "llamatune.marathon.Session",
         SimpleNamespace(create=create_session),
     )
 
@@ -264,10 +268,10 @@ def _patch_runtime(
             )
         return TuneOutcome(session_dir=session.dir, analysis=analysis, exit_code=exit_code)
 
-    monkeypatch.setattr("llamatune.search.run_tuning", tune)
+    monkeypatch.setattr("llamatune.marathon.run_tuning", tune)
     monkeypatch.setattr(
-        "llamatune.search.resume_tuning",
-        lambda session_dir: TuneOutcome(
+        "llamatune.marathon.resume_tuning",
+        lambda session_dir, **_kwargs: TuneOutcome(
             session_dir=session_dir,
             analysis={"winner": None},
             exit_code=0,
@@ -280,13 +284,13 @@ def _patch_runtime(
         )
         return _calibration(tmp_path, verdict)
 
-    monkeypatch.setattr("llamatune.calibrate.run_calibration", calibrate)
+    monkeypatch.setattr(marathon_module, "run_calibration", calibrate)
 
     def run_ab(*args: Any, **kwargs: Any) -> ABResult:
         verdict = ab_values.pop(0) if len(ab_values) > 1 else ab_values[0]
         return _ab_result(str(kwargs["label"]), verdict)
 
-    monkeypatch.setattr("llamatune.abtest.run_ab", run_ab)
+    monkeypatch.setattr("llamatune.marathon.run_ab", run_ab)
 
     def run_matrix(*args: Any, **kwargs: Any) -> list[Any]:
         state["matrix_calls"] += 1
@@ -363,9 +367,17 @@ def test_reentry_retains_mismatched_unfinished_run(tmp_path: Path) -> None:
     assert mismatches == (run.dir,)
 
 
-def test_journal_reader_ignores_non_records_and_stops_at_torn_tail(tmp_path: Path) -> None:
-    (tmp_path / "journal.jsonl").write_text('1\n{"type":"phase"}\n{"torn"')
-    assert _entries(tmp_path) == [{"type": "phase"}]
+def test_journal_reader_skips_corrupt_lines_and_keeps_later_entries(tmp_path: Path) -> None:
+    (tmp_path / "journal.jsonl").write_text(
+        '{"type":"phase","phase":"first"}\n'
+        "{corrupt middle line\n"
+        '{"type":"phase","phase":"last"}\n'
+        '{"torn tail"',
+        encoding="utf-8",
+    )
+    with pytest.warns(RuntimeWarning, match="is corrupt and was skipped"):
+        entries = _entries(tmp_path)
+    assert [entry["phase"] for entry in entries] == ["first", "last"]
     assert _entries(tmp_path / "absent") == []
 
 
@@ -537,3 +549,209 @@ def test_run_marathon_second_signal_finalizes_interruption(
     assert outcome.exit_code == 4
     assert outcome.summary["stop_reason"] == "interrupted"
     assert _entries(outcome.run_dir)[-2]["immediate"] is True
+
+
+_SPACE = {"A": (config(), config(flash_attn=True))}
+
+
+def _append_journal(session_dir: Path, entries: list[dict[str, Any]]) -> None:
+    with (session_dir / "journal.jsonl").open("a", encoding="utf-8") as handle:
+        for entry in entries:
+            handle.write(json.dumps(entry) + "\n")
+
+
+def test_run_marathon_incremental_ledger_matches_from_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ledgers built incrementally equal full rescans; each round parses once."""
+    opts = replace(options(tmp_path), dry_run=False, rounds_max=2, converge_rounds=5)
+    hardware, llama, model = reports(tmp_path)
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda: hardware)
+    monkeypatch.setattr("llamatune.llama.discover_llama", lambda llama_bin: llama)
+    monkeypatch.setattr(
+        "llamatune.model.inspect_model",
+        lambda model_path, *, full_hash: model,
+    )
+    monkeypatch.setattr(
+        marathon_module,
+        "_recon",
+        lambda run, model, llama, options: {
+            "pp": 100.0,
+            "tg": 50.0,
+            "cv_ref": 0.01,
+            "runs": 10,
+            "warmup_drift": False,
+            "trend": {"pp": 0.0, "tg": 0.0},
+            "default_config": config().to_dict(),
+        },
+    )
+    monkeypatch.setattr("llamatune.coverage.enumerate_space", lambda *args, **kwargs: dict(_SPACE))
+
+    sessions: list[Path] = []
+
+    def create_session(sessions_dir: Path, **kwargs: Any) -> SimpleNamespace:
+        session_dir = sessions_dir / f"round-{len(sessions) + 1}"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        sessions.append(session_dir)
+        return SimpleNamespace(dir=session_dir)
+
+    monkeypatch.setattr("llamatune.marathon.Session", SimpleNamespace(create=create_session))
+
+    round_journals: tuple[list[dict[str, Any]], ...] = (
+        [
+            {
+                "type": "trial",
+                "trial_id": "t1",
+                "config": config().to_dict(),
+                "status": "ok",
+                "score": 100.0,
+                "tau": 0.02,
+            },
+            {
+                "type": "trial",
+                "trial_id": "t2",
+                "config": config(flash_attn=True).to_dict(),
+                "status": "ok",
+                "score": 103.0,
+            },
+            {"type": "prune", "trial_ids": ["p1"]},
+        ],
+        [
+            {
+                "type": "trial",
+                "trial_id": "t3",
+                "config": config().to_dict(),
+                "status": "error",
+                "score": 90.0,
+            },
+            {"type": "pruned", "trial_ids": ["p2", "p1"]},
+        ],
+    )
+
+    def tune(session: Any, *_args: Any, **kwargs: Any) -> TuneOutcome:
+        _append_journal(session.dir, list(round_journals[len(sessions) - 1]))
+        contender = config(flash_attn=True)
+        return TuneOutcome(
+            session_dir=session.dir,
+            analysis={"winner": {"config": contender.to_dict()}},
+            exit_code=0,
+        )
+
+    monkeypatch.setattr("llamatune.marathon.run_tuning", tune)
+
+    def calibrate(*args: Any, **kwargs: Any) -> CalibrationResult:
+        return _calibration(tmp_path, "consistent")
+
+    monkeypatch.setattr(marathon_module, "run_calibration", calibrate)
+    monkeypatch.setattr(
+        "llamatune.marathon.run_ab", lambda *args, **kwargs: _ab_result(str(kwargs["label"]), "b")
+    )
+    monkeypatch.setattr("llamatune.matrix.run_matrix", lambda *args, **kwargs: [])
+    monkeypatch.setattr(signal, "getsignal", lambda sig: "original")
+    monkeypatch.setattr(signal, "signal", lambda sig, handler: None)
+
+    evidence_calls = {"n": 0}
+    original_evidence = marathon_module._trial_evidence
+
+    def counted_evidence(session_dirs: Any) -> tuple[set[str], set[str], list[dict[str, Any]]]:
+        evidence_calls["n"] += 1
+        return original_evidence(session_dirs)
+
+    monkeypatch.setattr(marathon_module, "_trial_evidence", counted_evidence)
+
+    outcome = run_marathon(opts, now_fn=AdvancingClock())
+
+    assert outcome.exit_code == 0
+    assert outcome.summary["stop_reason"] == "rounds_max"
+    assert evidence_calls["n"] == 1 + len(round_journals)
+    snapshots = [
+        entry for entry in _entries(outcome.run_dir) if entry.get("type") == "coverage_snapshot"
+    ]
+    assert [snapshot["round"] for snapshot in snapshots] == [1, 2]
+    for snapshot in snapshots:
+        executed, pruned, trials = original_evidence(tuple(sessions[: snapshot["round"]]))
+        expected = _jsonable(build_ledger(dict(_SPACE), executed, pruned, trials=trials))
+        assert snapshot["ledger"] == expected
+    executed, pruned, trials = original_evidence(tuple(sessions))
+    assert outcome.summary["ledger"] == _jsonable(
+        build_ledger(dict(_SPACE), executed, pruned, trials=trials)
+    )
+    assert outcome.summary["ledger"]["responsive"] == ["flash_attn"]
+
+
+def test_plain_reporter_receives_phase_and_round_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+
+    from llamatune.ui import PlainReporter
+
+    opts = replace(options(tmp_path), dry_run=False, rounds_max=1, converge_rounds=2)
+    _patch_runtime(
+        monkeypatch,
+        tmp_path,
+        winners=[None],
+        ledger_remaining=1,
+    )
+    stream = io.StringIO()
+    outcome = run_marathon(opts, now_fn=AdvancingClock(), reporter=PlainReporter(stream))
+
+    assert outcome.exit_code == 1
+    text = stream.getvalue()
+    assert "[marathon] phase reconnaissance" in text
+    assert "[marathon] phase rounds" in text
+    assert "[marathon] round 1/1 budget=" in text
+    assert "[marathon] phase matrix" in text
+    assert "[marathon] phase verification" in text
+
+
+def test_marathon_threads_reporter_into_tuning_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+
+    from llamatune.types import TuneOutcome
+    from llamatune.ui import PlainReporter
+
+    opts = replace(options(tmp_path), dry_run=False, rounds_max=1, converge_rounds=2)
+    _patch_runtime(monkeypatch, tmp_path, winners=[None], ledger_remaining=1)
+    seen: list[Any] = []
+
+    def capture_tune(session: Any, *_args: Any, **kwargs: Any) -> TuneOutcome:
+        seen.append(kwargs.get("reporter"))
+        return TuneOutcome(session_dir=session.dir, analysis={"winner": None}, exit_code=0)
+
+    monkeypatch.setattr("llamatune.marathon.run_tuning", capture_tune)
+    stream = io.StringIO()
+    reporter = PlainReporter(stream)
+    outcome = run_marathon(opts, now_fn=AdvancingClock(), reporter=reporter)
+
+    assert outcome.exit_code == 1
+    assert seen and seen[0] is reporter
+
+
+def test_startup_model_inspection_failure_still_exits_three(
+    tmp_path: Path,
+) -> None:
+    """Expected discovery/hardware failures keep the exit-3 error summary."""
+    opts = replace(options(tmp_path), dry_run=False, model_path=tmp_path / "missing.gguf")
+
+    outcome = run_marathon(opts, now_fn=AdvancingClock())
+
+    assert outcome.exit_code == 3
+    assert outcome.summary["schema_version"] == 1
+    assert "error" in outcome.summary
+
+
+def test_unexpected_startup_exception_propagates_to_internal_error_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A programming error at startup must not become a silent exit 3 (#11)."""
+    opts = replace(options(tmp_path), dry_run=False)
+    monkeypatch.setattr(
+        "llamatune.llama.discover_llama",
+        lambda _path: (_ for _ in ()).throw(KeyError("capabilities")),
+    )
+
+    with pytest.raises(KeyError):
+        run_marathon(opts, now_fn=AdvancingClock())

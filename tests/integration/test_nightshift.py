@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import dataclasses
+import os
+import signal
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from llamatune import calibrate, discovery, hardware, llama, registry, search
+from llamatune import discovery, hardware, llama, nightshift, registry, search
 from llamatune.model import inspect_model
 from llamatune.nightshift import resolve_deadline, run_nightshift
 from llamatune.types import (
@@ -241,6 +243,52 @@ def test_one_failed_model_does_not_prevent_the_next_model(
     assert [item["outcome"] for item in outcome.summary["items"]] == ["failed", "failed"]
 
 
+def test_circuit_breaker_stop_maps_to_exit_one_not_four(
+    tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_report = inspect_model(tiny_gguf)
+    models = [
+        DiscoveredModel(
+            path=tiny_gguf,
+            report=first_report,
+            shard_paths=(),
+            group_key=None,
+            representative=True,
+        )
+    ]
+    for index in range(2):
+        path = tmp_path / f"extra-{index}.gguf"
+        path.write_bytes(tiny_gguf.read_bytes() + b"x" * (index + 1))
+        report = dataclasses.replace(
+            first_report,
+            path=path,
+            fingerprint=format(index, "064x"),
+            size_bytes=path.stat().st_size,
+        )
+        models.append(
+            DiscoveredModel(
+                path=path, report=report, shard_paths=(), group_key=None, representative=True
+            )
+        )
+    _patch_foundation(monkeypatch, tmp_path, models[0])
+    monkeypatch.setattr(discovery, "discover_models", lambda *_args, **_kwargs: tuple(models))
+    monkeypatch.setattr(
+        search,
+        "run_tuning",
+        lambda session, *_args, **_kwargs: TuneOutcome(
+            session_dir=session.dir, analysis={}, exit_code=3
+        ),
+    )
+    outcome = run_nightshift(_options(tmp_path, tmp_path))
+    assert outcome.exit_code == 1
+    assert [item["outcome"] for item in outcome.summary["items"]] == [
+        "failed",
+        "failed",
+        "failed",
+    ]
+    assert any("circuit breaker" in warning for warning in outcome.summary["warnings"])
+
+
 def test_consistent_calibration_does_not_retune(
     tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -255,7 +303,7 @@ def test_consistent_calibration_does_not_retune(
     _patch_foundation(monkeypatch, tmp_path, model)
     monkeypatch.setattr(registry, "build_registry", lambda _path: {record.fingerprint: record})
     monkeypatch.setattr(
-        calibrate, "run_calibration", lambda *_args: _calibration(model, record, "consistent")
+        nightshift, "run_calibration", lambda *_args: _calibration(model, record, "consistent")
     )
     monkeypatch.setattr(
         search,
@@ -282,7 +330,7 @@ def test_drift_calibration_enqueues_and_executes_retune(
     _patch_foundation(monkeypatch, tmp_path, model)
     monkeypatch.setattr(registry, "build_registry", lambda _path: {record.fingerprint: record})
     monkeypatch.setattr(
-        calibrate, "run_calibration", lambda *_args: _calibration(model, record, "drift")
+        nightshift, "run_calibration", lambda *_args: _calibration(model, record, "drift")
     )
     seen_depths: list[int | None] = []
 
@@ -349,12 +397,19 @@ def test_dynamic_transfer_after_representative_tune(
     def tune(session: Any, *_args: object, **_kwargs: object) -> TuneOutcome:
         nonlocal tuned
         tuned = True
+        session.write_analysis(
+            {
+                "baseline": {"noise_floor_cv": 0.01, "pp": {"mean": 100.0}, "tg": {"mean": 20.0}},
+                "winner": None,
+            }
+        )
+        session.append({"type": "session_end", "exit_code": 1, "reason": "completed"})
         return TuneOutcome(session_dir=session.dir, analysis={}, exit_code=1)
 
     monkeypatch.setattr(registry, "build_registry", build)
     monkeypatch.setattr(search, "run_tuning", tune)
     monkeypatch.setattr(
-        calibrate, "run_calibration", lambda *_args: _calibration(sibling, record, "consistent")
+        nightshift, "run_calibration", lambda *_args: _calibration(sibling, record, "consistent")
     )
     outcome = run_nightshift(_options(tmp_path, tmp_path))
     assert [(item["kind"], item["outcome"]) for item in outcome.summary["items"]] == [
@@ -422,6 +477,40 @@ def test_stopped_session_journal_translates_to_nightshift_exit_four(
     assert outcome.summary["items"][0]["outcome"] == "interrupted"
 
 
+def test_user_signal_with_unfinished_plan_maps_to_exit_four(
+    tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_report = inspect_model(tiny_gguf)
+    second_path = tmp_path / "second.gguf"
+    second_path.write_bytes(tiny_gguf.read_bytes() + b"different")
+    second_report = dataclasses.replace(
+        first_report, path=second_path, fingerprint="f" * 64, size_bytes=second_path.stat().st_size
+    )
+    models = (
+        DiscoveredModel(
+            path=tiny_gguf, report=first_report, shard_paths=(), group_key=None, representative=True
+        ),
+        DiscoveredModel(
+            path=second_path,
+            report=second_report,
+            shard_paths=(),
+            group_key=None,
+            representative=True,
+        ),
+    )
+    _patch_foundation(monkeypatch, tmp_path, models[0])
+    monkeypatch.setattr(discovery, "discover_models", lambda *_args, **_kwargs: models)
+
+    def interrupted(session: Any, *_args: object, **_kwargs: object) -> TuneOutcome:
+        os.kill(os.getpid(), signal.SIGINT)
+        return TuneOutcome(session_dir=session.dir, analysis={}, exit_code=1)
+
+    monkeypatch.setattr(search, "run_tuning", interrupted)
+    outcome = run_nightshift(_options(tmp_path, tmp_path))
+    assert outcome.exit_code == 4
+    assert len(outcome.summary["items"]) == 1
+
+
 def test_identical_deepening_profile_is_skipped(
     tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -436,7 +525,7 @@ def test_identical_deepening_profile_is_skipped(
     _patch_foundation(monkeypatch, tmp_path, model)
     monkeypatch.setattr(registry, "build_registry", lambda _path: {record.fingerprint: record})
     monkeypatch.setattr(
-        calibrate, "run_calibration", lambda *_args: _calibration(model, record, "consistent")
+        nightshift, "run_calibration", lambda *_args: _calibration(model, record, "consistent")
     )
     monkeypatch.setattr(
         search,
@@ -465,7 +554,7 @@ def test_spare_time_deepens_each_model_at_most_once(
     _patch_foundation(monkeypatch, tmp_path, model)
     monkeypatch.setattr(registry, "build_registry", lambda _path: {record.fingerprint: record})
     monkeypatch.setattr(
-        calibrate, "run_calibration", lambda *_args: _calibration(model, record, "consistent")
+        nightshift, "run_calibration", lambda *_args: _calibration(model, record, "consistent")
     )
     monkeypatch.setattr(
         search,
@@ -511,3 +600,200 @@ def test_run_metadata_and_report_window_are_complete(
     assert set(outcome.summary["window"]) == {"started", "ended", "deadline", "outcome"}
     report = (outcome.run_dir / "nightshift-report.md").read_text()
     assert "Started: 2026-01-01T00:00:00+00:00" in report
+
+
+def test_plain_reporter_receives_item_lines_and_run_tuning_gets_reporter(
+    tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+
+    from llamatune.ui import PlainReporter
+
+    report = inspect_model(tiny_gguf)
+    model = DiscoveredModel(
+        path=tiny_gguf, report=report, shard_paths=(), group_key=None, representative=True
+    )
+    _patch_foundation(monkeypatch, tmp_path, model)
+    seen: list[Any] = []
+
+    def fake_tune(session: Any, *_args: object, **kwargs: object) -> TuneOutcome:
+        seen.append(kwargs.get("reporter"))
+        return TuneOutcome(session_dir=session.dir, analysis={"winner": None}, exit_code=1)
+
+    monkeypatch.setattr(search, "run_tuning", fake_tune)
+    stream = io.StringIO()
+    outcome = run_nightshift(_options(tmp_path, tiny_gguf.parent), reporter=PlainReporter(stream))
+    assert outcome.exit_code == 0
+    assert "[nightshift] item 1/1 tune" in stream.getvalue()
+    assert tiny_gguf.stem in stream.getvalue()
+    assert seen and seen[0] is not None
+
+
+def test_quiet_style_none_reporter_writes_nothing(
+    tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = inspect_model(tiny_gguf)
+    model = DiscoveredModel(
+        path=tiny_gguf, report=report, shard_paths=(), group_key=None, representative=True
+    )
+    _patch_foundation(monkeypatch, tmp_path, model)
+    monkeypatch.setattr(
+        search,
+        "run_tuning",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("benchmark executed")),
+    )
+
+    outcome = run_nightshift(_options(tmp_path, tiny_gguf.parent, dry_run=True), reporter=None)
+    assert outcome.exit_code == 0
+
+
+def test_follow_symlinks_flag_plumbs_into_discovery(
+    tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = inspect_model(tiny_gguf)
+    model = DiscoveredModel(
+        path=tiny_gguf, report=report, shard_paths=(), group_key=None, representative=True
+    )
+    _patch_foundation(monkeypatch, tmp_path, model)
+    captured: list[bool] = []
+
+    def capture_discovery(*_args: Any, **kwargs: Any) -> tuple[DiscoveredModel, ...]:
+        captured.append(bool(kwargs.get("follow_symlinks")))
+        return (model,)
+
+    monkeypatch.setattr(discovery, "discover_models", capture_discovery)
+
+    run_nightshift(_options(tmp_path, tmp_path, dry_run=True), follow_symlinks=True)
+    assert captured[-1] is True
+
+    run_nightshift(_options(tmp_path, tmp_path, dry_run=True))
+    assert captured[-1] is False
+
+
+def test_unexpected_item_exception_propagates_and_does_not_masquerade(
+    tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A programming error (KeyError) must surface, not record 'failed' (#11)."""
+    model = DiscoveredModel(
+        path=tiny_gguf,
+        report=inspect_model(tiny_gguf),
+        shard_paths=(),
+        group_key=None,
+        representative=True,
+    )
+    _patch_foundation(monkeypatch, tmp_path, model)
+
+    def boom(session: Any, *_args: object, **_kwargs: object) -> TuneOutcome:
+        raise KeyError("fingerprint")
+
+    monkeypatch.setattr(search, "run_tuning", boom)
+    with pytest.raises(KeyError):
+        run_nightshift(_options(tmp_path, tiny_gguf.parent))
+
+
+_GOLDEN_NIGHTREPORT = Path(__file__).resolve().parents[1] / "fixtures" / "golden_nightreport.md"
+
+
+def test_nightreport_render_matches_golden_fixture(tmp_path: Path) -> None:
+    """A typed fixture summary renders byte-identically to the golden report."""
+    from llamatune.nightreport import render
+    from llamatune.types import NightshiftContentGroup, NightshiftItemSummary, NightshiftWindow
+
+    tune_item = NightshiftItemSummary(
+        kind="tune",
+        model_path="/models/alpha.gguf",
+        fingerprint="a" * 64,
+        reference_fingerprint=None,
+        reason="no completed session",
+        outcome="succeeded",
+        session_dir=str(tmp_path / "alpha"),
+        wall_s=120.0,
+        tune_exit_code=1,
+    )
+    consistent_item = NightshiftItemSummary(
+        kind="calibrate",
+        model_path="/models/beta.gguf",
+        fingerprint="b" * 64,
+        reference_fingerprint="b" * 64,
+        reason="verify latest completed session",
+        outcome="consistent",
+        calibration={
+            "verdict": "consistent",
+            "drift_pp": 0.012,
+            "drift_tg": 0.004,
+            "drift_pp_signed": -0.012,
+            "drift_tg_signed": 0.004,
+            "build_changed": False,
+        },
+    )
+    transfer_item = NightshiftItemSummary(
+        kind="calibrate",
+        model_path="/models/gamma.gguf",
+        fingerprint="c" * 64,
+        reference_fingerprint="a" * 64,
+        reason="transfer calibration from content-group representative",
+        outcome="consistent",
+        calibration={
+            "verdict": "consistent",
+            "transfer_from": "a" * 64,
+            "drift_pp": 0.003,
+            "drift_tg": 0.009,
+            "build_changed": False,
+        },
+    )
+    error_item = NightshiftItemSummary(
+        kind="calibrate",
+        model_path="/models/delta.gguf",
+        fingerprint="d" * 64,
+        reference_fingerprint="d" * 64,
+        reason="verify latest completed session",
+        outcome="error",
+        calibration={"verdict": "error", "reason": "llama-bench failed", "build_changed": True},
+    )
+    deferred_item = NightshiftItemSummary(
+        kind="tune",
+        model_path="/models/epsilon.gguf",
+        fingerprint="e" * 64,
+        reference_fingerprint=None,
+        reason="insufficient time for tune-class item",
+        outcome="deferred",
+        estimated_minutes=45.0,
+    )
+    summary = {
+        "schema_version": 1,
+        "options": {},
+        "window": NightshiftWindow(
+            started="2026-01-01T22:00:00+00:00",
+            ended="2026-01-02T06:00:00+00:00",
+            deadline="2026-01-02T06:00:00+00:00",
+            outcome="completed",
+        ),
+        "items": [
+            tune_item,
+            consistent_item,
+            transfer_item,
+            error_item,
+            deferred_item,
+        ],
+        "counts": {
+            "tune:succeeded": 1,
+            "calibrate:consistent": 2,
+            "calibrate:error": 1,
+            "tune:deferred": 1,
+        },
+        "total_invocations": 42,
+        "hardware": {"cpu_model": "Test CPU", "gpus": [{"name": "Test GPU"}]},
+        "llamacpp": {"build_commit": "abc1234", "help_sha256": "f" * 64},
+        "content_groups": [
+            NightshiftContentGroup(
+                group_key="qwen-family",
+                representative="/models/alpha.gguf",
+                members=["/models/alpha.gguf", "/models/gamma.gguf"],
+            )
+        ],
+        "warnings": ["model epsilon skipped: deadline reached"],
+        "exit_code": 1,
+        "constants": {"min_tune_minutes": 20.0, "shutdown_margin_minutes": 5.0},
+    }
+    rendered = render(summary)
+    assert rendered == _GOLDEN_NIGHTREPORT.read_text(encoding="utf-8")

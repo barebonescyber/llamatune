@@ -61,7 +61,7 @@ def test_quality_assembles_all_options_and_emits_json(
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("quality corpus", encoding="utf-8")
 
-    def capture(options: QualityOptions) -> QualityOutcome:
+    def capture(options: QualityOptions, **_kwargs: Any) -> QualityOutcome:
         seen["options"] = options
         return _outcome(tmp_path)
 
@@ -126,7 +126,7 @@ def test_quality_defaults_and_human_outcome(
 ) -> None:
     seen: list[QualityOptions] = []
 
-    def capture(options: QualityOptions) -> QualityOutcome:
+    def capture(options: QualityOptions, **_kwargs: Any) -> QualityOutcome:
         seen.append(options)
         return _outcome(tmp_path, exit_code=1)
 
@@ -143,7 +143,7 @@ def test_quality_defaults_and_human_outcome(
 def test_quality_human_dry_run_and_returned_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def dry(options: QualityOptions) -> QualityOutcome:
+    def dry(options: QualityOptions, **_kwargs: Any) -> QualityOutcome:
         return QualityOutcome(
             run_dir=Path(),
             summary={
@@ -166,7 +166,7 @@ def test_quality_human_dry_run_and_returned_error(
 
     monkeypatch.setattr(
         "llamatune.quality.run_quality",
-        lambda options: QualityOutcome(
+        lambda options, **_kwargs: QualityOutcome(
             run_dir=Path(), summary={"error": "model unreadable"}, exit_code=3
         ),
     )
@@ -186,7 +186,9 @@ def test_quality_human_dry_run_and_returned_error(
         ),
         (["model.gguf", "--reps", "0"], "--reps"),
         (["model.gguf", "--reps", "6"], "--reps"),
-        (["model.gguf", "--ctx-size", "0"], "must be positive"),
+        (["model.gguf", "--ctx-size", "0"], "--ctx-size values must be > 0"),
+        (["model.gguf", "--ctx-size", "8192,4096"], "distinct and ascending"),
+        (["model.gguf", "--ctx-size", "abc"], "comma-separated list of integers"),
         (["model.gguf", "--max-tokens", "0"], "must be positive"),
         (["model.gguf", "--request-timeout", "0"], "timeouts"),
         (["model.gguf", "--server-start-timeout", "0"], "timeouts"),
@@ -222,9 +224,13 @@ def test_quality_resume_wiring_and_conflicts(
     seen: dict[str, Any] = {}
 
     def capture(
-        run_dir: Path, *, llama_bin: Path | None = None, now_fn: Any = None
+        run_dir: Path,
+        *,
+        llama_bin: Path | None = None,
+        now_fn: Any = None,
+        reporter: Any = None,
     ) -> QualityOutcome:
-        seen.update(run_dir=run_dir, llama_bin=llama_bin, now_fn=now_fn)
+        seen.update(run_dir=run_dir, llama_bin=llama_bin, now_fn=now_fn, reporter=reporter)
         return _outcome(tmp_path)
 
     monkeypatch.setattr("llamatune.quality.resume_quality", capture)
@@ -257,10 +263,77 @@ def test_quality_maps_orchestrator_errors(
     exception: Exception,
     exit_code: int,
 ) -> None:
-    def fail(options: QualityOptions) -> QualityOutcome:
+    def fail(options: QualityOptions, **_kwargs: Any) -> QualityOutcome:
         raise exception
 
     monkeypatch.setattr("llamatune.quality.run_quality", fail)
     result = runner.invoke(app, ["quality", str(tmp_path / "model.gguf")])
     assert result.exit_code == exit_code
     assert "error: bad" in result.stderr
+
+
+def test_quality_ctx_size_accepts_csv_and_bare_int(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: list[QualityOptions] = []
+
+    def capture(options: QualityOptions, **_kwargs: Any) -> QualityOutcome:
+        captured.append(options)
+        return _outcome(tmp_path)
+
+    monkeypatch.setattr("llamatune.quality.run_quality", capture)
+    csv_result = runner.invoke(
+        app, ["quality", str(tmp_path / "model.gguf"), "--ctx-size", "4096,8192"]
+    )
+    assert csv_result.exit_code == 0
+    assert captured[0].ctx_size == 4096
+
+    bare_result = runner.invoke(app, ["quality", str(tmp_path / "m.gguf"), "--ctx-size", "4096"])
+    assert bare_result.exit_code == 0
+    assert captured[1].ctx_size == 4096
+
+
+def test_quality_default_ctx_size_is_8192(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[QualityOptions] = []
+
+    def capture(options: QualityOptions, **_kwargs: Any) -> QualityOutcome:
+        captured.append(options)
+        return _outcome(tmp_path)
+
+    monkeypatch.setattr("llamatune.quality.run_quality", capture)
+    result = runner.invoke(app, ["quality", str(tmp_path / "model.gguf")])
+    assert result.exit_code == 0
+    assert captured[0].ctx_size == 8192
+
+
+@pytest.mark.parametrize(
+    ("args", "expect_reporter"),
+    [
+        ([], True),
+        (["--progress", "plain"], True),
+        (["--quiet"], False),
+        (["--json"], False),
+    ],
+)
+def test_quality_threads_reporter_from_progress_options(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    args: list[str],
+    expect_reporter: bool,
+) -> None:
+    from llamatune.ui import PlainReporter
+
+    captured: dict[str, Any] = {}
+
+    def capture(options: QualityOptions, *, reporter: Any = None) -> QualityOutcome:
+        captured["reporter"] = reporter
+        return _outcome(tmp_path)
+
+    monkeypatch.setattr("llamatune.quality.run_quality", capture)
+    result = runner.invoke(app, ["quality", str(tmp_path / "model.gguf"), *args])
+    assert result.exit_code == 0
+    if expect_reporter:
+        # auto resolves to the plain renderer on a non-TTY stderr.
+        assert isinstance(captured["reporter"], PlainReporter)
+    else:
+        assert captured["reporter"] is None

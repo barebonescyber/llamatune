@@ -13,9 +13,8 @@ import shlex
 from typing import Any
 
 from llamatune.config import DIMENSION_ORDER
+from llamatune.sanitize import markdown_text, strip_control_chars
 from llamatune.types import TrialConfig
-
-_LOSSY_CACHE_TYPES = {"cache_type_k", "cache_type_v"}
 
 
 def _fmt(value: float | int | None, digits: int = 2) -> str:
@@ -39,7 +38,6 @@ def _format_config(config: dict[str, Any]) -> str:
         f"ngl={config.get('gpu_layers')} ncmoe={config.get('moe_cpu_layers')} "
         f"fa={int(bool(config.get('flash_attn')))} ub={config.get('ubatch')} "
         f"b={config.get('batch')} t={config.get('threads')} "
-        f"tb={config.get('threads_batch')} ot={config.get('ot_spec')} "
         f"mmap={int(bool(config.get('mmap')))} "
         f"nkvo={int(bool(config.get('no_kv_offload')))} "
         f"ctk={config.get('cache_type_k')} ctv={config.get('cache_type_v')}"
@@ -51,7 +49,14 @@ def _format_config(config: dict[str, Any]) -> str:
     return text
 
 
-def _runtime_flags(config: TrialConfig) -> list[str]:
+def runtime_flags(config: TrialConfig) -> list[str]:
+    """Shared llama.cpp runtime flags for one config (DESIGN §11.2 flag mapping).
+
+    Single source of truth used by both export output (``render_export``,
+    ``report.md``) and ``recommend.build_recommended_sh``, so the two always
+    agree flag-for-flag. ``ot_spec`` takes precedence over ``--n-cpu-moe``:
+    a tensor override already pins expert placement.
+    """
     flags = [
         "-ngl",
         str(config.gpu_layers),
@@ -93,7 +98,7 @@ def render_export(
         return json.dumps(recommended, indent=2, sort_keys=True) + "\n"
     config = TrialConfig.from_dict(recommended["config"])
     model_path = str((recommended.get("model") or {}).get("path", "MODEL.gguf"))
-    flags = _runtime_flags(config)
+    flags = runtime_flags(config)
     ctx = (session_meta.get("options") or {}).get("ctx_size")
     if ctx is not None:
         flags += ["-c", str(ctx)]
@@ -139,7 +144,7 @@ def render_search_plan(
     """Render the pure dry-run search plan returned by config.build_search_plan."""
     lines = [
         "llamatune dry-run search plan",
-        f"model: {model.get('name') or model.get('path', '-')}",
+        f"model: {strip_control_chars(model.get('name') or model.get('path', '-'))}",
         f"hardware: {hardware.get('cpu_model', '-')} / {len(hardware.get('gpus') or [])} GPU(s)",
         "dimensions:",
     ]
@@ -225,9 +230,9 @@ def _hardware_section(hardware: dict[str, Any]) -> str:
 
 def _model_section(model: dict[str, Any]) -> str:
     lines = [
-        f"- Path: `{model.get('path', '-')}`",
-        f"- Name: {model.get('name') or '(none)'}",
-        f"- Architecture: {model.get('architecture', '-')}",
+        f"- Path: `{markdown_text(model.get('path', '-'))}`",
+        f"- Name: {markdown_text(model.get('name') or '(none)')}",
+        f"- Architecture: {markdown_text(model.get('architecture', '-'))}",
         f"- Layers: {model.get('n_layer', '-')} (ngl_all={model.get('ngl_all', '-')})",
         f"- MoE: {model.get('moe', False)} (expert_count={model.get('expert_count', 0)})",
         f"- Size: {model.get('size_bytes', 0):,} bytes",
@@ -241,11 +246,11 @@ def _model_section(model: dict[str, Any]) -> str:
 def _llamacpp_section(llamacpp: dict[str, Any]) -> str:
     build_number = llamacpp.get("build_number")
     lines = [
-        f"- llama-bench: `{llamacpp.get('bench_path', '-')}`",
-        f"- llama-cli: `{llamacpp.get('cli_path') or '(not found)'}`",
-        f"- llama-server: `{llamacpp.get('server_path') or '(not found)'}`",
+        f"- llama-bench: `{markdown_text(llamacpp.get('bench_path', '-'))}`",
+        f"- llama-cli: `{markdown_text(llamacpp.get('cli_path') or '(not found)')}`",
+        f"- llama-server: `{markdown_text(llamacpp.get('server_path') or '(not found)')}`",
         f"- Capabilities: {', '.join(sorted(llamacpp.get('capabilities') or [])) or '(none)'}",
-        f"- Build commit: {llamacpp.get('build_commit') or '(unknown)'}",
+        f"- Build commit: {markdown_text(llamacpp.get('build_commit') or '(unknown)')}",
         f"- Build number: {build_number if build_number is not None else '(unknown)'}",
     ]
     if "bench_sha256" in llamacpp:
@@ -364,7 +369,7 @@ def _counts_section(counts: dict[str, Any]) -> str:
 def _warnings_section(warnings: list[str]) -> str:
     if not warnings:
         return "_None._\n"
-    return "\n".join(f"- {w}" for w in warnings) + "\n"
+    return "\n".join(f"- {markdown_text(w)}" for w in warnings) + "\n"
 
 
 def _summary_section(analysis: dict[str, Any]) -> str:
@@ -450,10 +455,10 @@ def _default_probe_section(analysis: dict[str, Any]) -> str:
     return (
         "\n".join(
             [
-                f"- Status: {probe.get('status', '-')}",
-                f"- Classification: {probe.get('classification', '-')}",
-                f"- Pattern: {probe.get('pattern') or '(none)'}",
-                f"- Evidence: `{probe.get('evidence', '-')}`",
+                f"- Status: {markdown_text(probe.get('status', '-'))}",
+                f"- Classification: {markdown_text(probe.get('classification', '-'))}",
+                f"- Pattern: {markdown_text(probe.get('pattern') or '(none)')}",
+                f"- Evidence: `{markdown_text(probe.get('evidence', '-'))}`",
             ]
         )
         + "\n"
@@ -695,7 +700,7 @@ def _recommended_runtime_section(
             gpu_layers=int(recommended.get("gpu_layers", config.gpu_layers)),
             moe_cpu_layers=int(recommended.get("moe_cpu_layers", config.moe_cpu_layers)),
         )
-        argv += _runtime_flags(config)
+        argv += runtime_flags(config)
     else:
         argv += ["-ngl", str(recommended.get("gpu_layers", 0))]
         if recommended.get("moe_cpu_layers") is not None:

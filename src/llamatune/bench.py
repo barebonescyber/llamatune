@@ -444,13 +444,6 @@ def failure_pattern(stderr_text: str, classification: str) -> str | None:
     return None
 
 
-def detect_oom(stderr_text: str) -> str | None:
-    """Return the matched OOM pattern string, or None (DESIGN §8)."""
-    if classify_failure(stderr_text) != "oom":
-        return None
-    return failure_pattern(stderr_text, "oom")
-
-
 def resolved_config(
     entry: dict[str, Any], *, force_gpu_layers: int | None = None, multi_gpu: bool = False
 ) -> TrialConfig:

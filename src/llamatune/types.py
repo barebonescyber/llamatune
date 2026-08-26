@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NotRequired, Protocol, TypedDict
 
 
 def _freeze_json(value: Any) -> Any:
@@ -132,12 +132,22 @@ class TrialConfig:
     ot_spec: str | None = None
     tensor_split: tuple[float, ...] | None = None
     split_mode: str | None = None
+    # Memoized trial identifier (PERF-008): computed once in __post_init__.
+    # Excluded from init/repr/compare so equality, hashing, and the public
+    # constructor signature are unchanged (DESIGN §7).
+    _trial_id: str = field(init=False, repr=False, compare=False, default="")
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_trial_id", self._compute_trial_id())
+
+    def _compute_trial_id(self) -> str:
+        canonical = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
     @property
     def trial_id(self) -> str:
         """Deterministic trial identifier: sha256(canonical JSON)[:16]."""
-        canonical = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+        return self._trial_id
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -546,19 +556,6 @@ class CoverageLedger:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class RoundRecord:
-    """Summary of one tuning round within a Marathon."""
-
-    index: int
-    session_dir: Path
-    exit_code: int
-    winner_config: TrialConfig | None
-    champion_changed: bool
-    wall_s: float
-    coverage_pct: float
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
 class MatrixCell:
     """One measured or deferred context-by-depth operating point."""
 
@@ -787,3 +784,168 @@ class QualityOutcome:
     run_dir: Path
     summary: dict[str, Any]
     exit_code: int
+
+
+# --------------------------------------------------------------------------
+# Cross-module result-dict contracts (issue #11)
+#
+# These TypedDicts document the JSON-shaped dictionaries that orchestrators
+# write into evidence and renderers read back. Producers construct them with
+# literal TypedDict expressions so mypy verifies every key; consumers that
+# read the same shapes from disk keep defensive ``.get()`` access because
+# historical journals may predate a key.
+# --------------------------------------------------------------------------
+
+
+class NightshiftWorkItemFields(TypedDict):
+    """Identity keys shared by every :class:`NightshiftItemSummary` record."""
+
+    kind: str
+    model_path: str | None
+    fingerprint: str | None
+    reference_fingerprint: str | None
+    reason: str
+
+
+class NightshiftItemSummary(NightshiftWorkItemFields, total=False):
+    """One work-item record in ``NightshiftSummary.items``.
+
+    Produced by nightshift per-item helpers (``_run_tune_class_item``,
+    ``_run_calibrate_item``, ``_run_deepen_candidate``, ``_deferred_item``);
+    consumed by the nightreport renderer, the CLI dry-run printer, and the
+    shift summary counters. Records derived from a planned item carry all
+    eight :class:`WorkItem` projection keys; hand-built records (e.g.
+    deferred siblings of a failed representative) omit the three
+    placement-estimate keys. Every producer must set ``outcome`` even though
+    it is not statically required.
+
+    ``outcome`` vocabulary: ``succeeded`` | ``failed`` (expected model
+    failure; feeds the tune-failure circuit breaker) | ``error`` (unexpected
+    internal failure or plan-invariant violation; never feeds the breaker)
+    | ``interrupted`` | ``deferred`` | ``planned`` |
+    calibration verdicts (``consistent`` | ``drift``).
+    """
+
+    outcome: str
+    session_dir: str | None
+    estimated_minutes: float | None
+    depth_workload: int | None
+    wall_s: float
+    tune_exit_code: int
+    error: str
+    calibration: dict[str, Any]
+
+
+class NightshiftWindow(TypedDict):
+    """Shift time window embedded in ``NightshiftSummary.window``."""
+
+    started: str
+    ended: str
+    deadline: str | None
+    outcome: str
+
+
+class NightshiftContentGroup(TypedDict):
+    """One content-addressed duplicate group in ``NightshiftSummary``.
+
+    The canonical key for the group label is ``group_key``; no producer has
+    ever written a competing spelling (verified against journal-writing code
+    while resolving issue #11 drift), so renderers may rely on it.
+    """
+
+    group_key: str
+    representative: str
+    members: list[str]
+
+
+class NightshiftSummary(TypedDict):
+    """The ``nightshift.json`` / ``NightshiftOutcome.summary`` contract.
+
+    Producer: ``nightshift._finalize``. Consumers: ``nightreport.render``,
+    ``cli.nightshift`` (--json and dry-run printing), and the Results Matrix
+    nightshift harvester. Declared as documentation of the exact key set;
+    the outcome field itself remains ``dict[str, Any]`` because the shared
+    evidence writer and locked renderer signatures accept plain dicts.
+    """
+
+    schema_version: int
+    options: dict[str, Any]
+    window: NightshiftWindow
+    items: list[NightshiftItemSummary]
+    counts: dict[str, int]
+    total_invocations: int
+    hardware: dict[str, Any]
+    llamacpp: dict[str, Any]
+    content_groups: list[NightshiftContentGroup]
+    warnings: list[str]
+    exit_code: int
+    constants: dict[str, Any]
+
+
+class MatrixBuildSummary(TypedDict):
+    """Summary returned by ``resultsmatrix.build``; printed by ``cli.matrix_build``."""
+
+    output: str
+    rows: int
+    current_rows: int
+    models: int
+    roots: list[str]
+    kinds: dict[str, int]
+    warnings: list[str]
+
+
+class MatrixQueryRow(TypedDict, total=False):
+    """One ranked row inside ``MatrixQueryPayload.groups[].rows``.
+
+    Base keys come from ``ResultRow.to_dict``; ``rank`` and ``compat`` are
+    added by ``matrixquery.apply``.
+    """
+
+    rank: NotRequired[int]
+    compat: NotRequired[str]
+    row_id: str
+    kind: str
+    current: bool
+    model_fingerprint: str
+    model_name: str | None
+    model_path: str
+    quant: str | None
+    hardware_hash: str
+    hardware_signature: list[Any]
+    build_discriminator: str
+    build_commit: str | None
+    config: dict[str, Any] | None
+    ctx: int | None
+    depth: int | None
+    pp_workload: int | None
+    tg_workload: int | None
+    suite_id: str | None
+    metrics: dict[str, float]
+    status: str
+    confirmed: bool
+    replicated: bool | None
+    reps: int | None
+    noise_floor_cv: float | None
+    source_root: str
+    evidence_dir: str
+    ts: str
+
+
+class MatrixQueryGroup(TypedDict):
+    """Rows grouped by hardware hash inside a matrix query payload."""
+
+    hardware_hash: str
+    hardware_signature: list[Any]
+    rows: list[MatrixQueryRow]
+
+
+class MatrixQueryPayload(TypedDict):
+    """Contract returned by ``matrixquery.apply``; rendered by ``cli``."""
+
+    filters: dict[str, Any]
+    identity: dict[str, str] | None
+    groups: list[MatrixQueryGroup]
+    excluded: dict[str, int]
+    warnings: list[str]
+    use_case: NotRequired[str | None]
+    sort: NotRequired[str | None]

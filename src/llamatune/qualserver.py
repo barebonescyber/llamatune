@@ -5,13 +5,15 @@ from __future__ import annotations
 import contextlib
 import http.client
 import json
+import secrets
 import subprocess
 import threading
 import time
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, BinaryIO, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, Protocol, cast
 
 from llamatune import executor
+from llamatune.sanitize import strip_control_chars
 
 if TYPE_CHECKING:
     from llamatune.quality import QualityRun
@@ -23,16 +25,37 @@ _STDERR_CAP = executor.STDERR_CAP_BYTES
 _READ_CHUNK = 64 * 1024
 _READINESS_POLL_S = 2.0
 
-# Module seams keep readiness tests deterministic without changing the frozen API.
-_monotonic = time.monotonic
-_sleep = time.sleep
+#: Attempts to claim an ephemeral loopback port and reach an authenticated
+#: ready state before :class:`ServerStartError` is raised (SEC-005). Every
+#: attempt shares the single ``start_timeout_s`` deadline.
+_MAX_START_ATTEMPTS = 4
+
+#: Evidence placeholder that replaces the per-launch API key in journaled
+#: argv (AGENTS.md: no credentials in evidence; names only).
+_REDACTED_API_KEY = "<redacted>"
 
 
-def _swap_monotonic(clock: Any) -> Any:
-    global _monotonic
-    previous = _monotonic
-    _monotonic = clock
-    return previous
+class Timing(Protocol):
+    """Injected monotonic clock and sleep seam for deterministic supervision."""
+
+    def monotonic(self) -> float: ...
+
+    def sleep(self, seconds: float) -> None: ...
+
+
+class RealTiming:
+    """Production :class:`Timing` backed by :mod:`time`."""
+
+    __slots__ = ()
+
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+
+REAL_TIMING: Timing = RealTiming()
 
 
 class ServerError(RuntimeError):
@@ -49,6 +72,14 @@ class ServerUnavailableError(ServerError):
 
 class ServerProtocolError(ServerError):
     """Raised for malformed, unsuccessful, or oversized HTTP replies."""
+
+
+class _StartAttemptError(Exception):
+    """Internal: one start attempt failed; ``retryable`` allows a fresh port."""
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class _Capture:
@@ -101,7 +132,14 @@ class _Capture:
             return self._truncated
 
 
-def _endpoint_argv(argv: Sequence[str], port: int) -> tuple[str, ...]:
+def _endpoint_argv(argv: Sequence[str], port: int, api_key: str) -> tuple[str, ...]:
+    """Normalize endpoint and authentication flags on a server argv.
+
+    Strips any caller-provided ``--host``/``--port``/``--api-key`` pairs so the
+    supervision layer stays the single authority for the literal loopback host,
+    the chosen port, and the per-launch credential, then appends its own
+    triplets.
+    """
     result: list[str] = []
     index = 0
     host_seen = False
@@ -119,12 +157,33 @@ def _endpoint_argv(argv: Sequence[str], port: int) -> tuple[str, ...]:
                 raise ValueError("--port requires a value")
             index += 2
             continue
+        if value == "--api-key":
+            if index + 1 >= len(argv):
+                raise ValueError("--api-key requires a value")
+            index += 2
+            continue
         result.append(value)
         index += 1
     if not host_seen:
         result.extend(("--host", _HOST))
     result.extend(("--port", str(port)))
+    result.extend(("--api-key", api_key))
     return tuple(result)
+
+
+def _redact_api_key(command: Sequence[str]) -> list[str]:
+    """Return ``command`` with every API-key value replaced by the placeholder."""
+    redacted: list[str] = []
+    skip = False
+    for value in command:
+        if skip:
+            redacted.append(_REDACTED_API_KEY)
+            skip = False
+            continue
+        redacted.append(value)
+        if value == "--api-key":
+            skip = True
+    return redacted
 
 
 def _free_loopback_port() -> int:
@@ -135,14 +194,25 @@ def _free_loopback_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _tighten_socket(sock: Any, deadline: float) -> None:
+def _auth_headers(api_key: str | None) -> dict[str, str]:
+    """Bearer authorization headers for one request (empty without a key)."""
+    if not api_key:
+        return {}
+    return {"Authorization": f"Bearer {api_key}"}
+
+
+def _tighten_socket(
+    sock: Any,
+    deadline: float,
+    timing: Timing,
+) -> None:
     """Shrink ``sock``'s timeout to the time left before ``deadline``.
 
     Raises :class:`ServerUnavailableError` once the deadline has elapsed so no
     blocking socket operation can start past it. ``sock`` may be ``None`` (no
     live socket yet), in which case only the deadline is checked.
     """
-    remaining = deadline - _monotonic()
+    remaining = deadline - timing.monotonic()
     if remaining <= 0:
         raise ServerUnavailableError("llama-server response exceeded its deadline")
     if sock is not None:
@@ -150,7 +220,12 @@ def _tighten_socket(sock: Any, deadline: float) -> None:
             sock.settimeout(remaining)
 
 
-def _read_bounded_body(sock: Any, response: http.client.HTTPResponse, deadline: float) -> bytes:
+def _read_bounded_body(
+    sock: Any,
+    response: http.client.HTTPResponse,
+    deadline: float,
+    timing: Timing,
+) -> bytes:
     """Read a size- and time-bounded response body against a hard deadline.
 
     ``sock`` is the socket the response actually reads from — captured before
@@ -166,7 +241,7 @@ def _read_bounded_body(sock: Any, response: http.client.HTTPResponse, deadline: 
     chunks: list[bytes] = []
     total = 0
     while True:
-        _tighten_socket(sock, deadline)
+        _tighten_socket(sock, deadline, timing)
         chunk = response.read1(_READ_CHUNK)
         if not chunk:
             break
@@ -185,6 +260,7 @@ def _request_within_deadline(
     *,
     body: bytes | None = None,
     headers: dict[str, str] | None = None,
+    timing: Timing,
 ) -> tuple[int, bytes]:
     """Perform one request/response cycle bounded by a single monotonic deadline.
 
@@ -201,12 +277,12 @@ def _request_within_deadline(
     """
     connection.connect()
     sock = connection.sock
-    _tighten_socket(sock, deadline)
+    _tighten_socket(sock, deadline, timing)
     connection.request(method, url, body=body, headers=headers or {})
-    _tighten_socket(sock, deadline)
+    _tighten_socket(sock, deadline, timing)
     response = connection.getresponse()
     try:
-        raw = _read_bounded_body(sock, response, deadline)
+        raw = _read_bounded_body(sock, response, deadline, timing)
         status = response.status
     finally:
         response.close()
@@ -227,6 +303,8 @@ class ServerHandle:
         control: Any,
         stdout_capture: _Capture,
         stderr_capture: _Capture,
+        api_key: str | None = None,
+        timing: Timing = REAL_TIMING,
     ) -> None:
         self._run = run
         self.launch_number = launch_number
@@ -236,6 +314,8 @@ class ServerHandle:
         self._control = control
         self._stdout_capture = stdout_capture
         self._stderr_capture = stderr_capture
+        self._api_key = api_key
+        self._timing = timing
         self._stopped = False
         self._lock = threading.Lock()
 
@@ -245,7 +325,12 @@ class ServerHandle:
 
     @property
     def stderr_tail(self) -> str:
-        return self._stderr_capture.tail.decode("utf-8", errors="replace")
+        """Decoded, control-character-stripped tail for echo/evidence surfaces.
+
+        The bounded on-disk ``server/<n>/stderr.log`` written by :meth:`stop`
+        keeps the raw captured bytes; only this surfacing accessor strips.
+        """
+        return strip_control_chars(self._stderr_capture.tail.decode("utf-8", errors="replace"))
 
     def chat(
         self,
@@ -270,7 +355,7 @@ class ServerHandle:
         # One hard monotonic deadline spans connect, request write, header
         # reception, and the complete bounded body read (never a per-recv
         # inactivity timeout that a trickling peer could reset indefinitely).
-        deadline = _monotonic() + timeout_s
+        deadline = self._timing.monotonic() + timeout_s
         connection = http.client.HTTPConnection(_HOST, self.port, timeout=max(0.01, timeout_s))
         try:
             status, raw = _request_within_deadline(
@@ -279,7 +364,12 @@ class ServerHandle:
                 "/v1/chat/completions",
                 deadline,
                 body=body,
-                headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(body)),
+                    **_auth_headers(self._api_key),
+                },
+                timing=self._timing,
             )
         except (OSError, TimeoutError, http.client.HTTPException) as exc:
             raise ServerUnavailableError(f"llama-server request failed: {exc}") from exc
@@ -304,7 +394,7 @@ class ServerHandle:
                 return
             try:
                 if self._process.poll() is None:
-                    executor._terminate_group(self._process, self._control)
+                    executor.terminate_group(self._process, self._control)
                 try:
                     self._process.wait(timeout=15.0)
                 except subprocess.TimeoutExpired:
@@ -312,7 +402,7 @@ class ServerHandle:
                         self._process.kill()
                     self._process.wait()
             finally:
-                executor._close_process_control(self._control)
+                executor.close_process_control(self._control)
                 self._stdout_capture.join()
                 self._stderr_capture.join()
                 base = f"server/{self.launch_number}"
@@ -327,22 +417,84 @@ class ServerHandle:
             self._stopped = True
 
 
-def _health(port: int, timeout_s: float) -> bool:
-    # A non-positive budget means the enclosing startup deadline has no time
-    # left: report not-ready rather than inflating it to a floor value.
+def _health(port: int, timeout_s: float, api_key: str, timing: Timing) -> int | None:
+    """Return the HTTP status of a keyed ``GET /health``, or ``None`` if not ready.
+
+    A non-positive budget means the enclosing startup deadline has no time
+    left: report not-ready rather than inflating it to a floor value. The same
+    hard deadline as chat() applies: a trickling /health body cannot overrun
+    the per-poll budget and so cannot escape the enclosing startup deadline.
+    An unreachable, malformed, oversized, or late response is ``None``; only an
+    HTTP status that the server actually produced is returned, so the caller
+    can distinguish "not ready yet" (503) from "credentials rejected" (401/403)
+    — readiness requires a 200 with this launch's key accepted.
+    """
     if timeout_s <= 0:
-        return False
-    # Same hard deadline as chat(): a trickling /health body cannot overrun the
-    # per-poll budget and so cannot escape the enclosing startup deadline.
-    deadline = _monotonic() + timeout_s
+        return None
+    deadline = timing.monotonic() + timeout_s
     connection = http.client.HTTPConnection(_HOST, port, timeout=timeout_s)
     try:
-        status, _ = _request_within_deadline(connection, "GET", "/health", deadline)
-        return status == 200
+        status, _ = _request_within_deadline(
+            connection,
+            "GET",
+            "/health",
+            deadline,
+            headers=_auth_headers(api_key),
+            timing=timing,
+        )
+        return status
     except (OSError, TimeoutError, http.client.HTTPException, ServerError):
-        return False
+        return None
     finally:
         connection.close()
+
+
+def _await_ready(
+    process: subprocess.Popen[bytes],
+    port: int,
+    api_key: str,
+    deadline: float,
+    timing: Timing,
+) -> None:
+    """Poll one spawn attempt until authenticated readiness or attempt failure.
+
+    Raises :class:`_StartAttemptError` when the child exits during startup (a
+    lost bind race is indistinguishable from any other early exit) or when a
+    peer on the port rejects this launch's credentials; both are retryable
+    under a fresh ephemeral port. Exhausting the shared deadline without a
+    keyed 200 fails the attempt non-retryably.
+    """
+    while timing.monotonic() < deadline:
+        if process.poll() is not None:
+            raise _StartAttemptError(
+                f"llama-server exited during startup with code {process.returncode}",
+                retryable=True,
+            )
+        remaining = deadline - timing.monotonic()
+        status = _health(port, min(2.0, remaining), api_key, timing)
+        if status == 200:
+            return
+        if status in (401, 403):
+            raise _StartAttemptError(
+                "another server answered on the selected loopback port and "
+                "rejected this launch's credentials",
+                retryable=True,
+            )
+        timing.sleep(min(_READINESS_POLL_S, max(0.0, deadline - timing.monotonic())))
+    raise _StartAttemptError(
+        "llama-server did not become ready before the startup timeout",
+        retryable=False,
+    )
+
+
+def _new_api_key() -> str:
+    """Return a random API key that is safe to pass as one argv element.
+
+    The prefix guarantees the first character is never ``-``.  A leading
+    hyphen makes argparse-class parsers read the key as an option flag, which
+    breaks server startup (observed with bare ``secrets.token_urlsafe``).
+    """
+    return "llamatune-" + secrets.token_urlsafe(32)
 
 
 def start(
@@ -350,41 +502,59 @@ def start(
     argv: tuple[str, ...],
     *,
     start_timeout_s: float,
+    timing: Timing = REAL_TIMING,
 ) -> ServerHandle:
-    """Launch one server on a released ephemeral loopback port and await readiness."""
+    """Launch one supervised llama-server and await authenticated readiness.
+
+    Port assignment closes the bind-close-rebind race by verification and
+    retry (SEC-005): every attempt probes a fresh ephemeral loopback port,
+    spawns the child bound to it, and demands an HTTP 200 on ``/health`` that
+    accepts this launch's bearer key before succeeding. A child that exits
+    during startup (typically a lost bind race) or an interloper server that
+    rejects the key triggers another attempt with a new port, all inside the
+    single ``start_timeout_s`` deadline; at most :data:`_MAX_START_ATTEMPTS`
+    children are spawned.
+
+    Each launch gets its own random API key (``secrets.token_urlsafe``) passed
+    to llama-server as ``--api-key`` and sent as ``Authorization: Bearer`` on
+    every client request. Journaled argv redacts the key value (no credentials
+    in evidence). ``timing`` injects the monotonic clock/sleep seam; production
+    callers rely on the default :data:`REAL_TIMING`.
+    """
     if start_timeout_s <= 0:
         raise ValueError("start_timeout_s must be positive")
-    port = _free_loopback_port()
-    command = _endpoint_argv(argv, port)
     launch_number = run._allocate_server_launch()
     env = executor.build_child_env()
-    run.write_json(
-        f"server/{launch_number}/command.json",
-        {"argv": list(command), "env_names": sorted(env)},
-    )
-    try:
-        process, control = executor._spawn(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            **executor._popen_platform_kwargs(),
+    api_key = _new_api_key()
+    deadline = timing.monotonic() + start_timeout_s
+    attempts = 0
+    while True:
+        attempts += 1
+        port = _free_loopback_port()
+        command = _endpoint_argv(argv, port, api_key)
+        run.write_json(
+            f"server/{launch_number}/command.json",
+            {"argv": _redact_api_key(command), "env_names": sorted(env)},
         )
-    except OSError as exc:
-        raise ServerStartError(f"could not start llama-server: {exc}") from exc
-    if process.stdout is None or process.stderr is None:  # pragma: no cover - PIPE invariant
         try:
-            executor._terminate_group(process, control)
-            process.wait()
-        finally:
-            executor._close_process_control(control)
-        raise ServerStartError("llama-server pipes were not created")
-    stdout_capture = _Capture(cast(BinaryIO, process.stdout), _STDOUT_CAP)
-    stderr_capture = _Capture(cast(BinaryIO, process.stderr), _STDERR_CAP)
-    handle: ServerHandle | None = None
-    try:
-        stdout_capture.start()
-        stderr_capture.start()
+            process, control = executor.spawn_supervised(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                **executor.popen_platform_kwargs(),
+            )
+        except OSError as exc:
+            raise ServerStartError(f"could not start llama-server: {exc}") from exc
+        if process.stdout is None or process.stderr is None:  # pragma: no cover - PIPE invariant
+            try:
+                executor.terminate_group(process, control)
+                process.wait()
+            finally:
+                executor.close_process_control(control)
+            raise ServerStartError("llama-server pipes were not created")
+        stdout_capture = _Capture(cast(BinaryIO, process.stdout), _STDOUT_CAP)
+        stderr_capture = _Capture(cast(BinaryIO, process.stderr), _STDERR_CAP)
         handle = ServerHandle(
             run=run,
             launch_number=launch_number,
@@ -394,40 +564,27 @@ def start(
             control=control,
             stdout_capture=stdout_capture,
             stderr_capture=stderr_capture,
+            api_key=api_key,
+            timing=timing,
         )
-        run.append({"type": "server_start", "launch": launch_number, "argv": list(command)})
-        deadline = _monotonic() + start_timeout_s
-        while _monotonic() < deadline:
-            if process.poll() is not None:
-                raise ServerStartError(
-                    f"llama-server exited during startup with code {process.returncode}"
-                )
-            remaining = deadline - _monotonic()
-            if _health(port, min(2.0, remaining)):
-                run.append({"type": "server_ready", "launch": launch_number, "port": port})
-                return handle
-            _sleep(min(_READINESS_POLL_S, max(0.0, deadline - _monotonic())))
-        raise ServerStartError("llama-server did not become ready before the startup timeout")
-    except BaseException:
-        if handle is not None:
+        try:
+            stdout_capture.start()
+            stderr_capture.start()
+            run.append(
+                {
+                    "type": "server_start",
+                    "launch": launch_number,
+                    "argv": _redact_api_key(command),
+                }
+            )
+            _await_ready(process, port, api_key, deadline, timing)
+        except _StartAttemptError as exc:
             handle.stop()
-        else:
-            try:
-                if process.poll() is None:
-                    executor._terminate_group(process, control)
-                process.wait()
-            finally:
-                executor._close_process_control(control)
-                stdout_capture.join()
-                stderr_capture.join()
-                base = f"server/{launch_number}"
-                with contextlib.suppress(Exception):
-                    run.write_text(
-                        f"{base}/stdout.log",
-                        stdout_capture.data.decode("utf-8", errors="replace"),
-                    )
-                    run.write_text(
-                        f"{base}/stderr.log",
-                        stderr_capture.data.decode("utf-8", errors="replace"),
-                    )
-        raise
+            if exc.retryable and attempts < _MAX_START_ATTEMPTS and timing.monotonic() < deadline:
+                continue
+            raise ServerStartError(str(exc)) from None
+        except BaseException:
+            handle.stop()
+            raise
+        run.append({"type": "server_ready", "launch": launch_number, "port": port})
+        return handle

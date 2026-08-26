@@ -8,7 +8,7 @@ from typing import Any, cast
 
 import pytest
 
-from llamatune.matrixquery import USE_CASES, apply
+from llamatune.matrixquery import USE_CASES, _rank_rows, apply
 from llamatune.resultsmatrix import harvest
 from llamatune.types import MatrixQuerySpec, ResultRow, ResultsMatrix, TrialConfig
 
@@ -374,3 +374,20 @@ def test_invalid_query_specs_are_rejected() -> None:
         apply(_matrix(), _spec("made-up"), None)
     with pytest.raises(ValueError, match="non-negative"):
         apply(_matrix(), _spec(limit=-1), None)
+
+
+def _metric_pp(row: ResultRow) -> float | None:
+    return row.metrics.get("perf.pp")
+
+
+def test_rank_rows_puts_missing_metrics_last_in_both_directions() -> None:
+    zero = _row("zero", metrics={"perf.pp": 0.0})
+    low = _row("low", metrics={"perf.pp": 10.0})
+    high = _row("high", metrics={"perf.pp": 90.0})
+    none_a = _row("none-a", metrics={})
+    none_b = _row("none-b", metrics={})
+    rows = [none_b, high, none_a, low, zero]
+    ascending = [row.row_id for row in _rank_rows(rows, _metric_pp, None, True, {})]
+    descending = [row.row_id for row in _rank_rows(rows, _metric_pp, None, False, {})]
+    assert ascending == ["zero", "low", "high", "none-a", "none-b"]
+    assert descending == ["high", "low", "zero", "none-a", "none-b"]
