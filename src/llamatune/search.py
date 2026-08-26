@@ -14,6 +14,7 @@ import contextlib
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import signal
 import statistics
@@ -2760,6 +2761,24 @@ class _Engine:
             and self.options.ctx_size is not None
         ):
             return
+        journaled = self._find_stage("cli_validation")
+        if (
+            journaled is not None
+            and journaled.get("trial_id") == config.trial_id
+            and journaled.get("status") in ("ok", "failed")
+            and isinstance(journaled.get("evidence"), str)
+        ):
+            status = str(journaled["status"])
+            evidence = str(journaled["evidence"])
+            self.cli_validation = {"status": status, "evidence": evidence}
+            if status != "ok":
+                warning = (
+                    "recommendation passed llama-bench context probe but failed llama-cli; "
+                    "see cli_validation evidence"
+                )
+                self.extra_warnings.append(warning)
+                self._emit("warning", message=warning)
+            return
         argv = bench.build_cli_context_argv(
             cli_path=self.llama.cli_path,
             model_path=self.model.path,
@@ -2786,7 +2805,14 @@ class _Engine:
             evidence, argv, result, 1, self._record_load(config.threads), observation
         )
         self.cli_validation = {"status": status, "evidence": evidence}
-        self._append({"type": "stage", "stage": "cli_validation", **self.cli_validation})
+        self._append(
+            {
+                "type": "stage",
+                "stage": "cli_validation",
+                "trial_id": config.trial_id,
+                **self.cli_validation,
+            }
+        )
         measured = _Measured(status, None, None, None, None)
         self._emit_exec_end(label, run_id, result, measured)
         if status != "ok":
@@ -2807,10 +2833,26 @@ class _Engine:
         ):
             return
         results: dict[str, float | None] = {}
+        journaled = {
+            str(entry["run_id"]): entry
+            for entry in self.session.entries
+            if entry.get("type") == "quality_gate_run" and isinstance(entry.get("run_id"), str)
+        }
         for name, candidate in (
             ("lossy", config),
             ("f16", dataclasses.replace(config, cache_type_k="f16", cache_type_v="f16")),
         ):
+            run_id = f"ppl-{name}-{candidate.trial_id}"
+            prior = journaled.get(run_id)
+            if (
+                prior is not None
+                and prior.get("name") == name
+                and prior.get("trial_id") == candidate.trial_id
+                and prior.get("status") == "ok"
+                and _is_finite_number(prior.get("ppl"))
+            ):
+                results[name] = float(prior["ppl"])
+                continue
             argv = bench.build_perplexity_argv(
                 perplexity_path=self.llama.perplexity_path,
                 model_path=self.model.path,
@@ -2819,7 +2861,6 @@ class _Engine:
                 ctx=self.options.ctx_size or self.options.pp + self.options.tg,
                 capabilities=self.caps,
             )
-            run_id = f"ppl-{name}-{candidate.trial_id}"
             probe_dir = self.session.probe_dir(run_id)
             result, observation = self._run_child(
                 kind="probe",
@@ -2839,6 +2880,8 @@ class _Engine:
                 self._record_load(candidate.threads),
                 observation,
             )
+            raw = result.stdout.path.read_bytes() + b"\n" + result.stderr.path.read_bytes()
+            ppl = bench.parse_perplexity_output(raw)
             self._append(
                 {
                     "type": "quality_gate_run",
@@ -2849,10 +2892,10 @@ class _Engine:
                         "ok" if result.exit_code == 0 and not result.timed_out else "failed"
                     ),
                     "evidence": f"probes/{run_id}",
+                    "ppl": ppl,
                 }
             )
-            raw = result.stdout.path.read_bytes() + b"\n" + result.stderr.path.read_bytes()
-            results[name] = bench.parse_perplexity_output(raw)
+            results[name] = ppl
         self.quality_gate = {
             "status": "ok" if all(value is not None for value in results.values()) else "failed",
             "ppl_lossy": results["lossy"],
@@ -3073,7 +3116,24 @@ class _Engine:
             return _Confirm(False, None, None, 0.0)
         pp_means: list[float] = []
         tg_means: list[float] = []
+        journaled = {
+            int(entry["run"]): entry
+            for entry in self.session.entries
+            if entry.get("type") == "confirmation_run"
+            and entry.get("trial_id") == config.trial_id
+            and isinstance(entry.get("run"), int)
+        }
         for index in range(1, self.options.baseline_runs + 1):
+            prior = journaled.get(index)
+            if (
+                prior is not None
+                and prior.get("status") == "ok"
+                and _is_finite_number(prior.get("pp_mean"))
+                and _is_finite_number(prior.get("tg_mean"))
+            ):
+                pp_means.append(float(prior["pp_mean"]))
+                tg_means.append(float(prior["tg_mean"]))
+                continue
             if not self._can_execute():
                 warning = "confirmation skipped because trial budget was exhausted"
                 if warning not in self.extra_warnings:
@@ -3576,6 +3636,14 @@ def _opt_int(value: Any) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _is_finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
 def _sign(value: int) -> int:
