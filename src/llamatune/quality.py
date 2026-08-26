@@ -1185,9 +1185,10 @@ def _summary(
     evaluated: tuple[SuiteResult, ...],
     comparison: dict[str, Any] | None,
     warnings: Sequence[str],
+    exec_isolation: str | None = None,
 ) -> dict[str, Any]:
     scores = [suite.metrics["score"] for suite in evaluated if "score" in suite.metrics]
-    return {
+    summary = {
         "schema_version": _SCHEMA_VERSION,
         "run_dir": str(run.dir),
         "created": str(run.metadata["created"]),
@@ -1217,6 +1218,9 @@ def _summary(
         "comparison": comparison,
         "warnings": list(warnings),
     }
+    if exec_isolation is not None:
+        summary["exec_isolation"] = exec_isolation
+    return summary
 
 
 def _refresh_matrix(root: Path) -> None:
@@ -1237,10 +1241,11 @@ def _phase4(
     comparison: dict[str, Any] | None,
     warnings: list[str],
     exit_code: int,
+    exec_isolation: str | None = None,
 ) -> QualityOutcome:
     if comparison is not None and comparison.get("degradation_warning"):
         warnings.append("lossy cache measurably degrades quality on this machine")
-    summary = _summary(run, resolved, evaluated, comparison, warnings)
+    summary = _summary(run, resolved, evaluated, comparison, warnings, exec_isolation)
     run.write_json("quality.json", summary)
     from llamatune.qualityreport import render
 
@@ -1300,6 +1305,10 @@ def _dry_run(resolved: _Resolved) -> QualityOutcome:
         ),
         "warnings": list(resolved.warnings),
     }
+    if resolved.options.exec_enabled:
+        from llamatune.sandbox import describe_isolation
+
+        plan["exec_isolation"] = describe_isolation().summary
     return QualityOutcome(run_dir=Path(), summary=plan, exit_code=0)
 
 
@@ -1377,6 +1386,18 @@ def _execute(
             old_handlers[signum] = signal.getsignal(signum)
             signal.signal(signum, signals.receive)
     warnings = list(resolved.warnings)
+    exec_isolation: str | None = None
+    if resolved.options.exec_enabled:
+        from llamatune.sandbox import describe_isolation
+
+        report = describe_isolation()
+        exec_isolation = report.summary
+        warnings.extend(report.warnings)
+        if report.warnings:
+            print(
+                f"WARNING: quality --exec degraded isolation: {'; '.join(report.warnings)}",
+                file=sys.stderr,
+            )
     evaluated: tuple[SuiteResult, ...] = ()
     lossless: tuple[SuiteResult, ...] = ()
     comparison = None
@@ -1427,7 +1448,7 @@ def _execute(
         interrupted = True
     except ServerStartError as exc:
         warnings.append(str(exc))
-        return _phase4(run, resolved, evaluated, comparison, warnings, 3)
+        return _phase4(run, resolved, evaluated, comparison, warnings, 3, exec_isolation)
     finally:
         if previous_clock is not None:
             qualserver_module._swap_monotonic(previous_clock)
@@ -1438,8 +1459,16 @@ def _execute(
             signal.signal(signum, handler)
     if interrupted:
         run.append({"type": "interrupted", "forced": signals.forced})
-        return _phase4(run, resolved, evaluated, comparison, warnings, 4)
-    return _phase4(run, resolved, evaluated, comparison, warnings, 1 if harness_error else 0)
+        return _phase4(run, resolved, evaluated, comparison, warnings, 4, exec_isolation)
+    return _phase4(
+        run,
+        resolved,
+        evaluated,
+        comparison,
+        warnings,
+        1 if harness_error else 0,
+        exec_isolation,
+    )
 
 
 def run_quality(

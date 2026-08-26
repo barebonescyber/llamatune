@@ -34,6 +34,9 @@ execution, bounds child runtime and captured output, passes an allowlisted child
 environment, confines session writes, and performs no runtime network access.
 It does not install models, llama.cpp, drivers, or system tuning.
 
-The optional experimental quality `--exec` path is an accident barrier, not a
-security sandbox. Never use it with adversarial generated code. See
+The optional experimental quality `--exec` path executes model-generated code behind
+layered best-effort barriers: POSIX resource limits, probed Linux network-namespace
+isolation (required unless the operator passes `--exec-allow-network`), and optional
+bubblewrap filesystem confinement. It remains an accident barrier, not a security
+sandbox. Never use it with adversarial generated code. See
 [`docs/beta-contract.md`](docs/beta-contract.md) for the complete beta boundary.

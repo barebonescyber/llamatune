@@ -572,13 +572,50 @@ KV-cache recommendation, add `--compare-lossless` to run the evaluated and lossl
 configurations serially and report per-suite deltas. Select `perplexity` only with a local
 `--quality-corpus PATH`.
 
-Generated Python is always data unless the operator explicitly enables `--exec`. That
-option runs declared coding assertions in a fresh, resource-limited POSIX subprocess with
-bounded output and time. This is an accident barrier, not a security boundary: POSIX
-limits do not inherently block network system calls, and unprivileged network namespaces
-may be unavailable. On macOS, the platform's unreliable `RLIMIT_AS` implementation is
-reported and that single address-space cap is omitted; the CPU, file-size, descriptor, and
-core-dump limits remain active. Do not enable it for an adversarial model.
+### `quality --exec` trust boundary
+
+Generated Python is always data unless the operator explicitly enables `--exec`. With
+`--exec`, llamatune extracts fenced Python blocks from model responses and executes them
+in a child process. Each child runs one suite assertion in a fresh temporary directory.
+The child gets an allowlisted environment, bounded runtime, and bounded captured output.
+
+What the sandbox confines:
+
+| Limit | Linux | macOS | Windows |
+|---|---|---|---|
+| CPU time | 10 s rlimit | 10 s rlimit | not available (`--exec` refuses) |
+| File size | 1 MiB rlimit | 1 MiB rlimit | not available |
+| Open files | 32 rlimit | 32 rlimit | not available |
+| Core dumps | disabled | disabled | not available |
+| Memory | 512 MiB address-space rlimit | data-segment and RSS rlimits where honored; no address-space cap | not available |
+| Network | confirmed network namespace (`unshare -rn`) | none | none |
+| Filesystem | bubblewrap sandbox when available | none | none |
+
+Before any execution, llamatune probes network-namespace support with a real `unshare -rn`
+test process. The probe must confirm isolation. If it does not, `--exec` refuses to run
+and llamatune exits with code `3`. Pass `--exec-allow-network` to run anyway. Isolation
+is still applied when available, even with `--exec-allow-network`.
+
+When bubblewrap (`bwrap`) is installed and works, the child sees `/usr`, `/lib`, and
+`/lib64` read-only, gets private tmpfs mounts for `/tmp`, `/home`, and `/run`, and can
+write only its own run directory. Without bubblewrap, there is no filesystem confinement.
+
+What the sandbox does NOT confine:
+
+- Without a confirmed namespace: the child can open network connections.
+- Without bubblewrap: the child reads and writes files with your account's permissions,
+  including `$HOME`.
+- On macOS and Windows: no network or filesystem confinement.
+- A confirmed namespace does not confine the filesystem. Bubblewrap does not confine
+  the network by itself here.
+
+The run summary records `exec_isolation`: `network-namespace` when confirmed active,
+or `none (allowed by flag)` after opt-in. Degraded runs add entries to the summary
+`warnings` list and print `WARNING:` lines to stderr.
+
+> WARNING: With `--exec-allow-network`, model-generated code runs with network access.
+> That code can exfiltrate files, credentials, and session evidence to remote systems.
+> Do not use it with an adversarial model.
 
 Each run writes under `<sessions-dir>/quality/<run>/`, including identity/config metadata,
 an fsynced journal, bounded request/response evidence, `quality.json`, and

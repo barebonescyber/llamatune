@@ -13,6 +13,7 @@ import tempfile
 import threading
 from contextlib import suppress
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -23,9 +24,30 @@ except ImportError:  # pragma: no cover - exercised by platform simulation
 
 _OUTPUT_LIMIT = 64 * 1024
 _WALL_LIMIT_S = 30.0
+_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
 _RUN_GUARD = threading.Lock()
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_PROCESS: subprocess.Popen[bytes] | None = None
+
+_ISOLATION_ACTIVE = "network-namespace"
+_ISOLATION_ALLOWED = "none (allowed by flag)"
+_ISOLATION_UNAVAILABLE = "none (unavailable)"
+_FS_BWRAP = "bubblewrap"
+_FS_NONE = "none"
+_BWRAP_PYTHON_MOUNT = "/llamatune-py"
+
+
+class IsolationStatus(StrEnum):
+    """Probe result for unprivileged network-namespace isolation."""
+
+    AVAILABLE = "available"
+    UNAVAILABLE_TOOL = "unavailable-tool"
+    UNAVAILABLE_PERMISSION = "unavailable-kernel-permission"
+    UNSUPPORTED_PLATFORM = "unsupported-platform"
+
+
+class SandboxIsolationError(RuntimeError):
+    """Raised before spawn when network isolation is unconfirmed and not allowed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,28 +61,70 @@ class ExecVerdict:
     stderr_tail: str
 
 
-def _limits() -> tuple[tuple[int, int], ...]:
+@dataclass(frozen=True, slots=True)
+class LimitPlan:
+    """Planned rlimits per platform; memory limits are best-effort."""
+
+    required: tuple[tuple[int, int], ...]
+    memory: tuple[tuple[int, int], ...]
+    memory_label: str
+
+
+@dataclass(frozen=True, slots=True)
+class IsolationReport:
+    """Surfaced isolation posture for one --exec enabled quality run."""
+
+    network_status: IsolationStatus
+    network_active: bool
+    filesystem_confinement: str
+    memory_limit: str
+    summary: str
+    warnings: tuple[str, ...]
+
+
+def limit_plan(platform: str) -> LimitPlan:
+    """Return the planned rlimits for the given platform (pure selection)."""
     if _resource is None:
         raise RuntimeError("Python execution sandbox requires POSIX resource limits")
-    return (
+    required = (
         (_resource.RLIMIT_CPU, 10),
-        (_resource.RLIMIT_AS, 512 * 1024 * 1024),
         (_resource.RLIMIT_FSIZE, 1024 * 1024),
         (_resource.RLIMIT_NOFILE, 32),
         (_resource.RLIMIT_CORE, 0),
+    )
+    if platform == "darwin":
+        # Darwin exposes RLIMIT_AS but rejects lowering it in a pre-exec child
+        # on some Python/macOS combinations.  Attempt RLIMIT_DATA (and RLIMIT_RSS
+        # where the platform honors it) as best-effort heap bounds instead.
+        memory = tuple(
+            (limit_id, _MEMORY_LIMIT_BYTES)
+            for limit_id in (
+                getattr(_resource, "RLIMIT_DATA", None),
+                getattr(_resource, "RLIMIT_RSS", None),
+            )
+            if limit_id is not None
+        )
+        label = "rlimit-data" if memory else "rlimit-none"
+        return LimitPlan(required=required, memory=memory, memory_label=label)
+    return LimitPlan(
+        required=required,
+        memory=((_resource.RLIMIT_AS, _MEMORY_LIMIT_BYTES),),
+        memory_label="rlimit-as",
     )
 
 
 def _apply_limits() -> None:
     if _resource is None:
         raise RuntimeError("Python execution sandbox requires POSIX resource limits")
-    for resource_id, value in _limits():
-        # Darwin exposes RLIMIT_AS but rejects lowering it in a pre-exec child
-        # on some Python/macOS combinations.  Keep the remaining accident
-        # barriers usable and report this platform limitation in the verdict.
-        if sys.platform == "darwin" and resource_id == _resource.RLIMIT_AS:
-            continue
+    plan = limit_plan(sys.platform)
+    for resource_id, value in plan.required:
         _resource.setrlimit(resource_id, (value, value))
+    for resource_id, value in plan.memory:
+        try:
+            _resource.setrlimit(resource_id, (value, value))
+        except OSError:
+            # Some platforms reject individual memory limits in a pre-exec child.
+            continue
 
 
 def _environment() -> dict[str, str]:
@@ -68,12 +132,13 @@ def _environment() -> dict[str, str]:
 
 
 @functools.lru_cache(maxsize=1)
-def _network_wrapper() -> tuple[str, ...]:
+def _network_probe() -> tuple[IsolationStatus, tuple[str, ...]]:
+    """Verify that ``unshare -rn`` actually works; never assume it does."""
     if not sys.platform.startswith("linux"):
-        return ()
+        return (IsolationStatus.UNSUPPORTED_PLATFORM, ())
     executable = shutil.which("unshare", path=os.defpath)
     if executable is None:
-        return ()
+        return (IsolationStatus.UNAVAILABLE_TOOL, ())
     try:
         probe = subprocess.run(  # noqa: S603 - fixed trusted executable and argv
             (executable, "-rn", sys.executable, "-I", "-S", "-B", "-c", "pass"),
@@ -85,8 +150,157 @@ def _network_wrapper() -> tuple[str, ...]:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return ()
-    return (executable, "-rn") if probe.returncode == 0 else ()
+        return (IsolationStatus.UNAVAILABLE_PERMISSION, ())
+    status = (
+        IsolationStatus.AVAILABLE
+        if probe.returncode == 0
+        else IsolationStatus.UNAVAILABLE_PERMISSION
+    )
+    wrapper = (executable, "-rn") if status is IsolationStatus.AVAILABLE else ()
+    return (status, wrapper)
+
+
+def detect_network_isolation() -> IsolationStatus:
+    """Return the probed network-namespace isolation status."""
+    return _network_probe()[0]
+
+
+def _network_wrapper() -> tuple[str, ...]:
+    return _network_probe()[1]
+
+
+def _interpreter_visible_in_confinement() -> bool:
+    resolved = str(Path(sys.executable).resolve())
+    return any(
+        resolved == prefix or resolved.startswith(prefix.rstrip("/") + "/")
+        for prefix in ("/usr", "/bin", "/sbin", "/lib", "/lib64")
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _bwrap_prefix_probe() -> tuple[tuple[str, ...], str] | None:
+    """Probe bubblewrap with the exact confinement argv shape we would run."""
+    if not sys.platform.startswith("linux"):
+        return None
+    executable = shutil.which("bwrap")
+    if executable is None:
+        return None
+    visible = _interpreter_visible_in_confinement()
+    child_python = (
+        sys.executable if visible else f"{_BWRAP_PYTHON_MOUNT}/{Path(sys.executable).name}"
+    )
+    alt_bind = (
+        ()
+        if visible
+        else ("--ro-bind", str(Path(sys.executable).resolve().parent), _BWRAP_PYTHON_MOUNT)
+    )
+    static = (
+        executable,
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--ro-bind-try",
+        "/lib",
+        "/lib",
+        "--ro-bind-try",
+        "/lib64",
+        "/lib64",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",  # noqa: S108 - bubblewrap mount target, not a host temp file
+        "--tmpfs",
+        "/home",
+        "--tmpfs",
+        "/run",
+        *alt_bind,
+    )
+    with tempfile.TemporaryDirectory(prefix="llamatune-bwrap-probe-") as scratch:
+        argv = (
+            *static,
+            "--bind",
+            scratch,
+            scratch,
+            "--die-with-parent",
+            child_python,
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            "pass",
+        )
+        try:
+            probe = subprocess.run(  # noqa: S603 - fixed trusted executable and argv
+                argv,
+                cwd=scratch,
+                env=_environment(),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=5.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    return (static, child_python) if probe.returncode == 0 else None
+
+
+def detect_filesystem_confinement() -> str:
+    """Return ``bubblewrap`` when bubblewrap probes usable, else ``none``."""
+    return _FS_BWRAP if _bwrap_prefix_probe() is not None else _FS_NONE
+
+
+_ALLOW_DEGRADED_NETWORK = False
+
+
+def set_allow_network_fallback(allowed: bool) -> None:
+    """Record whether the operator accepted runs without network isolation."""
+    global _ALLOW_DEGRADED_NETWORK
+    _ALLOW_DEGRADED_NETWORK = allowed
+
+
+def allow_network_fallback() -> bool:
+    """Return whether degraded (unisolated) network execution was accepted."""
+    return _ALLOW_DEGRADED_NETWORK
+
+
+def describe_isolation(*, allow_network: bool | None = None) -> IsolationReport:
+    """Summarize the isolation posture for an --exec run, with degradation warnings."""
+    allowed = allow_network_fallback() if allow_network is None else allow_network
+    status, wrapper = _network_probe()
+    active = bool(wrapper)
+    if active:
+        summary = _ISOLATION_ACTIVE
+    elif allowed:
+        summary = _ISOLATION_ALLOWED
+    else:
+        summary = _ISOLATION_UNAVAILABLE
+    warnings: list[str] = []
+    if not active:
+        warnings.append(
+            f"network namespace isolation unavailable ({status.value}); "
+            "model-generated code runs with network access"
+        )
+    filesystem = detect_filesystem_confinement()
+    if filesystem == _FS_NONE:
+        reason = (
+            "unsupported on this platform"
+            if not sys.platform.startswith("linux")
+            else "bubblewrap missing or unusable"
+        )
+        warnings.append(f"filesystem confinement inactive ({reason})")
+    memory = limit_plan(sys.platform).memory_label
+    if memory == "rlimit-none":
+        warnings.append("no memory rlimit could be applied")
+    return IsolationReport(
+        network_status=status,
+        network_active=active,
+        filesystem_confinement=filesystem,
+        memory_limit=memory,
+        summary=summary,
+        warnings=tuple(warnings),
+    )
 
 
 class _TailCapture:
@@ -118,11 +332,18 @@ def _drain(stream: BinaryIO, tail: _TailCapture) -> None:
 def _isolation_note(wrapper: tuple[str, ...]) -> str:
     notes: list[str] = []
     if sys.platform.startswith("linux") and not wrapper:
-        notes.append("network namespace isolation unavailable")
+        status = detect_network_isolation()
+        notes.append(f"network namespace isolation unavailable ({status.value})")
     elif not sys.platform.startswith("linux"):
         notes.append("network namespace isolation unsupported on this platform")
     if sys.platform == "darwin":
-        notes.append("RLIMIT_AS unsupported on this platform")
+        plan = limit_plan(sys.platform)
+        memory = (
+            "RLIMIT_DATA fallback attempted"
+            if plan.memory_label != "rlimit-none"
+            else "no memory rlimit applied"
+        )
+        notes.append(f"RLIMIT_AS unsupported on this platform; {memory}")
     return "; ".join(notes)
 
 
@@ -180,12 +401,23 @@ def terminate_active() -> bool:
         _ACTIVE_LOCK.release()
 
 
-def run_python(code: str, *, timeout_s: float) -> ExecVerdict:
-    """Execute Python with bounded POSIX resources and process-group cleanup."""
+def run_python(code: str, *, timeout_s: float, allow_network: bool | None = None) -> ExecVerdict:
+    """Execute Python with bounded POSIX resources and process-group cleanup.
+
+    Fails closed before spawning anything unless network-namespace isolation is
+    confirmed active, or the operator explicitly accepted degraded isolation.
+    """
     if os.name != "posix" or _resource is None:
         raise RuntimeError("Python execution sandbox requires POSIX resource limits")
     if not _valid_timeout(timeout_s):
         raise ValueError("timeout_s must be finite and positive")
+    allowed = allow_network_fallback() if allow_network is None else allow_network
+    status, wrapper = _network_probe()
+    if status is not IsolationStatus.AVAILABLE and not allowed:
+        raise SandboxIsolationError(
+            f"network namespace isolation unavailable ({status.value}); "
+            "pass --exec-allow-network to accept reduced isolation"
+        )
     if not _RUN_GUARD.acquire(blocking=False):
         raise RuntimeError("another Python sandbox run is already active")
 
@@ -198,8 +430,14 @@ def run_python(code: str, *, timeout_s: float) -> ExecVerdict:
     try:
         directory = Path(tempfile.mkdtemp(prefix="llamatune-quality-exec-"))
         (directory / "main.py").write_text(code, encoding="utf-8")
-        wrapper = _network_wrapper()
-        argv = (*wrapper, sys.executable, "-I", "-S", "-B", "main.py")
+        confinement = _bwrap_prefix_probe()
+        if confinement is not None:
+            static, child_python = confinement
+            head = (*static, "--bind", str(directory), str(directory), "--die-with-parent")
+        else:
+            head = ()
+            child_python = sys.executable
+        argv = (*head, *wrapper, child_python, "-I", "-S", "-B", "main.py")
         process = subprocess.Popen(  # noqa: S603 - explicit opt-in sandbox boundary
             argv,
             cwd=directory,

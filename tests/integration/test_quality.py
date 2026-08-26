@@ -310,22 +310,26 @@ def test_exec_and_no_exec_paths_never_overlap_server_and_sandbox(
         original_stop(self)
         active_server = False
 
-    def checked_sandbox(code: str, *, timeout_s: float) -> Any:
+    def checked_sandbox(code: str, *, timeout_s: float, **_kwargs: Any) -> Any:
         assert active_server is False
         return original_sandbox(code, timeout_s=timeout_s)
 
     monkeypatch.setattr(quality, "start", tracked_start)
     monkeypatch.setattr(qualserver.ServerHandle, "stop", tracked_stop)
     monkeypatch.setattr(sandbox, "run_python", checked_sandbox)
-    enabled = quality.run_quality(
-        _options(
-            tiny_gguf,
-            fake_bin_dir,
-            tmp_path / "enabled",
-            (str(suite),),
-            exec_enabled=True,
+    sandbox.set_allow_network_fallback(True)
+    try:
+        enabled = quality.run_quality(
+            _options(
+                tiny_gguf,
+                fake_bin_dir,
+                tmp_path / "enabled",
+                (str(suite),),
+                exec_enabled=True,
+            )
         )
-    )
+    finally:
+        sandbox.set_allow_network_fallback(False)
     if os.name == "posix":
         assert enabled.exit_code == 0
         assert [task["score"] for task in enabled.summary["suites"][0]["tasks"]] == [1.0, 0.0]
@@ -338,6 +342,7 @@ def test_exec_and_no_exec_paths_never_overlap_server_and_sandbox(
     )
     assert disabled.exit_code == 0
     assert disabled.summary["exec_enabled"] is False
+    assert "exec_isolation" not in disabled.summary
     assert any(
         grader.get("grader") == "exec_python"
         and grader.get("detail") == "execution disabled"
@@ -346,22 +351,127 @@ def test_exec_and_no_exec_paths_never_overlap_server_and_sandbox(
         for grader in task["graders"]
     )
 
-    def unavailable_sandbox(code: str, *, timeout_s: float) -> Any:
+    def unavailable_sandbox(code: str, *, timeout_s: float, **_kwargs: Any) -> Any:
         del code, timeout_s
         raise RuntimeError("sandbox limits unavailable")
 
     monkeypatch.setattr(sandbox, "run_python", unavailable_sandbox)
-    unavailable = quality.run_quality(
+    sandbox.set_allow_network_fallback(True)
+    try:
+        unavailable = quality.run_quality(
+            _options(
+                tiny_gguf,
+                fake_bin_dir,
+                tmp_path / "unavailable",
+                (str(suite),),
+                exec_enabled=True,
+            )
+        )
+    finally:
+        sandbox.set_allow_network_fallback(False)
+    assert unavailable.exit_code == 1
+    assert all(task["status"] == "error" for task in unavailable.summary["suites"][0]["tasks"])
+
+
+def test_exec_isolation_status_and_warnings_surface_in_summary(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_server(fake_bin_dir)
+    tasks = _coding_tasks(exec_graders=True)
+    suite = _write_suite(tmp_path, "exec-isolation", "coding", tasks)
+    monkeypatch.setenv(
+        "LLAMATUNE_FAKE_SRV_SCRIPT",
+        str(_write_script(tmp_path, _coding_script(tasks, values=(2, 3)))),
+    )
+    calls: list[bool] = []
+
+    def fake_run_python(code: str, *, timeout_s: float, **_kwargs: Any) -> Any:
+        del code, timeout_s
+        calls.append(sandbox.allow_network_fallback())
+        return sandbox.ExecVerdict(
+            passed=True,
+            exit_code=0,
+            timed_out=False,
+            stdout_tail="",
+            stderr_tail="",
+        )
+
+    report = sandbox.IsolationReport(
+        network_status=sandbox.IsolationStatus.AVAILABLE,
+        network_active=True,
+        filesystem_confinement="none",
+        memory_limit="rlimit-as",
+        summary="network-namespace",
+        warnings=("filesystem confinement inactive (bubblewrap missing or unusable)",),
+    )
+    monkeypatch.setattr(sandbox, "run_python", fake_run_python)
+    monkeypatch.setattr(sandbox, "describe_isolation", lambda **_kwargs: report)
+    outcome = quality.run_quality(
         _options(
             tiny_gguf,
             fake_bin_dir,
-            tmp_path / "unavailable",
+            tmp_path / "isolation-root",
             (str(suite),),
             exec_enabled=True,
         )
     )
-    assert unavailable.exit_code == 1
-    assert all(task["status"] == "error" for task in unavailable.summary["suites"][0]["tasks"])
+
+    assert outcome.exit_code == 0
+    assert outcome.summary["exec_isolation"] == "network-namespace"
+    assert any(
+        "filesystem confinement inactive" in warning for warning in outcome.summary["warnings"]
+    )
+    assert all(call is False for call in calls)
+    captured = capsys.readouterr()
+    assert "WARNING: quality --exec degraded isolation" in captured.err
+
+
+def test_exec_isolation_reports_allowed_fallback_summary(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_server(fake_bin_dir)
+    tasks = _coding_tasks(exec_graders=True)
+    suite = _write_suite(tmp_path, "exec-fallback", "coding", tasks)
+    monkeypatch.setenv(
+        "LLAMATUNE_FAKE_SRV_SCRIPT",
+        str(_write_script(tmp_path, _coding_script(tasks, values=(2, 2)))),
+    )
+
+    def fake_run_python(code: str, *, timeout_s: float, **_kwargs: Any) -> Any:
+        del code, timeout_s
+        return sandbox.ExecVerdict(
+            passed=True,
+            exit_code=0,
+            timed_out=False,
+            stdout_tail="",
+            stderr_tail="",
+        )
+
+    monkeypatch.setattr(sandbox, "run_python", fake_run_python)
+    sandbox.set_allow_network_fallback(True)
+    try:
+        outcome = quality.run_quality(
+            _options(
+                tiny_gguf,
+                fake_bin_dir,
+                tmp_path / "fallback-root",
+                (str(suite),),
+                exec_enabled=True,
+            )
+        )
+        summary = outcome.summary
+    finally:
+        sandbox.set_allow_network_fallback(False)
+
+    assert "exec_isolation" in summary
+    assert summary["exec_isolation"] in {"none (allowed by flag)", "network-namespace"}
 
 
 def test_server_death_relaunches_once_then_degrades_on_second_death(

@@ -624,6 +624,8 @@ def _emit_quality_outcome(outcome: Any, *, json_output: bool) -> None:
         server_argv = outcome.summary.get("server_argv")
         typer.echo(f"server argv: {json.dumps(server_argv) if server_argv else 'none'}")
         typer.echo(f"exec tier: {'enabled' if outcome.summary.get('exec_enabled') else 'disabled'}")
+        if outcome.summary.get("exec_enabled"):
+            typer.echo(f"exec isolation: {outcome.summary.get('exec_isolation', 'unknown')}")
         return
     typer.echo(f"quality run: {outcome.run_dir}")
     overall = outcome.summary.get("overall")
@@ -690,6 +692,9 @@ def quality(
     task_filters: Annotated[list[str] | None, typer.Option("--tasks")] = None,
     list_suites: Annotated[bool, typer.Option("--list-suites")] = False,
     exec_enabled: Annotated[bool, typer.Option("--exec")] = False,
+    exec_allow_network: Annotated[
+        bool, typer.Option("--exec-allow-network", help="Allow --exec without network isolation")
+    ] = False,
     ctx_size: Annotated[int, typer.Option("--ctx-size")] = 8192,
     quality_corpus: Annotated[Path | None, typer.Option("--quality-corpus")] = None,
     reps: Annotated[int, typer.Option("--reps")] = 1,
@@ -725,6 +730,7 @@ def quality(
             "suites",
             "task_filters",
             "exec_enabled",
+            "exec_allow_network",
             "ctx_size",
             "quality_corpus",
             "reps",
@@ -779,6 +785,29 @@ def quality(
     if exec_enabled and not _quality_exec_supported():
         typer.echo("error: --exec requires POSIX resource limits", err=True)
         raise typer.Exit(code=2)
+    if exec_enabled:
+        from llamatune.sandbox import IsolationStatus, detect_network_isolation
+
+        status = detect_network_isolation()
+        if status is not IsolationStatus.AVAILABLE and not exec_allow_network:
+            typer.echo(
+                f"error: --exec requires confirmed network namespace isolation "
+                f"(probe: {status.value})",
+                err=True,
+            )
+            typer.echo(
+                "error: pass --exec-allow-network to run model-generated code with network access",
+                err=True,
+            )
+            raise typer.Exit(code=3)
+        from llamatune import sandbox as sandbox_module
+
+        sandbox_module.set_allow_network_fallback(exec_allow_network)
+        if exec_allow_network:
+            typer.echo(
+                "WARNING: --exec-allow-network: model-generated code will run WITH network access",
+                err=True,
+            )
 
     selected = tuple(suites or ("coding", "tooluse", "agentic", "ifollow"))
     try:
