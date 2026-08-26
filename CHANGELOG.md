@@ -84,6 +84,12 @@ the same release.
   end the climb early (#31).
 - `scan` fails cleanly when llama-bench is missing, and table and version
   surfaces match CLI conventions (#32).
+- Cross-module result dicts carry typed contracts, per-item handlers catch
+  only expected failures so programming errors surface instead of feeding
+  circuit breakers, and redundant exception tuples and casts are removed
+  (#11).
+- Quality-server API keys always start with a literal character so argparse
+  cannot read a hyphen-led key as an option flag.
 
 ## [0.1.0-beta.3] - 2026-08-01
 
