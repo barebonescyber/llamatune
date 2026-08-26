@@ -8,19 +8,29 @@ import fnmatch
 import importlib
 import json
 import math
-import os
 import re
-import secrets
 import signal
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Self, cast
 
-from llamatune import __version__, executor
+from llamatune import executor
+from llamatune._version import __version__
 from llamatune.config import hardware_signature
+from llamatune.evidence import (
+    EvidenceWriter,
+    PathEscapeError,
+    confined_path,
+    create_unique_dir,
+)
+from llamatune.evidence import (
+    jsonable as _jsonable,
+)
+from llamatune.evidence import (
+    utc_iso as _utc_now,
+)
 from llamatune.hardware import assess_hardware
 from llamatune.llama import LlamaDiscoveryError, discover_llama
 from llamatune.model import ModelInspectionError, inspect_model
@@ -44,26 +54,15 @@ from llamatune.types import (
 )
 
 _SCHEMA_VERSION = 1
-_CREATE_RETRIES = 10
 _SAFE_COMPONENT = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
-def _utc_now() -> str:
-    return datetime.now(UTC).isoformat()
+class QualityPathError(PathEscapeError, ValueError):
+    """A quality artifact path escaped its run directory (also a ValueError)."""
 
 
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, frozenset):
-        return sorted(value)
-    if isinstance(value, tuple):
-        return [_jsonable(item) for item in value]
-    if isinstance(value, list):
-        return [_jsonable(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    return value
+def _confine(root: Path, *parts: str) -> Path:
+    return confined_path(root, *parts, error=QualityPathError)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -71,14 +70,6 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{path}: expected a JSON object")
     return value
-
-
-def _confine(root: Path, *parts: str) -> Path:
-    resolved = root.resolve()
-    target = resolved.joinpath(*parts).resolve()
-    if target != resolved and resolved not in target.parents:
-        raise ValueError(f"quality path escapes run directory: {'/'.join(parts)}")
-    return target
 
 
 def _component(value: str) -> str:
@@ -123,8 +114,10 @@ def _options_from_dict(value: dict[str, Any]) -> QualityOptions:
     )
 
 
-class QualityRun:
+class QualityRun(EvidenceWriter):
     """Sole writer for one path-confined quality evidence directory."""
+
+    path_error: type[PathEscapeError] = QualityPathError
 
     def __init__(
         self,
@@ -170,19 +163,7 @@ class QualityRun:
         argv: list[str],
     ) -> Self:
         root = sessions_dir.resolve() / "quality"
-        root.mkdir(parents=True, exist_ok=True)
-        run_dir: Path | None = None
-        for _ in range(_CREATE_RETRIES):
-            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-            candidate = root / f"{_component(model.path.stem)}-{stamp}-{secrets.token_hex(3)}"
-            try:
-                candidate.mkdir(exist_ok=False)
-            except FileExistsError:
-                continue
-            run_dir = candidate
-            break
-        if run_dir is None:
-            raise OSError(f"could not allocate a quality run under {root}")
+        run_dir = create_unique_dir(root, _component(model.path.stem), error=OSError)
         created = _utc_now()
         metadata = {
             "schema_version": _SCHEMA_VERSION,
@@ -237,13 +218,8 @@ class QualityRun:
         self.write_json("run.json", self._metadata)
 
     def append(self, entry: dict[str, Any]) -> None:
-        record = _jsonable(dict(entry))
-        record.setdefault("ts", _utc_now())
-        path = _confine(self.dir, "journal.jsonl")
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        record = self._journal_record(entry)
+        self._append_record(record)
         self._entries.append(record)
 
     def task_dir(self, suite: str, task_id: str, rep: int, side: str) -> Path:
@@ -272,19 +248,6 @@ class QualityRun:
         path = _confine(self.dir, "perplexity", f"side-{_component(side)}")
         path.mkdir(parents=True, exist_ok=True)
         return path
-
-    def write_json(self, name: str, payload: dict[str, Any]) -> None:
-        path = _confine(self.dir, name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(_jsonable(payload), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-
-    def write_text(self, name: str, text: str) -> None:
-        path = _confine(self.dir, name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1223,15 +1186,13 @@ def _summary(
     return summary
 
 
-def _refresh_matrix(root: Path) -> None:
+def _refresh_matrix(root: Path, exit_code: int) -> None:
     try:
         module = importlib.import_module("llamatune.resultsmatrix")
     except ImportError:
         return
-    try:
+    if exit_code in module.REFRESH_EXIT_CODES:
         module.refresh(root)
-    except Exception as exc:  # Phase 4 refresh can never alter the quality result
-        print(f"warning: results matrix refresh failed: {exc}", file=sys.stderr)
 
 
 def _phase4(
@@ -1251,8 +1212,7 @@ def _phase4(
 
     run.write_text("quality-report.md", render(summary))
     run.append({"type": "quality_end", "exit_code": exit_code})
-    if exit_code in {0, 1, 4}:
-        _refresh_matrix(resolved.options.sessions_dir)
+    _refresh_matrix(resolved.options.sessions_dir, exit_code)
     return QualityOutcome(run_dir=run.dir, summary=summary, exit_code=exit_code)
 
 

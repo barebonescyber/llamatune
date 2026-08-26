@@ -95,14 +95,11 @@ def _matrix_roots(sessions_dirs: list[Path] | None) -> tuple[Path, ...]:
 
 
 def _refresh_results_matrix(root: Path, exit_code: int) -> None:
-    if exit_code not in {0, 1, 4}:
-        return
-    try:
-        from llamatune.resultsmatrix import refresh
+    from llamatune.resultsmatrix import REFRESH_EXIT_CODES, refresh
 
-        refresh(root)
-    except Exception as exc:  # the owning command's result always wins
-        typer.echo(f"warning: results matrix refresh failed: {exc}", err=True)
+    if exit_code not in REFRESH_EXIT_CODES:
+        return
+    refresh(root)
 
 
 def _matrix_identity(llama_bin: Path) -> tuple[str, str]:

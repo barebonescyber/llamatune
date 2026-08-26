@@ -21,6 +21,7 @@ from llamatune.cli import (
     _refresh_results_matrix,
     app,
 )
+from llamatune.resultsmatrix import refresh
 
 write_matrix_evidence = cast(
     Callable[..., dict[str, Path]],
@@ -433,12 +434,23 @@ def test_refresh_guard_preserves_exit_and_reports_failure(
 
     def fail(root: Path) -> None:
         calls.append(root)
-        raise OSError("read-only")
 
     monkeypatch.setattr("llamatune.resultsmatrix.refresh", fail)
-    _refresh_results_matrix(tmp_path, 2)
+    for blocked in (2, 3):
+        _refresh_results_matrix(tmp_path, blocked)
     assert calls == []
 
     _refresh_results_matrix(tmp_path, 1)
-    assert calls == [tmp_path]
+    _refresh_results_matrix(tmp_path, 4)
+    assert calls == [tmp_path, tmp_path]
+
+
+def test_refresh_is_total_and_reports_failure_via_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def boom(roots: tuple[Path, ...], output_dir: Path) -> dict[str, Any]:
+        raise OSError("read-only")
+
+    monkeypatch.setattr("llamatune.resultsmatrix.build", boom)
+    refresh(tmp_path)  # must not raise
     assert "warning: results matrix refresh failed: read-only" in capsys.readouterr().err
