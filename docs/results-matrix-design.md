@@ -124,8 +124,8 @@ access; new runtime dependencies.
 
 ## 3. CLI specification
 
-One new Typer sub-application in `cli.py` (thin, lazy imports, per
-DESIGN §3), mounted as `llamatune matrix`:
+One new Typer sub-application in `cli.py` (lazy imports, command glue only,
+per DESIGN §13), mounted as `llamatune matrix`:
 
 ```
 llamatune matrix build  [--sessions-dir DIR]... [--output DIR] [--json]
@@ -137,23 +137,26 @@ llamatune matrix export [--sessions-dir DIR]... --format json|csv|md
 
 Shared options:
 
-- `--sessions-dir DIR` (repeatable; default: `./llamatune-sessions`) —
-  roots to harvest. Every subcommand harvests fresh from the evidence on
-  each invocation (§6.1); the materialized artifact is an export for
-  direct file readers, never a cache consulted by the CLI.
+- `--sessions-dir DIR` (repeatable, default `./llamatune-sessions`) —
+  roots to harvest. Each invocation harvests rows from the underlying
+  evidence (§6.1). To speed refresh, refresh keeps a per-source digest
+  cache (`source_cache`) inside the artifact and skips re-parsing sources
+  whose digest is unchanged. Rows remain derived evidence, and cached rows
+  equal a full rebuild by construction. A missing, malformed, or
+  stale-version cache forces a full rebuild.
 
 `matrix build`:
 
 - Harvests all roots and writes `results-matrix.json` and
   `results-matrix.md` under `--output DIR` (default:
   `<first-root>/matrix/`). Prints a one-line summary (rows, models,
-  roots, warnings count); `--json` prints the §6.3 build summary instead.
+  roots, warnings count). `--json` prints the §6.3 build summary instead.
 
 `matrix query`:
 
 - `--use-case NAME` — one of the §7.1 named use cases. Mutually exclusive
   with `--sort`.
-- `--sort METRIC` — rank by any metric name, descending;
+- `--sort METRIC` — rank by any metric name, descending.
   `--ascending` flips.
 - Filters (§7.2): `--model TEXT` (substring of name, path stem, or
   fingerprint prefix), `--quant TEXT`, `--kind NAME` (repeatable),
@@ -165,7 +168,7 @@ Shared options:
   compute compatibility annotations (§7.3). Without it, compatibility is
   `unknown` and `--compat current` is a usage error (exit 2).
 - `--limit N` (default 10, `0` = unlimited).
-- `--json` — machine-readable result rows (§7.4); otherwise a human
+- `--json` — machine-readable result rows (§7.4). Otherwise a human
   table.
 
 `matrix show`:
@@ -176,8 +179,8 @@ Shared options:
 
 `matrix export`:
 
-- `--format json|csv|md`; `--output PATH` (default stdout). `json` is the
-  full §6.2 document; `csv` and `md` are the flattened row table (§8).
+- `--format json|csv|md`, plus `--output PATH` (default stdout). `json` is the
+  full §6.2 document. `csv` and `md` are the flattened row table (§8).
 
 Validation errors (unknown use case, unknown kind, `--compat current`
 without `--llama-bin`, no readable root) exit 2 with a one-line `error:`
@@ -193,8 +196,8 @@ message, matching existing CLI conventions.
   `--output` is not writable, or `--llama-bin` was given but no usable
   `llama-bench` was found there.
 
-Corrupt or unreadable individual sessions/runs never change the exit code;
-they are skipped and surfaced in `warnings` (§5.4).
+Corrupt or unreadable individual sessions/runs never change the exit code.
+They are skipped and surfaced in `warnings` (§5.4).
 
 ## 4. Row model and schema
 
