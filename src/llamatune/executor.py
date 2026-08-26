@@ -4,6 +4,13 @@ Executes argv lists with an allowlisted environment, bounded output capture,
 and process-group timeout handling. This module never interprets benchmark
 semantics (that belongs to ``bench.py``); it only runs a command and reports
 exit status, wall time, and hashed/sized/truncated output artifacts.
+
+Public supervision surface for long-lived children: :func:`spawn_supervised`,
+:func:`terminate_group`, :func:`close_process_control`,
+:func:`popen_platform_kwargs`, and their opaque :class:`ProcessControl` handle.
+These are the supported way to run and stop a supervised child (such as
+``llama-server``) that outlives a single :func:`run` call; the identical
+SIGTERM/SIGKILL and Job Object semantics apply on every path.
 """
 
 from __future__ import annotations
@@ -111,8 +118,13 @@ class ProbeResult:
 
 
 @dataclass(slots=True)
-class _ProcessControl:
-    """Platform process-tree state retained for one child lifetime."""
+class ProcessControl:
+    """Platform process-tree state retained for one child lifetime.
+
+    Opaque handle returned by :func:`spawn_supervised`; pass it back to
+    :func:`terminate_group` and :func:`close_process_control`. Callers never
+    inspect its fields.
+    """
 
     windows: bool
     job_handle: object | None = None
@@ -233,24 +245,35 @@ def _create_windows_job(pid: int) -> object | None:
     return None
 
 
-def _popen_platform_kwargs(preexec_fn: Callable[[], None] | None = None) -> dict[str, Any]:
+def popen_platform_kwargs(preexec_fn: Callable[[], None] | None = None) -> dict[str, Any]:
+    """Keyword arguments that give a child its own process group on this platform."""
     if _WINDOWS:
         return {"creationflags": _CREATE_NEW_PROCESS_GROUP}
     return {"start_new_session": True, "preexec_fn": preexec_fn}
 
 
-def _spawn(argv: Sequence[str], **kwargs: Any) -> tuple[subprocess.Popen[bytes], _ProcessControl]:
+def spawn_supervised(
+    argv: Sequence[str], **kwargs: Any
+) -> tuple[subprocess.Popen[bytes], ProcessControl]:
+    """Start ``argv`` and return its process plus platform :class:`ProcessControl`.
+
+    Part of the public supervision surface used by long-lived children (such as
+    ``llama-server``) that outlive a single :func:`run` call. Semantics are the
+    DESIGN §7 spawn contract: argv list, no shell, caller-provided bounded
+    streams and allowlisted environment.
+    """
     proc = subprocess.Popen(  # noqa: S603
         list(argv),
         **kwargs,
     )
-    control = _ProcessControl(windows=_WINDOWS)
+    control = ProcessControl(windows=_WINDOWS)
     if _WINDOWS:
         control.job_handle = _create_windows_job(proc.pid)
     return proc, control
 
 
-def _close_process_control(control: _ProcessControl) -> None:
+def close_process_control(control: ProcessControl) -> None:
+    """Release any platform job handle held by ``control`` (idempotent)."""
     if control.job_handle is None:
         return
     with contextlib.suppress(AttributeError, OSError):
@@ -347,7 +370,7 @@ def _taskkill_tree(pid: int) -> None:
         )
 
 
-def _terminate_group(proc: subprocess.Popen[bytes], control: _ProcessControl | None = None) -> None:
+def terminate_group(proc: subprocess.Popen[bytes], control: ProcessControl | None = None) -> None:
     """Terminate the child's platform process tree (DESIGN §7)."""
     if control is None or not control.windows:
         _terminate_posix_group(proc)
@@ -358,7 +381,7 @@ def _terminate_group(proc: subprocess.Popen[bytes], control: _ProcessControl | N
             terminated = _windows_api().terminate(control.job_handle)
         except (AttributeError, OSError):
             terminated = False
-        _close_process_control(control)
+        close_process_control(control)
     if not terminated:
         _taskkill_tree(proc.pid)
 
@@ -383,12 +406,12 @@ def run_probe(
     Returns ``None`` only when the process cannot be started.
     """
     try:
-        proc, control = _spawn(
+        proc, control = spawn_supervised(
             list(argv),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=build_child_env(),
-            **_popen_platform_kwargs(),
+            **popen_platform_kwargs(),
         )
     except OSError:
         return None
@@ -427,11 +450,11 @@ def run_probe(
             proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             timed_out = True
-            _terminate_group(proc, control)
+            terminate_group(proc, control)
             proc.wait()
     except BaseException:
         with contextlib.suppress(Exception):
-            _terminate_group(proc, control)
+            terminate_group(proc, control)
             proc.wait()
         out_thread.join()
         err_thread.join()
@@ -440,7 +463,7 @@ def run_probe(
         out_thread.join()
         err_thread.join()
     finally:
-        _close_process_control(control)
+        close_process_control(control)
     if capture_errors:
         name = sorted(capture_errors)[0]
         error = capture_errors[name]
@@ -493,13 +516,13 @@ def run(
 
         preexec_fn = _disable_core_dumps
 
-    proc, control = _spawn(
+    proc, control = spawn_supervised(
         list(argv),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=child_env,
         cwd=str(cwd) if cwd is not None else None,
-        **_popen_platform_kwargs(preexec_fn),
+        **popen_platform_kwargs(preexec_fn),
     )
     stdout_stream = proc.stdout
     stderr_stream = proc.stderr
@@ -540,7 +563,7 @@ def run(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
-                _terminate_group(proc, control)
+                terminate_group(proc, control)
                 proc.wait()  # reap; platform termination guarantees completion
                 break
             try:
@@ -552,7 +575,7 @@ def run(
                         on_heartbeat(time.monotonic() - start)
     except BaseException:
         with contextlib.suppress(Exception):
-            _terminate_group(proc, control)
+            terminate_group(proc, control)
             proc.wait()
         out_thread.join()
         err_thread.join()
@@ -561,7 +584,7 @@ def run(
         out_thread.join()
         err_thread.join()
     finally:
-        _close_process_control(control)
+        close_process_control(control)
     exit_code = proc.poll()
     wall_s = time.monotonic() - start
     ended_dt = datetime.now(UTC)

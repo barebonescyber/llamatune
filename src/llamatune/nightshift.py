@@ -519,6 +519,7 @@ def run_nightshift(
             options.exclude,
             duplicates=options.duplicates,
             full_hash=options.full_hash,
+            follow_symlinks=False,
         )
         records = _context_compatible_records(
             build_registry(options.sessions_dir), options.ctx_size
