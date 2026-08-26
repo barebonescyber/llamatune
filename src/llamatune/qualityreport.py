@@ -4,11 +4,24 @@ from __future__ import annotations
 
 import json
 import shlex
+from collections.abc import Callable
 from typing import Any
+
+from llamatune.sanitize import markdown_cell, strip_control_chars
 
 
 def _text(value: Any) -> str:
-    return str(value).replace("|", "\\|").replace("\n", " ")
+    """Table-cell escaping: HTML/backslash/control-char safety plus pipes/newlines."""
+    return markdown_cell(value)
+
+
+def _literal(value: Any) -> str:
+    """Pipe/newline/control-char discipline only.
+
+    For locally generated JSON payloads rendered inside code spans or table
+    cells: HTML entities would show literally there, so no entity escaping.
+    """
+    return strip_control_chars(str(value)).replace("|", "\\|").replace("\n", " ")
 
 
 def _score(value: Any) -> str:
@@ -31,12 +44,17 @@ def _argv(value: Any) -> str:
     return str(value) if value else "unavailable in schema v1"
 
 
-def _table(headers: tuple[str, ...], rows: list[tuple[Any, ...]]) -> list[str]:
+def _table(
+    headers: tuple[str, ...],
+    rows: list[tuple[Any, ...]],
+    *,
+    escaper: Callable[[Any], str] = _text,
+) -> list[str]:
     lines = [
         "| " + " | ".join(headers) + " |",
         "| " + " | ".join("---" for _ in headers) + " |",
     ]
-    lines.extend("| " + " | ".join(_text(value) for value in row) + " |" for row in rows)
+    lines.extend("| " + " | ".join(escaper(value) for value in row) + " |" for row in rows)
     return lines
 
 
@@ -108,6 +126,7 @@ def render(summary: dict[str, Any]) -> str:
         _table(
             ("Setting", "Value"),
             [(key, json.dumps(config[key], sort_keys=True)) for key in ordered_keys],
+            escaper=_literal,
         )
     )
     lines.extend(
@@ -119,7 +138,7 @@ def render(summary: dict[str, Any]) -> str:
     )
     if comparison is not None:
         lossless = comparison.get("lossless_config")
-        lines.append(f"Lossless configuration: `{_text(json.dumps(lossless, sort_keys=True))}`")
+        lines.append(f"Lossless configuration: `{_literal(json.dumps(lossless, sort_keys=True))}`")
         deltas = _array(comparison.get("suites"))
         lines.extend(("", "Lossless suite comparison:", ""))
         lines.extend(
@@ -135,6 +154,7 @@ def render(summary: dict[str, Any]) -> str:
                     for row in deltas
                     if isinstance(row, dict)
                 ],
+                escaper=_literal,
             )
         )
         if comparison.get("degradation_warning"):
@@ -191,7 +211,7 @@ def render(summary: dict[str, Any]) -> str:
 
     build = _object(summary.get("build"))
     launches = summary.get("server_launches", [])
-    hardware = _text(json.dumps(summary.get("hardware_signature", []), sort_keys=True))
+    hardware = _literal(json.dumps(summary.get("hardware_signature", []), sort_keys=True))
     discriminator = _text(build.get("bench_sha256") or build.get("help_sha256") or "unknown")
     launch_count: int | str
     if "server_launches" not in summary:

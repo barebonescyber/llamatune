@@ -8,6 +8,7 @@ import math
 from collections.abc import Callable
 from typing import Any
 
+from llamatune.sanitize import markdown_cell
 from llamatune.types import ResultRow, ResultsMatrix
 
 _GOOD_STATUSES = frozenset({"ok", "replicated", "consistent"})
@@ -40,7 +41,8 @@ _CSV_FIELDS = (
 
 
 def _escape(value: Any) -> str:
-    return str(value).replace("|", "\\|").replace("\n", " ")
+    """Table-cell escaping: HTML/backslash/control-char safety plus pipes/newlines."""
+    return markdown_cell(value)
 
 
 def _number(value: float | None) -> str:

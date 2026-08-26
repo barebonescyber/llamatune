@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from llamatune.sanitize import markdown_cell, markdown_text
+
 
 def _pct(value: Any) -> str:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
@@ -49,7 +51,7 @@ def _item_result(item: dict[str, Any], *, retuned: bool = False) -> str:
         improvement = item.get("winner_improvement")
         if improvement is not None:
             text += f", new winner {_pct(improvement)}"
-    return text
+    return markdown_cell(text)
 
 
 def _identity(summary: dict[str, Any]) -> list[str]:
@@ -91,11 +93,11 @@ def render(summary: dict[str, Any]) -> str:
         for group in groups:
             if isinstance(group, dict):
                 lines.append(
-                    f"  - {group.get('key') or group.get('group_key') or '-'}: "
-                    f"representative {group.get('representative') or '-'}"
+                    f"  - {markdown_text(group.get('key') or group.get('group_key') or '-')}: "
+                    f"representative {markdown_text(group.get('representative') or '-')}"
                 )
             else:
-                lines.append(f"  - {group}")
+                lines.append(f"  - {markdown_text(group)}")
 
     if any(
         isinstance(item, dict)
@@ -134,8 +136,8 @@ def render(summary: dict[str, Any]) -> str:
             action = item.get("kind") or item.get("action") or "-"
             was_retuned = item.get("fingerprint") in retuned_fingerprints and action == "calibrate"
             lines.append(
-                f"| {model_name} | `{str(item.get('fingerprint') or '-')[:16]}` | "
-                f"{action} | {_item_result(item, retuned=was_retuned)} |"
+                f"| {markdown_cell(model_name)} | `{str(item.get('fingerprint') or '-')[:16]}` | "
+                f"{markdown_cell(action)} | {_item_result(item, retuned=was_retuned)} |"
             )
     else:
         lines.append("| _None_ | - | - | - |")
@@ -153,15 +155,15 @@ def render(summary: dict[str, Any]) -> str:
             estimate = item.get("estimated_minutes")
             estimate_text = f"{estimate} min" if estimate is not None else "-"
             lines.append(
-                f"| {label} | {item.get('outcome')} | {item.get('reason') or '-'} | "
-                f"{estimate_text} |"
+                f"| {markdown_cell(label)} | {markdown_cell(item.get('outcome'))} | "
+                f"{markdown_cell(item.get('reason') or '-')} | {estimate_text} |"
             )
     else:
         lines.append("_None._")
 
     lines.extend(["", "## Warnings", ""])
     warnings = summary.get("warnings") or []
-    lines.extend(f"- {warning}" for warning in warnings)
+    lines.extend(f"- {markdown_text(warning)}" for warning in warnings)
     if not warnings:
         lines.append("_None._")
     return "\n".join(lines) + "\n"

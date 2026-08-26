@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, BinaryIO, Protocol, cast
 
 from llamatune import executor
+from llamatune.sanitize import strip_control_chars
 
 if TYPE_CHECKING:
     from llamatune.quality import QualityRun
@@ -324,7 +325,12 @@ class ServerHandle:
 
     @property
     def stderr_tail(self) -> str:
-        return self._stderr_capture.tail.decode("utf-8", errors="replace")
+        """Decoded, control-character-stripped tail for echo/evidence surfaces.
+
+        The bounded on-disk ``server/<n>/stderr.log`` written by :meth:`stop`
+        keeps the raw captured bytes; only this surfacing accessor strips.
+        """
+        return strip_control_chars(self._stderr_capture.tail.decode("utf-8", errors="replace"))
 
     def chat(
         self,
