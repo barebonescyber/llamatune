@@ -361,6 +361,28 @@ def is_fully_offloaded(gpu_layers: int, ngl_all: int) -> bool:
     return gpu_layers >= ngl_all
 
 
+#: A fully-offloaded run whose tg is within this factor of a pure-CPU
+#: reference is treated as host-memory spill suspected (issue #36).
+SPILL_TG_TOLERANCE = 1.3
+
+#: A fully-offloaded run whose observed device-memory delta is below this
+#: fraction of the estimated total need is treated as host-memory spill
+#: suspected (issue #36).
+SPILL_VRAM_DELTA_FRACTION = 0.5
+
+
+def is_cpu_class_speed(tg_mean: float, cpu_reference_tg: float) -> bool:
+    """Whether a measured tg is indistinguishable from the CPU reference."""
+    return cpu_reference_tg > 0 and tg_mean <= cpu_reference_tg * SPILL_TG_TOLERANCE
+
+
+def is_spill_vram_delta(observed_used_delta_mb: float, estimated_total_mb: float) -> bool:
+    """Whether an observed device-memory delta is far below the estimate."""
+    return estimated_total_mb > 0 and observed_used_delta_mb < (
+        estimated_total_mb * SPILL_VRAM_DELTA_FRACTION
+    )
+
+
 def has_gpu_backend(llama: LlamaCppReport) -> bool | None:
     """Whether the baseline reported a non-CPU llama.cpp backend."""
     if llama.backends is None:

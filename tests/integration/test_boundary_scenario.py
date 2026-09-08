@@ -87,6 +87,7 @@ def test_safe_fallback_boundary_and_context_recommendation(
         "probes": boundary["probes"],
         "cap_ngl": 33,
         "cap_source": "model",
+        "spill_suspected": False,
     }
     probes = [entry for entry in session.entries if entry.get("type") == "probe"]
     assert any(

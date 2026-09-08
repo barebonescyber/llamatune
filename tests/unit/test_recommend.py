@@ -104,6 +104,7 @@ class TestComputeCounts:
             "executed": 7,
             "ok": 1,
             "unstable": 1,
+            "host_spill": 0,
             "oom": 1,
             "cuda_error": 1,
             "gpu_resource": 0,

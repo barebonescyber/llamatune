@@ -57,6 +57,7 @@ _COUNT_KEYS = {
     "executed",
     "ok",
     "unstable",
+    "host_spill",
     "oom",
     "cuda_error",
     "gpu_resource",

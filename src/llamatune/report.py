@@ -355,6 +355,7 @@ def _counts_section(counts: dict[str, Any]) -> str:
         "executed",
         "ok",
         "unstable",
+        "host_spill",
         "oom",
         "cuda_error",
         "gpu_resource",
@@ -483,6 +484,8 @@ def _pair(label: str, value: Any) -> str:
             f", pp={_fmt(value.get('pp'))}, tg={_fmt(value.get('tg'))}, "
             f"score={_fmt(value.get('score'), 4)}"
         )
+    if value.get("spill_suspected"):
+        metrics = f"{metrics}, host-spill suspected" if metrics else ", host-spill suspected"
     reason = f" — {value['reason']}" if value.get("reason") else ""
     return f"- {label}: `{placement}`{metrics}{reason}"
 
@@ -520,6 +523,8 @@ def _feasibility_section(analysis: dict[str, Any]) -> str:
                 if warm_start_capped
                 else str(max_ok)
             )
+            if boundary.get("spill_suspected"):
+                max_display = f"{max_display} (host-spill suspected)"
             lines.append(
                 f"| {boundary.get('moe_cpu_layers', '-')} | {max_display} | "
                 f"{min_fail if min_fail is not None else '-'} | "
@@ -532,6 +537,12 @@ def _feasibility_section(analysis: dict[str, Any]) -> str:
             lines += [
                 "",
                 "_A search cap is inherited from another boundary; it is not a measured maximum._",
+            ]
+        if any(boundary.get("spill_suspected") for boundary in boundaries):
+            lines += [
+                "",
+                "_Host-memory spill was suspected at a fully offloaded placement; its "
+                "measurements were excluded from feasibility and scoring._",
             ]
     else:
         lines.append("- Boundaries: not evaluated")

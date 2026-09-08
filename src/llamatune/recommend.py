@@ -46,6 +46,7 @@ def compute_counts(records: list[dict[str, Any]]) -> dict[str, int]:
         "executed": 0,
         "ok": 0,
         "unstable": 0,
+        "host_spill": 0,
         "oom": 0,
         "cuda_error": 0,
         "gpu_resource": 0,

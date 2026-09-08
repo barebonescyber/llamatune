@@ -28,6 +28,8 @@ from typing import Any, cast
 from llamatune import bench, executor, recommend, stats
 from llamatune.config import (
     DIMENSION_ORDER,
+    SPILL_TG_TOLERANCE,
+    SPILL_VRAM_DELTA_FRACTION,
     applicable_dimensions,
     candidates_for,
     dimension_value,
@@ -40,6 +42,9 @@ from llamatune.config import (
     gpu_present,
     hardware_signature,
     has_gpu_backend,
+    is_cpu_class_speed,
+    is_fully_offloaded,
+    is_spill_vram_delta,
     is_valid_config,
     moe_cpu_layer_candidates,
     multi_gpu_capacity_check,
@@ -71,6 +76,10 @@ _TRIAL_TIMEOUT_MIN_S = 120.0
 _TRIAL_TIMEOUT_MAX_S = 3600.0
 _DEEP_TRIAL_TIMEOUT_MAX_S = 7200.0
 _THERMAL_WAIT_CYCLE_S = 10.0
+
+#: Backends that hard-fail over-allocation through stderr signatures; spill
+#: detection (issue #36) does not apply to them.
+_TRUSTED_OOM_BACKENDS = ("CUDA", "cuda", "Metal")
 
 
 def _sample_gpu_state() -> GpuSample | None:
@@ -1093,6 +1102,8 @@ class _Engine:
         Always anchors the incumbent on the baseline first, so a budget
         exhausted (or failing) seed trial still leaves a measured reference.
         """
+        if self.baseline.fallback != "cpu":
+            self._check_baseline_spill()
         self._set_incumbent(
             self.default_config,
             self.baseline.pp.mean,
@@ -1102,6 +1113,105 @@ class _Engine:
 
         # Boundary discovery, rather than an unproven full-offload seed,
         # advances from this measured anchor.
+
+    def _check_baseline_spill(self) -> None:
+        """Detect a full-offload baseline that runs at CPU-class speed (issue #36).
+
+        Reuses the ngl=0 CPU-fallback runs as the reference when the baseline
+        previously fell back to CPU; otherwise spends at most one bounded
+        ngl=0 reference trial. A suspicious full-offload baseline is demoted
+        to `host_spill` so it never anchors the search as a feasible GPU
+        placement; the search then re-anchors through boundary discovery.
+        """
+        defaults = self.default_config
+        tg_mean = self.baseline.tg.mean
+        if tg_mean is None or tg_mean <= 0:
+            return
+        cpu_tg = self._cpu_reference_tg()
+        if cpu_tg is None and self._spill_applicable() and self._can_execute():
+            argv = bench.build_baseline_argv(
+                bench_path=self.llama.bench_path,
+                model_path=self.model.path,
+                pp=self.options.pp,
+                tg=self.options.tg,
+                reps=self.options.reps_confirm,
+                ngl=0,
+                capabilities=self.caps,
+                depth=self.options.depth,
+            )
+            run_dir = self.session.baseline_dir(self.options.baseline_runs + 1)
+            result, observation = self._run_child(
+                kind="baseline",
+                label="baseline CPU reference 1/1",
+                run_id=f"baseline-{self.options.baseline_runs + 1}",
+                argv=argv,
+                timeout_s=_BASELINE_TIMEOUT_S,
+                stdout_path=run_dir / "stdout.json",
+                stderr_path=run_dir / "stderr.log",
+            )
+            self.executed_count += 1
+            reference = self._classify(result, self.options.reps_confirm)
+            self._write_command(
+                f"baseline/run-{self.options.baseline_runs + 1}",
+                argv,
+                result,
+                self.options.reps_confirm,
+                self._record_load(self.hardware.physical_cores),
+                observation,
+            )
+            if reference.status == "ok" and reference.tg is not None:
+                self._append(
+                    {
+                        "type": "baseline_run",
+                        "run": self.options.baseline_runs + 1,
+                        "ngl": 0,
+                        "status": "ok",
+                        "pp_mean": reference.pp.mean if reference.pp is not None else None,
+                        "tg_mean": reference.tg.mean,
+                        "oom_pattern": None,
+                        "cpu_reference": True,
+                    }
+                )
+                cpu_tg = reference.tg.mean
+            else:
+                self._append(
+                    {
+                        "type": "baseline_run",
+                        "run": self.options.baseline_runs + 1,
+                        "ngl": 0,
+                        "status": reference.status,
+                        "pp_mean": None,
+                        "tg_mean": None,
+                        "oom_pattern": reference.oom_pattern,
+                        "cpu_reference": True,
+                    }
+                )
+        if cpu_tg is None or not is_cpu_class_speed(tg_mean, cpu_tg):
+            return
+        demoted = f"baseline tg {tg_mean:.2f} t/s is within {SPILL_TG_TOLERANCE}x of the CPU reference {cpu_tg:.2f} t/s; host-memory spill suspected"  # noqa: E501
+        self._append(
+            {
+                "type": "stage",
+                "stage": "host_spill_suspected",
+                "config": defaults.to_dict(),
+                "reasons": [demoted],
+            }
+        )
+        self._emit("warning", message=f"host-memory spill suspected at baseline: {demoted}")
+        self.baseline = dataclasses.replace(self.baseline, kind="host_spill")
+        self.known[defaults.trial_id] = {
+            "type": "trial",
+            "trial_id": defaults.trial_id,
+            "config": defaults.to_dict(),
+            "status": "host_spill",
+            "pp_mean": self.baseline.pp.mean,
+            "tg_mean": tg_mean,
+            "score": None,
+            "flags": list(defaults.bench_args(self.caps)),
+            "dim": "baseline",
+            "oom_pattern": None,
+            "pruned_from": None,
+        }
 
     def _set_incumbent(self, config: TrialConfig, pp: float, tg: float, score: float) -> None:
         self.incumbent_config = config
@@ -1190,7 +1300,13 @@ class _Engine:
         for ncmoe in ladder:
             boundary = self._discover_boundary(self.incumbent_config, ncmoe, warm_cap)
             self.boundaries.append(boundary)
-            self._append({"type": "stage", "stage": "boundary", **dataclasses.asdict(boundary)})
+            self._append(
+                {
+                    "type": "stage",
+                    "stage": "boundary",
+                    **dataclasses.asdict(boundary),
+                }
+            )
             self._emit("boundary", **dataclasses.asdict(boundary))
             warm_cap = boundary.max_ok_ngl if _boundary_has_fit(boundary) else None
         self._bisect_minimum_spill()
@@ -1260,6 +1376,7 @@ class _Engine:
         base = dataclasses.replace(base, moe_cpu_layers=ncmoe)
         low: int | None = None
         failed, used = None, 0
+        spill_suspected = False
         limit = 2 * max(1, max(1, self.model.ngl_all).bit_length()) + 4
         baseline_verified = (
             hasattr(self, "baseline")
@@ -1273,12 +1390,30 @@ class _Engine:
             guess = self.options.initial_gpu_layers
             if guess is None or guess > cap:
                 guess = min(cap, 1)
-            status = self._probe(dataclasses.replace(base, gpu_layers=guess), "boundary", None)
+            probe_cfg = dataclasses.replace(base, gpu_layers=guess)
+            status = self._probe(probe_cfg, "boundary", None)
             used += 1
+            spill = (
+                self._boundary_spill_suspected(probe_cfg, _Measured(status, None, None, None, None))
+                if status == "ok"
+                else None
+            )
+            if spill is not None:
+                self._append(
+                    {
+                        "type": "stage",
+                        "stage": "host_spill_suspected",
+                        "config": probe_cfg.to_dict(),
+                        **spill,
+                    }
+                )
+                status = "host_spill"
             if status == "ok":
                 low = guess
             else:
                 failed = guess
+                if status == "host_spill":
+                    spill_suspected = True
                 if guess > 0 and used < limit:
                     status = self._probe(dataclasses.replace(base, gpu_layers=0), "boundary", None)
                     used += 1
@@ -1297,10 +1432,31 @@ class _Engine:
                 failed = guess
         while low is not None and failed is not None and failed - low > 1 and used < limit:
             guess = (low + failed) // 2
-            if self._probe(dataclasses.replace(base, gpu_layers=guess), "boundary", None) == "ok":
+            bisect_cfg = dataclasses.replace(base, gpu_layers=guess)
+            status = self._probe(bisect_cfg, "boundary", None)
+            spill = (
+                self._boundary_spill_suspected(
+                    bisect_cfg, _Measured(status, None, None, None, None)
+                )
+                if status == "ok"
+                else None
+            )
+            if spill is not None:
+                self._append(
+                    {
+                        "type": "stage",
+                        "stage": "host_spill_suspected",
+                        "config": bisect_cfg.to_dict(),
+                        **spill,
+                    }
+                )
+                status = "host_spill"
+            if status == "ok":
                 low = guess
             else:
                 failed = guess
+            if status == "host_spill":
+                spill_suspected = True
             used += 1
         compliant: list[tuple[TrialConfig, float, float, float]] = []
         neighbors = (
@@ -1334,6 +1490,7 @@ class _Engine:
             probes=used,
             cap_ngl=cap,
             cap_source=cap_source,
+            spill_suspected=spill_suspected,
         )
 
     def _refine_joint(self) -> None:
@@ -2071,6 +2228,18 @@ class _Engine:
 
         pp_mean = measured.pp.mean if measured.pp is not None else None
         tg_mean = measured.tg.mean if measured.tg is not None else None
+        spill = self._boundary_spill_suspected(cfg, measured) if measured.status == "ok" else None
+        measured = self._classify_spill(measured, spill)
+        if spill is not None:
+            self._append(
+                {
+                    "type": "stage",
+                    "stage": "host_spill_suspected",
+                    "trial_id": cfg.trial_id,
+                    **spill,
+                }
+            )
+            self._emit("warning", message=f"host-memory spill suspected at {cfg.trial_id}")
         primary_thermal_rejected = thermal.contaminated and (
             not thermal.retried or thermal.retry_contaminated is True
         )
@@ -2218,6 +2387,82 @@ class _Engine:
         )
 
     # -- classification -------------------------------------------------
+
+    def _spill_applicable(self) -> bool:
+        """Whether spill detection applies (issue #36).
+
+        Gates run when a GPU is available and the backend is Vulkan-like or
+        unknown; CUDA hard-fails OOM through stderr regexes instead.
+        """
+        if not gpu_available(self.hardware, self.llama):
+            return False
+        backends = self.llama.backends
+        if backends is None:
+            return True
+        return not any(name in backends for name in _TRUSTED_OOM_BACKENDS)
+
+    def _cpu_reference_tg(self) -> float | None:
+        """Median tg of the recorded ngl=0 reference runs, if any (issue #36)."""
+        speeds = [
+            float(entry["tg_mean"])
+            for entry in self.session.entries
+            if entry.get("type") == "baseline_run"
+            and entry.get("ngl") == 0
+            and entry.get("status") == "ok"
+            and entry.get("tg_mean") is not None
+        ]
+        if not speeds:
+            return None
+        return statistics.median(speeds)
+
+    def _boundary_spill_suspected(
+        self, config: TrialConfig, measured: _Measured
+    ) -> dict[str, Any] | None:
+        """Why a full-offload boundary stage looks like a host spill (issue #36).
+
+        Speed gate: a fully offloaded run whose tg is CPU-class relative to
+        the ngl=0 reference. Evidence gate: an observed device-memory delta
+        far below the estimated need. Returns None when neither fires.
+        """
+        if not is_fully_offloaded(config.gpu_layers, self.model.ngl_all):
+            return None
+        reasons: list[str] = []
+        if measured.tg is not None:
+            cpu_tg = self._cpu_reference_tg()
+            if cpu_tg is not None and is_cpu_class_speed(measured.tg.mean, cpu_tg):
+                reasons.append(
+                    f"tg {measured.tg.mean:.2f} t/s is within {SPILL_TG_TOLERANCE}x "
+                    f"of the CPU reference {cpu_tg:.2f} t/s at full offload"
+                )
+        if self._spill_applicable() and measured.status in ("ok", "unstable"):
+            estimate = estimate_vram(
+                config=config,
+                model=self.model,
+                ctx=self.options.ctx_size,
+                vram_reserve_mb=self.vram_reserve_mb,
+                vram_total_mb=total_vram_mb(self.hardware, multi_gpu=self.options.multi_gpu),
+                vram_free_mb=free_vram_mb(self.hardware, multi_gpu=self.options.multi_gpu),
+                calibration=self.calibration,
+            )
+            observation = self._estimate_observation(config, estimate.total_mb)
+            delta = (
+                float(observation["observed_used_delta_mb"]) if observation is not None else None
+            )
+            if delta is not None and is_spill_vram_delta(delta, estimate.total_mb):
+                reasons.append(
+                    f"observed VRAM delta {delta:.0f} MiB is below "
+                    f"{SPILL_VRAM_DELTA_FRACTION:.0%} of the estimated "
+                    f"{estimate.total_mb:.0f} MiB at full offload"
+                )
+        if not reasons:
+            return None
+        return {"reasons": reasons}
+
+    def _classify_spill(self, measured: _Measured, spill: dict[str, Any] | None) -> _Measured:
+        """Demote an ok full-offload measurement to host_spill (issue #36)."""
+        if spill is None or measured.status != "ok":
+            return measured
+        return dataclasses.replace(measured, status="host_spill")
 
     def _classify(self, result: executor.ExecResult, reps: int) -> _Measured:
         if result.timed_out:
@@ -2634,6 +2879,17 @@ class _Engine:
         max_boundary = (
             max(fitting_boundaries, key=lambda b: b.max_ok_ngl) if fitting_boundaries else None
         )
+        spill_suspected = any(
+            entry.get("stage") == "host_spill_suspected" for entry in self.session.entries
+        )
+        if spill_suspected and not any(
+            w.startswith("host-memory spill suspected") for w in warnings
+        ):
+            warnings.append(
+                "host-memory spill suspected: a fully offloaded placement ran at CPU-class "
+                "speed or used far less device memory than estimated; its results were "
+                "excluded from feasibility and scoring (NVIDIA issue #36)"
+            )
         estimate = estimate_vram(
             config=recommend_config,
             model=self.model,
@@ -2676,6 +2932,11 @@ class _Engine:
                 {
                     "gpu_layers": max_boundary.max_ok_ngl,
                     "moe_cpu_layers": max_boundary.moe_cpu_layers,
+                    **(
+                        {"spill_suspected": True}
+                        if any(b.spill_suspected for b in fitting_boundaries)
+                        else {}
+                    ),
                 }
                 if max_boundary
                 else None

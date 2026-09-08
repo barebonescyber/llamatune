@@ -367,6 +367,7 @@ class FeasibilityBoundary:
     probes: int
     cap_ngl: int | None = None
     cap_source: str = "model"
+    spill_suspected: bool = False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
