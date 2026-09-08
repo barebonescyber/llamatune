@@ -467,7 +467,6 @@ class _Engine:
         self.cli_validation: dict[str, Any] | None = None
         self.estimate_vs_observed: dict[str, Any] | None = None
         self._estimate_divergence: dict[str, dict[str, Any]] = {}
-        self._probe_timeout_retries = 0
         self._observations: dict[str, _RunObservation] = {}
         self.coverage: dict[str, dict[str, Any]] = {}
         self.quality_gate: dict[str, Any] | None = None
@@ -1683,22 +1682,30 @@ class _Engine:
         else:
             timeout_s = self.trial_timeout
         measured = self._execute_probe(cfg, purpose, ctx, probe_id, argv, timeout_s)
+        retry_run_id: str | None = None
         if measured.status == "timeout" and ctx is not None:
             # One work-scaled retry at a doubled timeout before recording the
             # failure (issue #38). Both attempts are journaled and each
             # consumes budget (DESIGN §7 retry semantics, as for thermal
-            # retries); both share the same purpose and probe id, and the
-            # surviving attempt's record wins self.probes.
+            # retries). The retry gets a distinct run id so attempt-2
+            # artifacts do not overwrite attempt-1, and is refused when the
+            # budget is exhausted (as for thermal retries).
             retry_timeout = min(
                 timeout_s * _CONTEXT_PROBE_RETRY_TIMEOUT_FACTOR, self._probe_timeout_max_s()
             )
-            self._probe_timeout_retries += 1
+            if not self._can_execute():
+                self.probes[probe_id] = measured.record
+                self._cooldown()
+                return measured.status
+            retry_run_id = f"{probe_id}-retry-2"
             retry_measured = self._execute_probe(
-                cfg, purpose, ctx, probe_id, argv, retry_timeout, attempt=2
+                cfg, purpose, ctx, retry_run_id, argv, retry_timeout, attempt=2
             )
             if retry_measured.status != "timeout":
                 measured = retry_measured
         self.probes[probe_id] = measured.record
+        if retry_run_id is not None:
+            self.probes[retry_run_id] = measured.record
         if measured.status in ("oom", "gpu_resource"):
             self.oom_points.append((cfg.to_dict(), probe_id))
         if ctx is not None and measured.status == "ok":
@@ -2542,8 +2549,16 @@ class _Engine:
             "floor_s": self.options.probe_timeout_s,
             "trial_timeout_s": self.trial_timeout,
             "max_s": self._probe_timeout_max_s(),
-            "retries": self._probe_timeout_retries,
+            "retries": self._count_journaled_retries(),
         }
+
+    def _count_journaled_retries(self) -> int:
+        """Work-scaled retries, reconstructed from the journal (resume-safe)."""
+        return sum(
+            1
+            for entry in self.session.entries
+            if entry.get("type") == "probe" and entry.get("attempt") == 2
+        )
 
     def _context_probe_timeout_s(self, cfg: TrialConfig, ctx: int) -> float:
         """Work-scaled timeout for one context probe (issue #38).

@@ -685,7 +685,20 @@ def test_context_section_reports_work_scaled_timeout_and_retries() -> None:
     text = report._context_section(analysis)
     assert "work-scaled at 2.5x" in text
     assert "122.7s" in text
-    assert "one work-scaled retry ran" in text
+    assert "1 work-scaled retries" in text
 
     no_timeout = report._context_section({"context_validation": {"ctx": 1, "status": "ok"}})
     assert "Probe timeout" not in no_timeout
+
+    zero_retries = report._context_section(
+        {
+            "context_validation": {"ctx": 1, "status": "ok", "evidence": "probes/x"},
+            "probe_timeout": {
+                "scale": 2.5,
+                "trial_timeout_s": 120.0,
+                "max_s": 3600.0,
+                "retries": 0,
+            },
+        }
+    )
+    assert "no retries needed" in zero_retries

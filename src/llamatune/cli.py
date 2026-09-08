@@ -1372,6 +1372,13 @@ def nightshift(
         error = "--cooldown must be >= 0"
     if depth is not None and depth < 0:
         error = "--depth must be >= 0"
+    if not (PROBE_TIMEOUT_SCALE_MIN <= probe_timeout_scale <= PROBE_TIMEOUT_SCALE_MAX):
+        error = (
+            f"--probe-timeout-scale must be between "
+            f"{PROBE_TIMEOUT_SCALE_MIN} and {PROBE_TIMEOUT_SCALE_MAX}"
+        )
+    if probe_timeout_s is not None and probe_timeout_s <= 0:
+        error = "--probe-timeout-s must be > 0"
     if error is not None:
         typer.echo(f"error: {error}", err=True)
         raise typer.Exit(code=2)

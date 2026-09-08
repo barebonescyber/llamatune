@@ -576,11 +576,11 @@ def _context_section(analysis: dict[str, Any]) -> str:
         return "**Warning:** no full-context validation was performed.\n"
     timeout = analysis.get("probe_timeout")
     timeout_line = ""
-    if isinstance(timeout, dict):
+    if isinstance(timeout, dict) and timeout.get("retries") is not None:
         retry_text = (
-            f" (one work-scaled retry ran; {timeout.get('retries')} retry)"
+            f", {timeout.get('retries')} work-scaled retries"
             if timeout.get("retries")
-            else " (no retries needed)"
+            else ", no retries needed"
         )
         timeout_line = (
             f"\n- Probe timeout: work-scaled at {timeout.get('scale')}x, "

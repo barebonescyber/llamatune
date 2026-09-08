@@ -8,7 +8,7 @@ import json
 import signal
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -3415,12 +3415,11 @@ class TestContextProbeTimeoutScaling(TestHostSpillDetection):
         tiny_gguf: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        _session, engine = self._baseline_engine(
+        session, engine = self._baseline_engine(
             tmp_path, fake_bin_dir, tiny_gguf, ctx_size=4096, ctx_ladder=()
         )
         timeout_s = 120.0
         engine.trial_timeout = timeout_s
-        engine._probe_timeout_retries = 0
         monkeypatch.setattr(
             engine,
             "_context_probe_timeout_s",
@@ -3445,6 +3444,7 @@ class TestContextProbeTimeoutScaling(TestHostSpillDetection):
                 "timeout_s": t,
                 "pattern": None,
             }
+            session.append(record)
             return search._ProbeOutcome(status, record)
 
         monkeypatch.setattr(engine, "_execute_probe", fake_execute)
@@ -3457,7 +3457,7 @@ class TestContextProbeTimeoutScaling(TestHostSpillDetection):
         assert [item["attempt"] for item in attempts] == [1, 2]
         assert attempts[1]["timeout_s"] == min(timeout_s * 2.0, engine._probe_timeout_max_s())
         assert attempts[0]["timeout_s"] == timeout_s
-        assert engine._probe_timeout_retries == 1
+        assert engine._count_journaled_retries() == 1
         stored = engine.probes
         assert any(
             record.get("attempt") == 2 and record.get("status") == "ok"
@@ -3534,11 +3534,23 @@ class TestEstimateDivergenceGating(TestHostSpillDetection):
         tiny_gguf: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        _session, engine, _probe_record = self._engine_with_divergence(
+        session, engine, _probe_record = self._engine_with_divergence(
             tmp_path, fake_bin_dir, tiny_gguf, monkeypatch
         )
+        # estimate 100 / observed delta 80: within 50%, NOT divergent.
         monkeypatch.setattr(search, "estimate_vram", lambda **kwargs: _estimate(100.0))
+        monkeypatch.setattr(
+            engine,
+            "_estimate_observation",
+            lambda cfg, est, probe_id: {"observed_used_delta_mb": 80.0, "samples": 3},
+        )
         _ = engine._journal_estimate_divergence(_envelope_config(33), 4096, "p1")
+        stages = [
+            entry
+            for entry in session.entries
+            if entry.get("type") == "stage" and entry.get("stage") == "estimate_diverged"
+        ]
+        assert stages == []
         engine.boundaries = [
             FeasibilityBoundary(moe_cpu_layers=0, max_ok_ngl=40, min_fail_ngl=41, probes=1)
         ]
@@ -3550,3 +3562,98 @@ def _estimate(total_mb: float) -> VramEstimate:
     return VramEstimate(
         weights_mb=0.0, kv_mb=0.0, compute_mb=0.0, total_mb=total_mb, reserve_mb=0.0, budget_mb=None
     )
+
+
+class TestEstimateDivergenceWiring:
+    """Issue #35: the _probe wiring populates _estimate_divergence on ok probes."""
+
+    def test_ok_context_probe_with_divergent_observation_populates_gate(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session, engine = TestHostSpillDetection._baseline_engine(
+            cast("TestHostSpillDetection", self), tmp_path, fake_bin_dir, tiny_gguf
+        )
+        monkeypatch.setattr(engine, "_spill_applicable", lambda: True)
+        monkeypatch.setattr(engine, "_cooldown", lambda: None)
+        monkeypatch.setattr(search, "estimate_vram", lambda **kwargs: _estimate(100.0))
+        monkeypatch.setattr(
+            engine,
+            "_estimate_observation",
+            lambda cfg, est, probe_id: {"observed_used_delta_mb": 10.0, "samples": 3},
+        )
+        statuses = iter(["ok"])
+
+        def fake_execute(
+            cfg: Any, purpose: str, ctx: int, probe_id: str, argv: Any, t: float, attempt: int = 1
+        ) -> Any:
+            record = {
+                "type": "probe",
+                "probe_id": probe_id,
+                "purpose": purpose,
+                "config": cfg.to_dict(),
+                "ctx": ctx,
+                "status": next(statuses),
+                "attempt": attempt,
+                "timeout_s": t,
+                "pattern": None,
+            }
+            return search._ProbeOutcome(record["status"], record)
+
+        monkeypatch.setattr(engine, "_execute_probe", fake_execute)
+
+        cfg = _envelope_config(33)
+        status = engine._probe(cfg, "context", 4096)
+        assert status == "ok"
+        assert cfg.trial_id in engine._estimate_divergence
+        assert engine._estimate_divergence[cfg.trial_id]["skip_layer_steps"] is True
+        stages = [
+            entry
+            for entry in session.entries
+            if entry.get("type") == "stage" and entry.get("stage") == "estimate_diverged"
+        ]
+        assert stages
+
+    def test_retry_refused_when_budget_exhausted(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _session, engine = TestHostSpillDetection._baseline_engine(
+            cast("TestHostSpillDetection", self), tmp_path, fake_bin_dir, tiny_gguf
+        )
+        engine.options = dataclasses.replace(engine.options, budget_trials=5)
+        engine.executed_count = 1
+        monkeypatch.setattr(engine, "_cooldown", lambda: None)
+        attempts: list[dict[str, Any]] = []
+        statuses = iter(["timeout"])
+
+        def fake_execute(
+            cfg: Any, purpose: str, ctx: int, probe_id: str, argv: Any, t: float, attempt: int = 1
+        ) -> Any:
+            attempts.append({"attempt": attempt})
+            engine.executed_count += 1
+            record = {
+                "type": "probe",
+                "probe_id": probe_id,
+                "purpose": purpose,
+                "config": cfg.to_dict(),
+                "ctx": 4096,
+                "status": next(statuses),
+                "attempt": attempt,
+                "timeout_s": 120.0,
+                "pattern": None,
+            }
+            return search._ProbeOutcome(record["status"], record)
+
+        monkeypatch.setattr(engine, "_execute_probe", fake_execute)
+
+        status = engine._probe(_envelope_config(33), "context", 4096)
+        assert status == "timeout"
+        assert [item["attempt"] for item in attempts] == [1]
+        assert engine._count_journaled_retries() == 0
