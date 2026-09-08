@@ -633,11 +633,21 @@ def test_detect_gpus_llama_bench_failure_warns_without_raising(
     assert "--list-devices" in gpu_warnings[0]
 
 
-def test_detect_gpus_without_bench_path_skips_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_detect_gpus_without_bench_path_warns(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(hardware, "_run_probe", lambda argv: None)
     gpus, gpu_warnings = hardware._detect_gpus("Linux", 32768, "x86_64")
     assert gpus == []
-    assert gpu_warnings == []
+    assert gpu_warnings == ["llama-bench not found; GPU fallback skipped"]
+
+
+def test_resolve_llama_bench_delegates_to_llama_resolve_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = Path("/opt/llama/llama-bench")
+    from llamatune import llama
+
+    monkeypatch.setattr(llama, "_resolve_binary", lambda name, llama_bin: sentinel)
+    assert hardware._resolve_llama_bench(Path("/opt/llama")) is sentinel
 
 
 def test_assess_hardware_threads_llama_bench_path(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -449,7 +449,7 @@ def _detect_gpus(
     if gpus:
         return gpus, []
     if llama_bench is None:
-        return [], []
+        return [], ["llama-bench not found; GPU fallback skipped"]
     llama_gpus = _detect_gpus_llama_bench(llama_bench)
     if llama_gpus:
         return llama_gpus, []
