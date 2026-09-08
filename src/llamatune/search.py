@@ -32,7 +32,9 @@ from llamatune.config import (
     SPILL_VRAM_DELTA_FRACTION,
     applicable_dimensions,
     candidates_for,
+    context_probe_timeout_s,
     dimension_value,
+    estimate_diverged,
     estimate_ram,
     estimate_reason,
     estimate_vram,
@@ -76,6 +78,9 @@ _TRIAL_TIMEOUT_MIN_S = 120.0
 _TRIAL_TIMEOUT_MAX_S = 3600.0
 _DEEP_TRIAL_TIMEOUT_MAX_S = 7200.0
 _THERMAL_WAIT_CYCLE_S = 10.0
+
+#: Multiplier applied to a timed-out context probe on its single retry (issue #38).
+_CONTEXT_PROBE_RETRY_TIMEOUT_FACTOR = 2.0
 
 #: Backends that hard-fail over-allocation through stderr signatures; spill
 #: detection (issue #36) does not apply to them.
@@ -151,6 +156,14 @@ class _Measured:
     tg: Any
     entry: dict[str, Any] | None
     oom_pattern: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ProbeOutcome:
+    """Journal record plus terminal status of one probe (possibly retried)."""
+
+    status: str
+    record: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -453,6 +466,8 @@ class _Engine:
         self.context_envelope: list[dict[str, Any]] | None = None
         self.cli_validation: dict[str, Any] | None = None
         self.estimate_vs_observed: dict[str, Any] | None = None
+        self._estimate_divergence: dict[str, dict[str, Any]] = {}
+        self._probe_timeout_retries = 0
         self._observations: dict[str, _RunObservation] = {}
         self.coverage: dict[str, dict[str, Any]] = {}
         self.quality_gate: dict[str, Any] | None = None
@@ -1663,6 +1678,47 @@ class _Engine:
                 depth=self.options.depth,
             )
         )
+        if ctx is not None:
+            timeout_s = self._context_probe_timeout_s(cfg, ctx)
+        else:
+            timeout_s = self.trial_timeout
+        measured = self._execute_probe(cfg, purpose, ctx, probe_id, argv, timeout_s)
+        if measured.status == "timeout" and ctx is not None:
+            # One work-scaled retry at a doubled timeout before recording the
+            # failure (issue #38). Both attempts are journaled and each
+            # consumes budget (DESIGN §7 retry semantics, as for thermal
+            # retries); both share the same purpose and probe id, and the
+            # surviving attempt's record wins self.probes.
+            retry_timeout = min(
+                timeout_s * _CONTEXT_PROBE_RETRY_TIMEOUT_FACTOR, self._probe_timeout_max_s()
+            )
+            self._probe_timeout_retries += 1
+            retry_measured = self._execute_probe(
+                cfg, purpose, ctx, probe_id, argv, retry_timeout, attempt=2
+            )
+            if retry_measured.status != "timeout":
+                measured = retry_measured
+        self.probes[probe_id] = measured.record
+        if measured.status in ("oom", "gpu_resource"):
+            self.oom_points.append((cfg.to_dict(), probe_id))
+        if ctx is not None and measured.status == "ok":
+            divergence = self._journal_estimate_divergence(cfg, ctx, probe_id)
+            if divergence is not None:
+                self._estimate_divergence[cfg.trial_id] = divergence
+        self._cooldown()
+        return measured.status
+
+    def _execute_probe(
+        self,
+        cfg: TrialConfig,
+        purpose: str,
+        ctx: int | None,
+        probe_id: str,
+        argv: tuple[str, ...],
+        timeout_s: float,
+        attempt: int = 1,
+    ) -> _ProbeOutcome:
+        """Run one bounded probe attempt and journal its outcome."""
         probe_dir = self.session.probe_dir(probe_id)
         label = f"{purpose} {self._config_label(cfg)}"
         result, observation = self._run_child(
@@ -1670,7 +1726,7 @@ class _Engine:
             label=label,
             run_id=probe_id,
             argv=argv,
-            timeout_s=self.trial_timeout,
+            timeout_s=timeout_s,
             stdout_path=probe_dir / "stdout.json",
             stderr_path=probe_dir / "stderr.log",
         )
@@ -1683,6 +1739,8 @@ class _Engine:
             "config": cfg.to_dict(),
             "ctx": ctx,
             "status": measured.status,
+            "attempt": attempt,
+            "timeout_s": timeout_s,
             "pattern": measured.oom_pattern,
             "estimate_reason": estimate_reason(
                 config=cfg,
@@ -1697,11 +1755,7 @@ class _Engine:
         )
         self._append(record)
         self._emit_exec_end(label, probe_id, result, measured)
-        self.probes[probe_id] = record
-        if measured.status in ("oom", "gpu_resource"):
-            self.oom_points.append((cfg.to_dict(), probe_id))
-        self._cooldown()
-        return measured.status
+        return _ProbeOutcome(measured.status, record)
 
     def _sweep(self, dim: str) -> None:
         candidates = candidates_for(
@@ -2471,6 +2525,97 @@ class _Engine:
             return None
         return float(pp), tg
 
+    def _probe_timeout_max_s(self) -> float:
+        """Upper bound for any single invocation, deep-aware (DESIGN §7)."""
+        return (
+            _DEEP_TRIAL_TIMEOUT_MAX_S
+            if self.options.depth is not None and self.options.depth > 0
+            else _TRIAL_TIMEOUT_MAX_S
+        )
+
+    def _probe_timeout_summary(self) -> dict[str, Any] | None:
+        """Work-scaled context-probe timeout summary for the report (issue #38)."""
+        if self.options.ctx_size is None:
+            return None
+        return {
+            "scale": self.options.probe_timeout_scale,
+            "floor_s": self.options.probe_timeout_s,
+            "trial_timeout_s": self.trial_timeout,
+            "max_s": self._probe_timeout_max_s(),
+            "retries": self._probe_timeout_retries,
+        }
+
+    def _context_probe_timeout_s(self, cfg: TrialConfig, ctx: int) -> float:
+        """Work-scaled timeout for one context probe (issue #38).
+
+        Boundary probes keep the search-trial timeout: their workload is the
+        small search pp/tg, so no ctx scaling applies. Context probes scale
+        with ``ctx / measured_pp * scale`` when baseline prompt throughput is
+        known; an absolute floor override takes precedence over the trial
+        timeout. The result is bounded by the per-invocation maximum.
+        """
+        measured_pp = self._measured_pp_mean()
+        return context_probe_timeout_s(
+            trial_timeout_s=self.trial_timeout,
+            ctx=ctx,
+            measured_pp_mean=measured_pp,
+            scale=self.options.probe_timeout_scale,
+            floor_s=self.options.probe_timeout_s,
+            max_s=self._probe_timeout_max_s(),
+        )
+
+    def _measured_pp_mean(self) -> float | None:
+        """Measured baseline prompt throughput, if the baseline is measured."""
+        if hasattr(self, "baseline") and self.baseline.pp.n > 0:
+            mean = self.baseline.pp.mean
+            if mean > 0:
+                return mean
+        return None
+
+    def _journal_estimate_divergence(
+        self, cfg: TrialConfig, ctx: int, probe_id: str
+    ) -> dict[str, Any] | None:
+        """Flag a candidate whose VRAM estimate diverged from observation (issue #35).
+
+        A diverged estimate must not drive layer-step sweeps or feasibility
+        pruning; the spill gate classifies the placement instead. Returns the
+        divergence record, or None when no measurement contradicts the estimate.
+        """
+        if not self._spill_applicable():
+            return None
+        estimate = estimate_vram(
+            config=cfg,
+            model=self.model,
+            ctx=self.options.ctx_size,
+            vram_reserve_mb=self.vram_reserve_mb,
+            vram_total_mb=total_vram_mb(self.hardware, multi_gpu=self.options.multi_gpu),
+            vram_free_mb=free_vram_mb(self.hardware, multi_gpu=self.options.multi_gpu),
+            calibration=self.calibration,
+        )
+        observation = self._estimate_observation(cfg, estimate.total_mb, probe_id)
+        if observation is None:
+            return None
+        delta = float(observation["observed_used_delta_mb"])
+        if not estimate_diverged(estimate.total_mb, delta):
+            return None
+        record = {
+            "type": "stage",
+            "stage": "estimate_diverged",
+            "config": cfg.to_dict(),
+            "estimated_total_mb": estimate.total_mb,
+            "observed_used_delta_mb": delta,
+            "estimate_diverged": True,
+            "skip_layer_steps": True,
+        }
+        self._append(record)
+        self._emit("estimate_diverged", **record)
+        return {
+            "estimated_total_mb": estimate.total_mb,
+            "observed_used_delta_mb": delta,
+            "estimate_diverged": True,
+            "skip_layer_steps": True,
+        }
+
     def _boundary_spill_suspected(
         self, config: TrialConfig, measured: _Measured, run_id: str | None = None
     ) -> dict[str, Any] | None:
@@ -2586,11 +2731,17 @@ class _Engine:
     def _context_candidates(self, base: TrialConfig) -> list[TrialConfig]:
         cap = gpu_layer_cap(self.model, self.options)
         candidates = [base] if base.gpu_layers <= cap else []
+        # An estimate proven diverged from observation must not drive the
+        # descending layer-step ladder (issue #35); the spill gate classifies
+        # the placement instead.
+        diverged = self._estimate_divergence.get(base.trial_id)
         for boundary in sorted(
             (boundary for boundary in self.boundaries if _boundary_has_fit(boundary)),
             key=lambda b: b.max_ok_ngl,
             reverse=True,
         ):
+            if diverged is not None and boundary.max_ok_ngl >= base.gpu_layers:
+                continue
             candidates.extend(
                 dataclasses.replace(base, gpu_layers=ngl, moe_cpu_layers=boundary.moe_cpu_layers)
                 for ngl in range(boundary.max_ok_ngl, -1, -1)
@@ -3037,6 +3188,7 @@ class _Engine:
             default_probe=self.default_probe,
             feasibility=feasibility,
             context_validation=self.context_validation,
+            probe_timeout=self._probe_timeout_summary(),
             cli_validation=self.cli_validation,
             estimate_vs_observed=self.estimate_vs_observed,
             coverage=self.coverage,

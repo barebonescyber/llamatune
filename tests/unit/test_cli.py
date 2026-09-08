@@ -834,6 +834,9 @@ def test_resume_unreadable_session_exits_2_with_contract(tmp_path: Path) -> None
         ["--depth-profile", "0,nope"],
         ["--thermal-threshold-c", "0"],
         ["--thermal-wait-cap-s", "-1"],
+        ["--probe-timeout-scale", "0.5"],
+        ["--probe-timeout-scale", "11"],
+        ["--probe-timeout-s", "0"],
     ],
 )
 def test_tune_rejects_invalid_new_options(tiny_gguf: Path, args: list[str]) -> None:

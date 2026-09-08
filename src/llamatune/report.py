@@ -574,6 +574,19 @@ def _context_section(analysis: dict[str, Any]) -> str:
     validation = analysis.get("context_validation")
     if not isinstance(validation, dict):
         return "**Warning:** no full-context validation was performed.\n"
+    timeout = analysis.get("probe_timeout")
+    timeout_line = ""
+    if isinstance(timeout, dict):
+        retry_text = (
+            f" (one work-scaled retry ran; {timeout.get('retries')} retry)"
+            if timeout.get("retries")
+            else " (no retries needed)"
+        )
+        timeout_line = (
+            f"\n- Probe timeout: work-scaled at {timeout.get('scale')}x, "
+            f"search-trial floor {timeout.get('trial_timeout_s')}s, "
+            f"cap {timeout.get('max_s')}s{retry_text}"
+        )
     return (
         "\n".join(
             [
@@ -582,6 +595,7 @@ def _context_section(analysis: dict[str, Any]) -> str:
                 f"- Evidence: `{validation.get('evidence', '-')}`",
             ]
         )
+        + timeout_line
         + "\n"
     )
 

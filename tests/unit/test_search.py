@@ -19,6 +19,7 @@ from llamatune.model import inspect_model
 from llamatune.session import Session, SessionPathError
 from llamatune.types import (
     BaselineResult,
+    FeasibilityBoundary,
     GPUInfo,
     GpuSample,
     HardwareReport,
@@ -28,6 +29,7 @@ from llamatune.types import (
     TrialConfig,
     TuneOptions,
     TuneOutcome,
+    VramEstimate,
 )
 
 
@@ -3368,3 +3370,183 @@ class TestHostSpillReviewRound2:
         ]
         assert len(reference_entries) == 1
         assert not any(entry.get("stage") == "host_spill_suspected" for entry in session.entries)
+
+
+class TestContextProbeTimeoutScaling(TestHostSpillDetection):
+    """Issue #38: context probes get work-scaled timeouts with one retry."""
+
+    def test_context_probe_timeout_scales_with_ctx_and_pp(self) -> None:
+        assert config.context_probe_timeout_s(
+            trial_timeout_s=120.0, ctx=65536, measured_pp_mean=400.0, scale=2.5, max_s=3600.0
+        ) == min(65536 / 400.0 * 2.5, 3600.0)
+
+    def test_context_probe_timeout_keeps_trial_timeout_without_measurement(self) -> None:
+        assert (
+            config.context_probe_timeout_s(
+                trial_timeout_s=120.0, ctx=65536, measured_pp_mean=None, max_s=3600.0
+            )
+            == 120.0
+        )
+
+    def test_context_probe_timeout_floor_override_wins_over_trial_timeout(self) -> None:
+        assert (
+            config.context_probe_timeout_s(
+                trial_timeout_s=120.0,
+                ctx=65536,
+                measured_pp_mean=None,
+                floor_s=300.0,
+                max_s=3600.0,
+            )
+            == 300.0
+        )
+
+    def test_context_probe_timeout_is_capped(self) -> None:
+        assert (
+            config.context_probe_timeout_s(
+                trial_timeout_s=120.0, ctx=65536, measured_pp_mean=1.0, scale=2.5, max_s=3600.0
+            )
+            == 3600.0
+        )
+
+    def test_context_probe_gets_scaled_timeout_and_retry_journals_both_attempts(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _session, engine = self._baseline_engine(
+            tmp_path, fake_bin_dir, tiny_gguf, ctx_size=4096, ctx_ladder=()
+        )
+        timeout_s = 120.0
+        engine.trial_timeout = timeout_s
+        engine._probe_timeout_retries = 0
+        monkeypatch.setattr(
+            engine,
+            "_context_probe_timeout_s",
+            lambda cfg, ctx: timeout_s,
+        )
+        statuses = iter(["timeout", "ok"])
+        attempts: list[dict[str, Any]] = []
+
+        def fake_execute(
+            cfg: Any, purpose: str, ctx: int, probe_id: str, argv: Any, t: float, attempt: int = 1
+        ) -> Any:
+            attempts.append({"attempt": attempt, "timeout_s": t})
+            status = next(statuses)
+            record = {
+                "type": "probe",
+                "probe_id": probe_id,
+                "purpose": purpose,
+                "config": cfg.to_dict(),
+                "ctx": ctx,
+                "status": status,
+                "attempt": attempt,
+                "timeout_s": t,
+                "pattern": None,
+            }
+            return search._ProbeOutcome(status, record)
+
+        monkeypatch.setattr(engine, "_execute_probe", fake_execute)
+        monkeypatch.setattr(engine, "_cooldown", lambda: None)
+        monkeypatch.setattr(engine, "_run_context_envelope", lambda *a, **k: None)
+
+        engine.options = dataclasses.replace(engine.options, ctx_size=4096)
+        status = engine._probe(_envelope_config(33), "context", 4096)
+        assert status == "ok"
+        assert [item["attempt"] for item in attempts] == [1, 2]
+        assert attempts[1]["timeout_s"] == min(timeout_s * 2.0, engine._probe_timeout_max_s())
+        assert attempts[0]["timeout_s"] == timeout_s
+        assert engine._probe_timeout_retries == 1
+        stored = engine.probes
+        assert any(
+            record.get("attempt") == 2 and record.get("status") == "ok"
+            for record in stored.values()
+        )
+
+
+class TestEstimateDivergenceGating(TestHostSpillDetection):
+    """Issue #35: a diverged estimate must not drive the layer-step ladder."""
+
+    def _engine_with_divergence(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> Any:
+        session, engine = self._baseline_engine(tmp_path, fake_bin_dir, tiny_gguf)
+        monkeypatch.setattr(engine, "_spill_applicable", lambda: True)
+        monkeypatch.setattr(engine, "_cooldown", lambda: None)
+        probe_record = {
+            "type": "probe",
+            "probe_id": "p1",
+            "purpose": "context",
+            "config": _envelope_config(33).to_dict(),
+            "ctx": 4096,
+            "status": "ok",
+            "pattern": None,
+        }
+        monkeypatch.setattr(
+            engine,
+            "_estimate_observation",
+            lambda cfg, est, probe_id: {"observed_used_delta_mb": 10.0, "samples": 3},
+        )
+        return session, engine, probe_record
+
+    def test_divergence_journals_stage_and_gates_layer_ladder(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session, engine, probe_record = self._engine_with_divergence(
+            tmp_path, fake_bin_dir, tiny_gguf, monkeypatch
+        )
+        monkeypatch.setattr(search, "estimate_vram", lambda **kwargs: _estimate(32651.0))
+        engine.probes["p1"] = probe_record
+        monkeypatch.setattr(engine, "_probe", lambda cfg, purpose, ctx: "ok")
+        monkeypatch.setattr(engine, "_run_context_envelope", lambda *a, **k: None)
+
+        divergence = engine._journal_estimate_divergence(_envelope_config(33), 4096, "p1")
+        assert divergence is not None and divergence["skip_layer_steps"] is True
+        stages = [
+            entry
+            for entry in session.entries
+            if entry.get("type") == "stage" and entry.get("stage") == "estimate_diverged"
+        ]
+        assert stages and stages[0]["skip_layer_steps"] is True
+
+        # Boundaries would normally drive a descending ladder; diverged estimates
+        # must not. The _probe wiring stores the record under the config id.
+        engine._estimate_divergence[_envelope_config(33).trial_id] = divergence
+        engine.boundaries = [
+            FeasibilityBoundary(moe_cpu_layers=0, max_ok_ngl=40, min_fail_ngl=41, probes=1)
+        ]
+        candidates = engine._context_candidates(_envelope_config(33))
+        assert candidates == [_envelope_config(33)]
+
+    def test_non_diverged_estimate_keeps_layer_ladder(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _session, engine, _probe_record = self._engine_with_divergence(
+            tmp_path, fake_bin_dir, tiny_gguf, monkeypatch
+        )
+        monkeypatch.setattr(search, "estimate_vram", lambda **kwargs: _estimate(100.0))
+        _ = engine._journal_estimate_divergence(_envelope_config(33), 4096, "p1")
+        engine.boundaries = [
+            FeasibilityBoundary(moe_cpu_layers=0, max_ok_ngl=40, min_fail_ngl=41, probes=1)
+        ]
+        candidates = engine._context_candidates(_envelope_config(33))
+        assert any(candidate.gpu_layers < 33 for candidate in candidates)
+
+
+def _estimate(total_mb: float) -> VramEstimate:
+    return VramEstimate(
+        weights_mb=0.0, kv_mb=0.0, compute_mb=0.0, total_mb=total_mb, reserve_mb=0.0, budget_mb=None
+    )

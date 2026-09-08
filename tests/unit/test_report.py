@@ -668,3 +668,24 @@ def test_present_null_binary_hash_is_explicitly_unknown() -> None:
         {**_LLAMACPP, "bench_sha256": None},
     )
     assert "llama-bench SHA-256: `(unknown)`" in text
+
+
+def test_context_section_reports_work_scaled_timeout_and_retries() -> None:
+    """Issue #38: the context-validation section names the timeout policy."""
+    analysis = {
+        "context_validation": {"ctx": 65536, "status": "ok", "evidence": "probes/x"},
+        "probe_timeout": {
+            "scale": 2.5,
+            "floor_s": None,
+            "trial_timeout_s": 122.7,
+            "max_s": 3600.0,
+            "retries": 1,
+        },
+    }
+    text = report._context_section(analysis)
+    assert "work-scaled at 2.5x" in text
+    assert "122.7s" in text
+    assert "one work-scaled retry ran" in text
+
+    no_timeout = report._context_section({"context_validation": {"ctx": 1, "status": "ok"}})
+    assert "Probe timeout" not in no_timeout

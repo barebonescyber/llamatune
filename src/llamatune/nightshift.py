@@ -396,6 +396,8 @@ def _tune_options(
         ctx_ladder=options.ctx_ladder,
         depth=depth if depth is not None else options.depth,
         vram_reserve_mb=options.vram_reserve_mb,
+        probe_timeout_scale=options.probe_timeout_scale,
+        probe_timeout_s=options.probe_timeout_s,
         quiet_load=hardware.physical_cores / 2,
     )
 

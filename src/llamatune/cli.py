@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 import typer
 
+from llamatune.config import PROBE_TIMEOUT_SCALE_MAX, PROBE_TIMEOUT_SCALE_MIN
+
 if TYPE_CHECKING:
     from llamatune.types import HardwareReport, LlamaCppReport, TuneOutcome
 
@@ -901,6 +903,20 @@ def tune(
     thermal_wait_cap_s: Annotated[
         float, typer.Option("--thermal-wait-cap-s", help="Maximum adaptive thermal wait")
     ] = 60.0,
+    probe_timeout_scale: Annotated[
+        float,
+        typer.Option(
+            "--probe-timeout-scale",
+            help="Work-scaled context-probe timeout multiplier (issue #38)",
+        ),
+    ] = 2.5,
+    probe_timeout_s: Annotated[
+        float | None,
+        typer.Option(
+            "--probe-timeout-s",
+            help="Absolute floor override for context-probe timeouts",
+        ),
+    ] = None,
     multi_gpu: Annotated[
         bool,
         typer.Option(
@@ -985,6 +1001,12 @@ def tune(
         (depth is not None and depth < 0, "--depth must be >= 0"),
         (thermal_threshold_c <= 0, "--thermal-threshold-c must be > 0"),
         (thermal_wait_cap_s < 0, "--thermal-wait-cap-s must be >= 0"),
+        (
+            not (PROBE_TIMEOUT_SCALE_MIN <= probe_timeout_scale <= PROBE_TIMEOUT_SCALE_MAX),
+            f"--probe-timeout-scale must be between "
+            f"{PROBE_TIMEOUT_SCALE_MIN} and {PROBE_TIMEOUT_SCALE_MAX}",
+        ),
+        (probe_timeout_s is not None and probe_timeout_s <= 0, "--probe-timeout-s must be > 0"),
         (
             initial_gpu_layers is not None
             and max_gpu_layers_value is not None
@@ -1071,6 +1093,8 @@ def tune(
         depth_profile=depth_profile_value,
         thermal_threshold_c=thermal_threshold_c,
         thermal_wait_cap_s=thermal_wait_cap_s,
+        probe_timeout_scale=probe_timeout_scale,
+        probe_timeout_s=probe_timeout_s,
         multi_gpu=multi_gpu,
     )
 
@@ -1288,6 +1312,20 @@ def nightshift(
     reps_search: Annotated[int | None, typer.Option("--reps-search")] = None,
     reps_confirm: Annotated[int | None, typer.Option("--reps-confirm")] = None,
     baseline_runs: Annotated[int | None, typer.Option("--baseline-runs")] = None,
+    probe_timeout_scale: Annotated[
+        float,
+        typer.Option(
+            "--probe-timeout-scale",
+            help="Work-scaled context-probe timeout multiplier (issue #38)",
+        ),
+    ] = 2.5,
+    probe_timeout_s: Annotated[
+        float | None,
+        typer.Option(
+            "--probe-timeout-s",
+            help="Absolute floor override for context-probe timeouts",
+        ),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Experimental: tune and verify local GGUF models unattended."""
@@ -1363,6 +1401,8 @@ def nightshift(
         reps_confirm=reps_confirm,
         baseline_runs=baseline_runs,
         depth=depth,
+        probe_timeout_scale=probe_timeout_scale,
+        probe_timeout_s=probe_timeout_s,
     )
     outcome = run_nightshift(options)
     if json_output:

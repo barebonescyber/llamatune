@@ -194,6 +194,7 @@ class TestBuildAnalysis:
             "baseline_kind",
             "feasibility",
             "context_validation",
+            "probe_timeout",
             "cli_validation",
             "estimate_vs_observed",
             "coverage",
