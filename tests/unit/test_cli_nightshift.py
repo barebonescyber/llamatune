@@ -26,6 +26,9 @@ def test_help_labels_night_shift_experimental() -> None:
         (["--drift-threshold", "-0.1"], "--drift-threshold must be >= 0"),
         (["--calibration-runs", "1"], "--calibration-runs must be >= 2"),
         (["--duplicates", "many"], "--duplicates must be 'one' or 'both'"),
+        (["--probe-timeout-scale", "0.5"], "--probe-timeout-scale must be between"),
+        (["--probe-timeout-scale", "11"], "--probe-timeout-scale must be between"),
+        (["--probe-timeout-s", "0"], "--probe-timeout-s must be > 0"),
     ],
 )
 def test_validation_errors_exit_2(tmp_path: Path, args: list[str], message: str) -> None:

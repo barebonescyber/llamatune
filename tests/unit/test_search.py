@@ -3657,3 +3657,77 @@ class TestEstimateDivergenceWiring:
         assert status == "timeout"
         assert [item["attempt"] for item in attempts] == [1]
         assert engine._count_journaled_retries() == 0
+
+
+class TestProbeRetryResumeSafety:
+    """Issue #38: a surviving retry must replay after resume, not attempt-1."""
+
+    def test_retry_survivor_replays_under_base_probe_id_on_resume(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session, engine = TestHostSpillDetection._baseline_engine(
+            cast("TestHostSpillDetection", self),
+            tmp_path,
+            fake_bin_dir,
+            tiny_gguf,
+            ctx_size=4096,
+            ctx_ladder=(),
+        )
+        monkeypatch.setattr(engine, "_cooldown", lambda: None)
+        statuses = iter(["timeout", "ok"])
+        cfg = _envelope_config(33)
+        probe_id = search._probe_id("context", cfg, 4096)
+
+        def fake_execute(
+            cfg_: Any, purpose: str, ctx: int, run_id: str, argv: Any, t: float, attempt: int = 1
+        ) -> Any:
+            record = {
+                "type": "probe",
+                "probe_id": run_id,
+                "purpose": purpose,
+                "config": cfg_.to_dict(),
+                "ctx": ctx,
+                "status": next(statuses),
+                "attempt": attempt,
+                "timeout_s": t,
+                "pattern": None,
+            }
+            session.append(record)
+            return search._ProbeOutcome(record["status"], record)
+
+        monkeypatch.setattr(engine, "_execute_probe", fake_execute)
+
+        status = engine._probe(cfg, "context", 4096)
+        assert status == "ok"
+        finals = [entry for entry in session.entries if entry.get("type") == "probe_final"]
+        assert len(finals) == 1
+        assert finals[0]["probe_id"] == probe_id
+        assert finals[0]["superseded_run_id"] == f"{probe_id}-retry-2"
+        # Resume: a fresh engine replaying this journal must restore the
+        # surviving attempt under the base probe id.
+        replayed = search._Engine(
+            session, engine.hardware, engine.model, engine.llama, engine.options
+        )
+        assert replayed.probes[probe_id]["status"] == "ok"
+        assert replayed.probes[probe_id]["attempt"] == 2
+
+    def test_probe_timeout_summary_absent_without_context_probes(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _session, engine = TestHostSpillDetection._baseline_engine(
+            cast("TestHostSpillDetection", self),
+            tmp_path,
+            fake_bin_dir,
+            tiny_gguf,
+            ctx_size=4096,
+            ctx_ladder=(),
+        )
+        assert engine._probe_timeout_summary() is None

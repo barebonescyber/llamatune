@@ -443,7 +443,7 @@ class _Engine:
                 self.known[entry["trial_id"]] = entry
                 if entry.get("status") in ("oom", "gpu_resource"):
                     self.oom_points.append((dict(entry["config"]), entry["trial_id"]))
-            elif entry.get("type") == "probe" and "probe_id" in entry:
+            elif entry.get("type") in ("probe", "probe_final") and "probe_id" in entry:
                 self.probes[entry["probe_id"]] = entry
 
         self.executed_count = _count_executed(session.entries)
@@ -1706,6 +1706,17 @@ class _Engine:
         self.probes[probe_id] = measured.record
         if retry_run_id is not None:
             self.probes[retry_run_id] = measured.record
+            # Resume replay keys probes by probe_id; journal the surviving
+            # attempt under the base id as a non-counted marker so a resumed
+            # session replays the winning outcome, not attempt-1's timeout.
+            final_record = {
+                **measured.record,
+                "type": "probe_final",
+                "probe_id": probe_id,
+                "superseded_run_id": retry_run_id,
+            }
+            self.probes[probe_id] = final_record
+            self._append(final_record)
         if measured.status in ("oom", "gpu_resource"):
             self.oom_points.append((cfg.to_dict(), probe_id))
         if ctx is not None and measured.status == "ok":
@@ -2543,6 +2554,13 @@ class _Engine:
     def _probe_timeout_summary(self) -> dict[str, Any] | None:
         """Work-scaled context-probe timeout summary for the report (issue #38)."""
         if self.options.ctx_size is None:
+            return None
+        context_probes = [
+            entry
+            for entry in self.session.entries
+            if entry.get("type") == "probe" and entry.get("purpose") == "context"
+        ]
+        if not context_probes:
             return None
         return {
             "scale": self.options.probe_timeout_scale,
