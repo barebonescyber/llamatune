@@ -2199,6 +2199,16 @@ def _measured(pp: float = 100.0, tg: float = 10.0) -> search._Measured:
     )
 
 
+def _unstable_status() -> search._Measured:
+    return search._Measured(
+        "unstable",
+        MetricStats(mean=100.0, stdev=20.0, cv=0.2, n=3),
+        MetricStats(mean=10.0, stdev=2.0, cv=0.2, n=3),
+        {},
+        None,
+    )
+
+
 def _unstable_measured() -> search._Measured:
     return search._Measured(
         "ok",
@@ -3136,7 +3146,7 @@ class TestHostSpillDetection:
 
         boundary = engine._discover_boundary(_envelope_config(33), 0)
 
-        assert boundary.spill_suspected is False
+        assert boundary.spill_suspected is True
         counts = recommend.compute_counts(
             [
                 {"status": "ok"},
@@ -3146,3 +3156,215 @@ class TestHostSpillDetection:
         )
         assert counts["host_spill"] == 1
         assert counts["executed"] == 3
+
+
+class TestHostSpillReviewRound2:
+    """Review-round coverage for issue #36 spill gates."""
+
+    def _engine(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        baseline_tg: float = 50.0,
+        **option_overrides: Any,
+    ) -> tuple[Session, search._Engine]:
+        session, engine = TestHostSpillDetection._baseline_engine(
+            self,  # type: ignore[arg-type]
+            tmp_path,
+            fake_bin_dir,
+            tiny_gguf,
+            baseline_tg=baseline_tg,
+            **option_overrides,
+        )
+        monkeypatch.setattr(engine, "_write_command", lambda *args: None)
+        monkeypatch.setattr(engine, "_record_load", lambda threads: None)
+        monkeypatch.setattr(engine, "_cooldown", lambda: None)
+        return session, engine
+
+    def test_spilled_boundary_probe_flags_boundary_and_not_max_ok(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session, engine = self._engine(
+            tmp_path,
+            fake_bin_dir,
+            tiny_gguf,
+            monkeypatch,
+            observe_vram=True,
+            initial_gpu_layers=33,
+        )
+        engine.baseline = dataclasses.replace(engine.baseline, kind="host_spill")
+        engine.default_config = _envelope_config(33)
+        engine.measured_default = _envelope_config(33)
+        engine.incumbent_config = _envelope_config(33)
+        probe_cfg = _envelope_config(33)
+        observation = search._RunObservation(
+            _gpu_sample(45.0), _gpu_sample(45.0), (_gpu_sample(45.0),) * 4
+        )
+
+        def fake_run_child(**kwargs: Any) -> tuple[executor.ExecResult, search._RunObservation]:
+            engine._observations[kwargs["run_id"]] = observation
+            return _exec_result(tmp_path, "probe"), observation
+
+        monkeypatch.setattr(engine, "_run_child", fake_run_child)
+        monkeypatch.setattr(engine, "_classify", lambda result, reps: _measured())
+
+        boundary = engine._discover_boundary(_envelope_config(33), 0)
+
+        assert boundary.spill_suspected is True
+        assert boundary.max_ok_ngl < engine.model.ngl_all
+        assert boundary.min_fail_ngl == 33
+        stages = [
+            entry
+            for entry in session.entries
+            if entry.get("type") == "stage" and entry.get("stage") == "host_spill_suspected"
+        ]
+        assert stages
+        assert stages[0]["config"] == probe_cfg.to_dict()
+        assert any("VRAM delta" in reason for reason in stages[0]["reasons"])
+
+    def test_boundary_failed_probes_do_not_flag_spill(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _session, engine = self._engine(tmp_path, fake_bin_dir, tiny_gguf, monkeypatch)
+        monkeypatch.setattr(engine, "_probe", lambda *_args, **_kwargs: "failed")
+
+        boundary = engine._discover_boundary(_envelope_config(33), 0)
+
+        assert boundary.spill_suspected is False
+
+    def test_exhausted_budget_never_recommends_spilled_default(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _session, engine = self._engine(
+            tmp_path, fake_bin_dir, tiny_gguf, monkeypatch, baseline_tg=2.0
+        )
+        reference = _measured(40.0, 1.8)
+        measurements = iter([reference])
+        monkeypatch.setattr(
+            engine,
+            "_run_child",
+            lambda **kwargs: (
+                _exec_result(tmp_path, "ref"),
+                search._RunObservation(None, None, ()),
+            ),
+        )
+        monkeypatch.setattr(engine, "_classify", lambda result, reps: next(measurements))
+        engine._seed_incumbent()
+        assert engine.baseline.kind == "host_spill"
+        engine.executed_count = engine.options.budget_trials
+
+        _winner, config, _expected, _confirmed = engine._determine_winner()
+
+        assert config != engine.default_config
+        assert config.gpu_layers == 0
+
+    def test_unstable_full_offload_trial_with_tiny_vram_delta_is_demoted(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session, engine = self._engine(
+            tmp_path, fake_bin_dir, tiny_gguf, monkeypatch, observe_vram=True
+        )
+        trial_config = _envelope_config(33)
+        samples = (_gpu_sample(45.0), _gpu_sample(45.0), _gpu_sample(70.0), _gpu_sample(45.0))
+        engine._observations[trial_config.trial_id] = search._RunObservation(
+            samples[0], samples[-1], samples
+        )
+        monkeypatch.setattr(
+            engine,
+            "_run_child",
+            lambda **kwargs: (
+                _exec_result(tmp_path, "x"),
+                search._RunObservation(None, None, ()),
+            ),
+        )
+        monkeypatch.setattr(engine, "_classify", lambda result, reps: _unstable_status())
+        monkeypatch.setattr(search, "_detect_gpu_throttle", lambda samples: False)
+
+        engine._execute_trial(trial_config, "spill_gate")
+
+        record = engine.known[trial_config.trial_id]
+        assert record["status"] == "host_spill"
+        assert record["score"] is None
+        stages = [
+            entry
+            for entry in session.entries
+            if entry.get("type") == "stage" and entry.get("stage") == "host_spill_suspected"
+        ]
+        assert stages
+
+    def test_boundary_neighbor_spill_flags_boundary(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _session, engine = self._engine(tmp_path, fake_bin_dir, tiny_gguf, monkeypatch)
+        engine.incumbent_config = _envelope_config(33)
+        monkeypatch.setattr(engine, "_probe", lambda *_args, **_kwargs: "ok")
+        monkeypatch.setattr(
+            engine,
+            "_evaluate",
+            lambda *_args, **_kwargs: search._Trial("host_spill", None, None, None),
+        )
+
+        boundary = engine._discover_boundary(_envelope_config(33), 0)
+
+        assert boundary.spill_suspected is True
+        assert boundary.max_ok_ngl == engine.model.ngl_all
+
+    def test_baseline_spill_reference_not_rerun_on_resume(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session, engine = self._engine(
+            tmp_path, fake_bin_dir, tiny_gguf, monkeypatch, baseline_tg=2.0
+        )
+        session.append(
+            {
+                "type": "baseline_run",
+                "run": 4,
+                "ngl": 0,
+                "status": "failed",
+                "pp_mean": None,
+                "tg_mean": None,
+                "oom_pattern": None,
+                "cpu_reference": True,
+            }
+        )
+
+        def forbidden(**kwargs: Any) -> None:
+            pytest.fail("a journaled cpu reference must not be re-run")
+
+        monkeypatch.setattr(engine, "_run_child", forbidden)
+        engine._check_baseline_spill()
+
+        reference_entries = [
+            entry
+            for entry in session.entries
+            if entry.get("type") == "baseline_run" and entry.get("cpu_reference")
+        ]
+        assert len(reference_entries) == 1
+        assert not any(entry.get("stage") == "host_spill_suspected" for entry in session.entries)

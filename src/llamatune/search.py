@@ -1101,9 +1101,14 @@ class _Engine:
 
         Always anchors the incumbent on the baseline first, so a budget
         exhausted (or failing) seed trial still leaves a measured reference.
+        A baseline demoted as a host spill never anchors the search; the
+        incumbent re-anchors on the measured ngl=0 reference instead.
         """
         if self.baseline.fallback != "cpu":
             self._check_baseline_spill()
+        if self.baseline.kind == "host_spill":
+            self._seed_incumbent_after_spill()
+            return
         self._set_incumbent(
             self.default_config,
             self.baseline.pp.mean,
@@ -1113,6 +1118,19 @@ class _Engine:
 
         # Boundary discovery, rather than an unproven full-offload seed,
         # advances from this measured anchor.
+
+    def _seed_incumbent_after_spill(self) -> None:
+        """Anchor the incumbent on the CPU reference after a spilled baseline (issue #36)."""
+        means = self._cpu_reference_means()
+        if means is None:
+            return
+        pp, tg = means
+        self._set_incumbent(
+            dataclasses.replace(self.default_config, gpu_layers=0),
+            pp,
+            tg,
+            self._score(pp, tg),
+        )
 
     def _check_baseline_spill(self) -> None:
         """Detect a full-offload baseline that runs at CPU-class speed (issue #36).
@@ -1128,7 +1146,16 @@ class _Engine:
         if tg_mean is None or tg_mean <= 0:
             return
         cpu_tg = self._cpu_reference_tg()
-        if cpu_tg is None and self._spill_applicable() and self._can_execute():
+        has_reference_attempt = any(
+            entry.get("type") == "baseline_run" and entry.get("cpu_reference")
+            for entry in self.session.entries
+        )
+        if (
+            cpu_tg is None
+            and not has_reference_attempt
+            and self._spill_applicable()
+            and self._can_execute()
+        ):
             argv = bench.build_baseline_argv(
                 bench_path=self.llama.bench_path,
                 model_path=self.model.path,
@@ -1394,7 +1421,11 @@ class _Engine:
             status = self._probe(probe_cfg, "boundary", None)
             used += 1
             spill = (
-                self._boundary_spill_suspected(probe_cfg, _Measured(status, None, None, None, None))
+                self._boundary_spill_suspected(
+                    probe_cfg,
+                    _Measured(status, None, None, None, None),
+                    run_id=_probe_id("boundary", probe_cfg, None),
+                )
                 if status == "ok"
                 else None
             )
@@ -1436,7 +1467,9 @@ class _Engine:
             status = self._probe(bisect_cfg, "boundary", None)
             spill = (
                 self._boundary_spill_suspected(
-                    bisect_cfg, _Measured(status, None, None, None, None)
+                    bisect_cfg,
+                    _Measured(status, None, None, None, None),
+                    run_id=_probe_id("boundary", bisect_cfg, None),
                 )
                 if status == "ok"
                 else None
@@ -1465,6 +1498,8 @@ class _Engine:
         for ngl in neighbors:
             cfg = dataclasses.replace(base, gpu_layers=ngl)
             trial = self._evaluate(cfg, "boundary_neighbor")
+            if trial.status == "host_spill":
+                spill_suspected = True
             if (
                 trial.status in ("ok", "unstable")
                 and trial.score is not None
@@ -2228,7 +2263,11 @@ class _Engine:
 
         pp_mean = measured.pp.mean if measured.pp is not None else None
         tg_mean = measured.tg.mean if measured.tg is not None else None
-        spill = self._boundary_spill_suspected(cfg, measured) if measured.status == "ok" else None
+        spill = (
+            self._boundary_spill_suspected(cfg, measured)
+            if measured.status in ("ok", "unstable")
+            else None
+        )
         measured = self._classify_spill(measured, spill)
         if spill is not None:
             self._append(
@@ -2401,22 +2440,39 @@ class _Engine:
             return True
         return not any(name in backends for name in _TRUSTED_OOM_BACKENDS)
 
-    def _cpu_reference_tg(self) -> float | None:
-        """Median tg of the recorded ngl=0 reference runs, if any (issue #36)."""
-        speeds = [
-            float(entry["tg_mean"])
+    def _cpu_reference_entries(self) -> list[dict[str, Any]]:
+        """Journaled ok ngl=0 reference runs with measured speeds (issue #36)."""
+        return [
+            entry
             for entry in self.session.entries
             if entry.get("type") == "baseline_run"
             and entry.get("ngl") == 0
             and entry.get("status") == "ok"
             and entry.get("tg_mean") is not None
         ]
+
+    def _cpu_reference_tg(self) -> float | None:
+        """Median tg of the recorded ngl=0 reference runs, if any (issue #36)."""
+        speeds = [float(entry["tg_mean"]) for entry in self._cpu_reference_entries()]
         if not speeds:
             return None
         return statistics.median(speeds)
 
+    def _cpu_reference_means(self) -> tuple[float, float] | None:
+        """(pp, tg) of the median-speed ok ngl=0 reference run, if any (issue #36)."""
+        entries = self._cpu_reference_entries()
+        if not entries:
+            return None
+        median_tg = statistics.median(float(entry["tg_mean"]) for entry in entries)
+        entry = next(e for e in entries if float(e["tg_mean"]) == median_tg)
+        pp = entry.get("pp_mean")
+        tg = float(entry["tg_mean"])
+        if pp is None:
+            return None
+        return float(pp), tg
+
     def _boundary_spill_suspected(
-        self, config: TrialConfig, measured: _Measured
+        self, config: TrialConfig, measured: _Measured, run_id: str | None = None
     ) -> dict[str, Any] | None:
         """Why a full-offload boundary stage looks like a host spill (issue #36).
 
@@ -2444,7 +2500,7 @@ class _Engine:
                 vram_free_mb=free_vram_mb(self.hardware, multi_gpu=self.options.multi_gpu),
                 calibration=self.calibration,
             )
-            observation = self._estimate_observation(config, estimate.total_mb)
+            observation = self._estimate_observation(config, estimate.total_mb, run_id)
             delta = (
                 float(observation["observed_used_delta_mb"]) if observation is not None else None
             )
@@ -2459,8 +2515,8 @@ class _Engine:
         return {"reasons": reasons}
 
     def _classify_spill(self, measured: _Measured, spill: dict[str, Any] | None) -> _Measured:
-        """Demote an ok full-offload measurement to host_spill (issue #36)."""
-        if spill is None or measured.status != "ok":
+        """Demote an ok or unstable full-offload measurement to host_spill (issue #36)."""
+        if spill is None or measured.status not in ("ok", "unstable"):
             return measured
         return dataclasses.replace(measured, status="host_spill")
 
@@ -2887,8 +2943,9 @@ class _Engine:
         ):
             warnings.append(
                 "host-memory spill suspected: a fully offloaded placement ran at CPU-class "
-                "speed or used far less device memory than estimated; its results were "
-                "excluded from feasibility and scoring (NVIDIA issue #36)"
+                "speed or used far less device memory than estimated, so the backend may be "
+                "spilling to host memory (issue #36); its results were excluded from "
+                "feasibility and scoring"
             )
         estimate = estimate_vram(
             config=recommend_config,
@@ -3160,13 +3217,16 @@ class _Engine:
             self._emit("warning", message=warning)
 
     def _estimate_observation(
-        self, config: TrialConfig, estimated_total_mb: float
+        self, config: TrialConfig, estimated_total_mb: float, run_id: str | None = None
     ) -> dict[str, Any] | None:
-        observations = [
-            observation
-            for run_id, observation in self._observations.items()
-            if run_id.startswith(config.trial_id)
-        ]
+        if run_id is not None and run_id in self._observations:
+            observations = [self._observations[run_id]]
+        else:
+            observations = [
+                observation
+                for key, observation in self._observations.items()
+                if key.startswith(config.trial_id)
+            ]
         samples = [sample for observation in observations for sample in observation.samples]
         if not samples:
             return None
@@ -3300,9 +3360,17 @@ class _Engine:
         return None, config, expected, False
 
     def _fallback_recommendation(self) -> tuple[TrialConfig, dict[str, Any]]:
-        """Return defaults, or the best measured config satisfying a binding cap."""
+        """Return defaults, or the best measured config satisfying a binding cap.
+
+        A default demoted as a host spill is never recommended unmeasured;
+        the measured ngl=0 CPU reference is offered instead (issue #36).
+        """
         cap = gpu_layer_cap(self.model, self.options)
-        if self.default_config.gpu_layers <= cap:
+        default_record = self.known.get(self.default_config.trial_id)
+        spilled_default = (
+            default_record is not None and default_record.get("status") == "host_spill"
+        )
+        if self.default_config.gpu_layers <= cap and not spilled_default:
             return self.default_config, self._defaults_expected()
         candidates = [
             record
@@ -3324,6 +3392,19 @@ class _Engine:
                 },
             }
             return TrialConfig.from_dict(best["config"]), expected
+        means = self._cpu_reference_means()
+        if means is not None and self.default_config.gpu_layers <= cap:
+            pp, tg = means
+            expected = {
+                "pp": pp,
+                "tg": tg,
+                "improvement_pct": {
+                    "pp": _improvement(pp, self.baseline.pp.mean),
+                    "tg": _improvement(tg, self.baseline.tg.mean),
+                    "score": (self._score(pp, tg) - 1) * 100,
+                },
+            }
+            return dataclasses.replace(self.default_config, gpu_layers=0), expected
         raise _NoFeasibleConfigError(
             f"no successful measured configuration satisfies max_gpu_layers={cap}"
         )

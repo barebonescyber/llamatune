@@ -243,8 +243,10 @@ proportional fallback.
 
 ## 8. Trial outcome classification
 
-`ok | unstable | oom | cuda_error | gpu_resource | timeout | crash | parse_error | pruned` (pruned =
-never executed, carries the pruning ancestor trial id). OOM detection:
+`ok | unstable | host_spill | oom | cuda_error | gpu_resource | timeout | crash | parse_error | pruned` (pruned =
+never executed, carries the pruning ancestor trial id). `host_spill` = a fully
+offloaded placement whose speed or observed VRAM delta suggests the backend is
+spilling to host memory; it is treated as infeasible (issue #36). OOM detection:
 nonzero exit AND stderr matching any of the case-insensitive regexes
 `failed to allocate`, `out of memory`, `cudaMalloc`, `kIOGPUCommandBuffer.*OutOfMemory`,
 `ggml_backend.*alloc.*fail`; the matched pattern is recorded.
