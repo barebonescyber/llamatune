@@ -139,3 +139,53 @@ def test_tune_with_missing_evidence_keeps_succeeded(tmp_path: Path) -> None:
     item = _tune_item(str(tmp_path / "missing"))
     text = render({"items": [item]})
     assert "succeeded" in text
+
+
+def test_calibrate_row_with_failed_validation_keeps_drift_text_and_qualifier(
+    tmp_path: Path,
+) -> None:
+    session_dir = _write_tune_session(tmp_path, ctx_size=8192, validation_status="failed")
+    item = {
+        "kind": "calibrate",
+        "model": "one.gguf",
+        "fingerprint": "a" * 64,
+        "outcome": "ok",
+        "session_dir": session_dir,
+        "calibration": {"verdict": "consistent", "drift_pp": 0.012, "drift_tg": 0.004},
+    }
+    text = render({"items": [item]})
+    assert "consistent (pp drift +1.2%, tg drift +0.4%)" in text
+    assert "tuned (context validation skipped/failed)" in text
+
+
+def test_interrupted_retuned_row_keeps_suffix_when_gate_rewords(tmp_path: Path) -> None:
+    session_dir = _write_tune_session(tmp_path, ctx_size=8192, validation_status="skipped")
+    item = {
+        "kind": "tune",
+        "model": "model.gguf",
+        "fingerprint": "d" * 64,
+        "outcome": "interrupted",
+        "session_dir": session_dir,
+        "retuned": True,
+        "winner_improvement": 0.02,
+    }
+    text = render({"items": [item]})
+    assert "tuned (context validation skipped/failed) → retuned" in text
+    assert "new winner +2.0%" in text
+
+
+def test_calibrate_row_marked_retuned_keeps_suffix_and_qualifier(tmp_path: Path) -> None:
+    session_dir = _write_tune_session(tmp_path, ctx_size=8192, validation_status="skipped")
+    item = {
+        "kind": "calibrate",
+        "model": "one.gguf",
+        "fingerprint": "a" * 64,
+        "outcome": "ok",
+        "session_dir": session_dir,
+        "calibration": {"verdict": "consistent"},
+        "retuned": True,
+        "winner_improvement": 0.02,
+    }
+    text = render({"items": [item]})
+    assert "consistent → retuned, new winner +2.0%" in text
+    assert "tuned (context validation skipped/failed)" in text

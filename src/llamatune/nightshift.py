@@ -413,7 +413,7 @@ def _stamp_nightshift_allocation(session: Any, options: TuneOptions) -> None:
             "budget_minutes": options.budget_minutes,
         }
         session.write_json("session.json", meta)
-    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+    except (OSError, ValueError, KeyError, TypeError):
         return
 
 

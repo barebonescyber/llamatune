@@ -1657,6 +1657,27 @@ def test_context_validation_keeps_trial_wording_when_trials_trip(
     )
 
 
+def test_context_validation_keeps_trial_wording_when_both_budgets_set_and_trials_trip(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+) -> None:
+    session, hw, model, llama, options = _setup(
+        tmp_path, fake_bin_dir, tiny_gguf, ctx_size=8192, budget_trials=1, budget_minutes=10.0
+    )
+    engine = search._Engine(session, hw, model, llama, options)
+    engine.incumbent_config = _envelope_config(20)
+    engine.executed_count = options.budget_trials
+    engine._validate_recommendation()
+    assert engine.context_validation is not None
+    assert engine.context_validation["status"] == "skipped"
+    assert engine.context_validation["reason"] == "trial budget was exhausted"
+    assert any(
+        "required context validation skipped because trial budget was exhausted" in warning
+        for warning in engine.extra_warnings
+    )
+
+
 def test_confirmation_respects_exhausted_budget(
     tmp_path: Path,
     fake_bin_dir: Path,

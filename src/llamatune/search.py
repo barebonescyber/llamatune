@@ -96,6 +96,8 @@ class _BudgetExhaustedError(Exception):
 
 def _budget_reason(engine: _Engine) -> str:
     """Name the budget that actually tripped (DESIGN §3; issue #39)."""
+    if engine.executed_count >= engine._trial_limit():
+        return "trial budget was exhausted"
     minutes = engine.options.budget_minutes
     if minutes is not None:
         used = min((_monotonic() - engine.start) / 60.0, minutes)

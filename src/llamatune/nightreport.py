@@ -1,4 +1,4 @@
-"""Pure Markdown rendering for a completed Night Shift summary."""
+"""Markdown rendering for a completed Night Shift summary."""
 
 from __future__ import annotations
 
@@ -52,6 +52,7 @@ def _context_validation_gate(item: dict[str, Any]) -> str | None:
             "options"
         )
     except (OSError, ValueError):
+        # Missing or unreadable evidence is not proof of failure; keep the row's verdict.
         return None
     if not isinstance(analysis, dict) or not isinstance(options, dict):
         return None
@@ -65,20 +66,28 @@ def _context_validation_gate(item: dict[str, Any]) -> str | None:
 
 def _item_result(item: dict[str, Any], *, retuned: bool = False) -> str:
     calibration = item.get("calibration")
+    retuned_active = bool(item.get("retuned")) or retuned
+    suffix = ""
+    if retuned_active:
+        suffix = " → retuned"
+        improvement = item.get("winner_improvement")
+        if improvement is not None:
+            suffix += f", new winner {_pct(improvement)}"
     if isinstance(calibration, dict):
-        text = _calibration_text(calibration)
+        text = _calibration_text(calibration) + suffix
     else:
         outcome = item.get("outcome") or item.get("result") or "unknown"
         reason = item.get("reason")
         text = f"failed: {reason}" if outcome in {"failed", "error"} and reason else str(outcome)
-    if item.get("retuned") or retuned:
-        text += " → retuned"
-        improvement = item.get("winner_improvement")
-        if improvement is not None:
-            text += f", new winner {_pct(improvement)}"
+        if retuned_active:
+            text += suffix
     gate = _context_validation_gate(item)
-    if gate is not None and not calibration and item.get("outcome") in {"succeeded", "interrupted"}:
-        text = gate
+    if gate is None:
+        return text
+    if isinstance(calibration, dict):
+        return f"{text}; {gate}"
+    if item.get("outcome") in {"succeeded", "interrupted"}:
+        return f"{gate}{suffix}"
     return text
 
 
@@ -94,7 +103,11 @@ def _identity(summary: dict[str, Any]) -> list[str]:
 
 
 def render(summary: dict[str, Any]) -> str:
-    """Render ``nightshift-report.md`` using summary content only."""
+    """Render ``nightshift-report.md`` from summary content.
+
+    Item verdicts may additionally read ``analysis.json``/``session.json``
+    under each item's ``session_dir`` to qualify context validation state.
+    """
     window = summary.get("window") or {}
     counts = summary.get("counts") or {}
     items = summary.get("items") or []
