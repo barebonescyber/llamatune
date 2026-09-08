@@ -19,7 +19,7 @@ from llamatune.types import GPUInfo, HardwareReport, LlamaCppReport, TuneOutcome
 runner = CliRunner()
 
 
-def _fake_hardware() -> HardwareReport:
+def _fake_hardware(llama_bin: Path | None = None) -> HardwareReport:
     return HardwareReport(
         os_name="Linux",
         arch="x86_64",

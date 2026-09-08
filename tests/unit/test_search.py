@@ -1009,7 +1009,7 @@ class TestResumeValidation:
         session, hw, _model, llama, _options_value = _setup(tmp_path, fake_bin_dir, tiny_gguf)
         changed = dataclasses.replace(llama, bench_sha256="f" * 64)
         monkeypatch.setattr("llamatune.llama.discover_llama", lambda _path: changed)
-        monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda: hw)
+        monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda llama_bin=None: hw)
         monkeypatch.setattr(
             search._Engine,
             "run",
@@ -1508,7 +1508,7 @@ def test_revalidate_confirmed_session_returns_comparison(
     metadata = json.loads(metadata_path.read_text())
     metadata["options"]["budget_trials"] = tuned.analysis["counts"]["budget_consumed"]
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
-    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda: hw)
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda llama_bin=None: hw)
     outcome = search.revalidate_session(session.dir)
     assert outcome.exit_code == 0
     assert outcome.analysis["status"] == "reproduced"

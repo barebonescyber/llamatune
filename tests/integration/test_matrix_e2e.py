@@ -24,7 +24,7 @@ write_matrix_evidence = cast(
 runner = CliRunner()
 
 
-def _gpu_hardware() -> HardwareReport:
+def _gpu_hardware(llama_bin: Path | None = None) -> HardwareReport:
     return HardwareReport(
         os_name="Linux",
         arch="x86_64",

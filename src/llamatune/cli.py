@@ -111,7 +111,7 @@ def _matrix_identity(llama_bin: Path) -> tuple[str, str]:
     from llamatune.llama import discover_llama
 
     llama = discover_llama(llama_bin)
-    signature = hardware_signature(assess_hardware())
+    signature = hardware_signature(assess_hardware(llama_bin=llama_bin))
     canonical = json.dumps(signature, sort_keys=True, separators=(",", ":"))
     hardware_hash = hashlib.sha256(canonical.encode()).hexdigest()[:16]
     discriminator = llama.bench_sha256 or llama.help_sha256
@@ -648,7 +648,7 @@ def scan(
     from llamatune.hardware import assess_hardware
     from llamatune.llama import LlamaDiscoveryError, discover_llama
 
-    hardware = assess_hardware()
+    hardware = assess_hardware(llama_bin=llama_bin)
 
     llama_report = None
     llama_error: str | None = None
@@ -1032,7 +1032,7 @@ def tune(
         )
         raise typer.Exit(code=3) from exc
 
-    hardware_report = assess_hardware()
+    hardware_report = assess_hardware(llama_bin=llama_bin)
     effective_progress = (
         ProgressMode.none if json_output and progress == ProgressMode.auto else progress
     )
@@ -1577,7 +1577,7 @@ def best_cmd(
     except (ModelInspectionError, LlamaDiscoveryError, OSError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=3) from exc
-    hardware = assess_hardware()
+    hardware = assess_hardware(llama_bin=llama_bin)
     result = lookup(
         sessions_dir / "registry.jsonl",
         model,

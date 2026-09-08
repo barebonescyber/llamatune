@@ -70,7 +70,7 @@ _SUMMARY_KEYS = {"trial_id", "status", "config", "pp_mean", "tg_mean", "score", 
 _EMISSION_FILES = ("analysis.json", "report.md", "recommended.json", "recommended.sh")
 
 
-def _gpu_hardware(vram_mb: int = 24000) -> HardwareReport:
+def _gpu_hardware(vram_mb: int = 24000, llama_bin: Path | None = None) -> HardwareReport:
     return HardwareReport(
         os_name="Linux",
         arch="x86_64",

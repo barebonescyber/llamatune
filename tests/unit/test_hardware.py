@@ -424,9 +424,10 @@ def test_assess_hardware_windows_uses_windows_seams(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(
         hardware,
         "_detect_gpus",
-        lambda os_name, ram_mb, arch: [
-            GPUInfo(vendor="intel", name="Arc", vram_mb=None, method="wmi:name-only")
-        ],
+        lambda os_name, ram_mb, arch, llama_bench=None: (
+            [GPUInfo(vendor="intel", name="Arc", vram_mb=None, method="wmi:name-only")],
+            [],
+        ),
     )
     report = hardware.assess_hardware()
     assert report.os_name == "Windows"
@@ -453,7 +454,9 @@ def test_assess_hardware_linux(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(hardware, "_detect_cpu_linux", lambda: ("Fake CPU", 8, 16, None, "method"))
     monkeypatch.setattr(hardware, "_detect_memory_linux", lambda: 32768)
-    monkeypatch.setattr(hardware, "_detect_gpus", lambda os_name, ram_mb, arch: [])
+    monkeypatch.setattr(
+        hardware, "_detect_gpus", lambda os_name, ram_mb, arch, llama_bench=None: ([], [])
+    )
     monkeypatch.setattr(hardware, "detect_load", lambda: (0.5, 0.5, 0.5))
 
     report = hardware.assess_hardware()
@@ -470,7 +473,9 @@ def test_assess_hardware_macos(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(platform, "machine", lambda: "arm64")
     monkeypatch.setattr(hardware, "_detect_cpu_macos", lambda: ("Apple M2", 12, 12, 8, "sysctl"))
     monkeypatch.setattr(hardware, "_detect_memory_macos", lambda: 65536)
-    monkeypatch.setattr(hardware, "_detect_gpus", lambda os_name, ram_mb, arch: [])
+    monkeypatch.setattr(
+        hardware, "_detect_gpus", lambda os_name, ram_mb, arch, llama_bench=None: ([], [])
+    )
     monkeypatch.setattr(hardware, "detect_load", lambda: None)
 
     report = hardware.assess_hardware()
@@ -485,7 +490,9 @@ def test_assess_hardware_warns_on_high_load(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(hardware, "_detect_cpu_linux", lambda: ("Fake CPU", 4, 8, None, "method"))
     monkeypatch.setattr(hardware, "_detect_memory_linux", lambda: 8192)
-    monkeypatch.setattr(hardware, "_detect_gpus", lambda os_name, ram_mb, arch: [])
+    monkeypatch.setattr(
+        hardware, "_detect_gpus", lambda os_name, ram_mb, arch, llama_bench=None: ([], [])
+    )
     monkeypatch.setattr(hardware, "detect_load", lambda: (10.0, 5.0, 2.0))
 
     report = hardware.assess_hardware()
@@ -497,8 +504,183 @@ def test_assess_hardware_unrecognized_platform_warns(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(platform, "machine", lambda: "amd64")
     monkeypatch.setattr(hardware, "_detect_cpu_linux", lambda: ("Fake CPU", 4, 8, None, "method"))
     monkeypatch.setattr(hardware, "_detect_memory_linux", lambda: 8192)
-    monkeypatch.setattr(hardware, "_detect_gpus", lambda os_name, ram_mb, arch: [])
+    monkeypatch.setattr(
+        hardware, "_detect_gpus", lambda os_name, ram_mb, arch, llama_bench=None: ([], [])
+    )
     monkeypatch.setattr(hardware, "detect_load", lambda: None)
 
     report = hardware.assess_hardware()
     assert any("unrecognized platform" in w for w in report.warnings)
+
+
+# -- llama-bench --list-devices fallback -----------------------------------------
+
+
+def test_detect_gpus_llama_bench_parses_nvk_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    out = (
+        "Available devices:\n"
+        "  Vulkan0: NVIDIA GeForce RTX 5070 (NVK GB205) (12227 MiB, 2226 MiB free)\n"
+    )
+    monkeypatch.setattr(hardware, "_run_probe", lambda argv: out)
+    gpus = hardware._detect_gpus_llama_bench(Path("/opt/llama/llama-bench"))
+    assert len(gpus) == 1
+    gpu = gpus[0]
+    assert gpu.name == "NVIDIA GeForce RTX 5070 (NVK GB205)"
+    assert gpu.vram_mb == 12227
+    assert gpu.vram_free_mb == 2226
+    assert gpu.vendor == "nvidia"
+    assert gpu.method == "llama-bench --list-devices"
+    assert gpu.vram_free_method == "llama-bench --list-devices"
+    assert gpu.vram_free_at is not None and "+00:00" in gpu.vram_free_at
+    assert gpu.driver_version is None
+
+
+def test_detect_gpus_llama_bench_line_without_free_mib(monkeypatch: pytest.MonkeyPatch) -> None:
+    out = "  Vulkan0: AMD Radeon RX 7900 (RADV NAVI31) (20468 MiB)\n"
+    monkeypatch.setattr(hardware, "_run_probe", lambda argv: out)
+    gpus = hardware._detect_gpus_llama_bench(Path("/opt/llama/llama-bench"))
+    assert len(gpus) == 1
+    gpu = gpus[0]
+    assert gpu.vram_mb == 20468
+    assert gpu.vram_free_mb is None
+    assert gpu.vram_free_method is None
+    assert gpu.vram_free_at is None
+    assert gpu.vendor == "amd"
+
+
+def test_detect_gpus_llama_bench_unknown_vendor(monkeypatch: pytest.MonkeyPatch) -> None:
+    out = "  Vulkan0: Some Exotic Accelerator (1 MiB)\n"
+    monkeypatch.setattr(hardware, "_run_probe", lambda argv: out)
+    gpus = hardware._detect_gpus_llama_bench(Path("/opt/llama/llama-bench"))
+    assert gpus[0].vendor == "unknown"
+
+
+def test_detect_gpus_llama_bench_multiple_lines_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    out = (
+        "  Vulkan0: NVIDIA GeForce RTX 5070 (NVK GB205) (12227 MiB, 2226 MiB free)\n"
+        "  Vulkan1: NVIDIA GeForce RTX 3060 (12288 MiB, 1000 MiB free)\n"
+    )
+    monkeypatch.setattr(hardware, "_run_probe", lambda argv: out)
+    gpus = hardware._detect_gpus_llama_bench(Path("/opt/llama/llama-bench"))
+    assert [gpu.vram_mb for gpu in gpus] == [12227, 12288]
+    assert [gpu.vram_free_mb for gpu in gpus] == [2226, 1000]
+
+
+def test_detect_gpus_llama_bench_probe_failure_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hardware, "_run_probe", lambda argv: None)
+    assert hardware._detect_gpus_llama_bench(Path("/opt/llama/llama-bench")) == []
+
+
+def test_detect_gpus_llama_bench_unparseable_output_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hardware, "_run_probe", lambda argv: "no devices here\n")
+    assert hardware._detect_gpus_llama_bench(Path("/opt/llama/llama-bench")) == []
+
+
+def test_detect_gpus_falls_back_to_llama_bench_when_vendor_probes_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = Path("/opt/llama/llama-bench")
+    seen: list[list[str]] = []
+
+    def fake_probe(argv: list[str]) -> str | None:
+        seen.append(argv)
+        if argv[0] == "nvidia-smi" or argv[0] == "rocm-smi":
+            return None
+        if argv[-1] == "--list-devices":
+            return "  Vulkan0: NVIDIA GeForce RTX 5070 (NVK GB205) (12227 MiB, 2226 MiB free)\n"
+        return None
+
+    monkeypatch.setattr(hardware, "_run_probe", fake_probe)
+    gpus, gpu_warnings = hardware._detect_gpus("Linux", 32768, "x86_64", llama_bench=bench)
+    assert [gpu.method for gpu in gpus] == ["llama-bench --list-devices"]
+    assert gpu_warnings == []
+    assert next(argv[1:] for argv in seen if argv[0] == str(bench)) == ["--list-devices"]
+
+
+def test_detect_gpus_skips_llama_bench_when_nvidia_smi_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = Path("/opt/llama/llama-bench")
+    calls: list[list[str]] = []
+
+    def fake_probe(argv: list[str]) -> str | None:
+        calls.append(argv)
+        if argv[0] == "nvidia-smi":
+            return "NVIDIA GeForce RTX 4090, 24564 MiB, 20000 MiB, 595.80, 17 %\n"
+        if argv[-1] == "--list-devices":
+            raise AssertionError("llama-bench fallback must not run when vendor probes succeed")
+        return None
+
+    monkeypatch.setattr(hardware, "_run_probe", fake_probe)
+    gpus, gpu_warnings = hardware._detect_gpus("Linux", 32768, "x86_64", llama_bench=bench)
+    assert [gpu.method for gpu in gpus] == ["nvidia-smi"]
+    assert gpu_warnings == []
+    assert all(argv[0] != str(bench) for argv in calls)
+
+
+def test_detect_gpus_llama_bench_failure_warns_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = Path("/opt/llama/llama-bench")
+    monkeypatch.setattr(hardware, "_run_probe", lambda argv: None)
+    gpus, gpu_warnings = hardware._detect_gpus("Linux", 32768, "x86_64", llama_bench=bench)
+    assert gpus == []
+    assert len(gpu_warnings) == 1
+    assert "--list-devices" in gpu_warnings[0]
+
+
+def test_detect_gpus_without_bench_path_skips_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hardware, "_run_probe", lambda argv: None)
+    gpus, gpu_warnings = hardware._detect_gpus("Linux", 32768, "x86_64")
+    assert gpus == []
+    assert gpu_warnings == []
+
+
+def test_assess_hardware_threads_llama_bench_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Path | None] = {}
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(hardware, "_detect_cpu_linux", lambda: ("Fake CPU", 4, 8, None, "method"))
+    monkeypatch.setattr(hardware, "_detect_memory_linux", lambda: 8192)
+    monkeypatch.setattr(
+        hardware,
+        "_detect_gpus",
+        lambda os_name, ram_mb, arch, llama_bench=None: (
+            captured.update(bench=llama_bench),
+            ([], []),
+        )[1],
+    )
+    monkeypatch.setattr(hardware, "detect_load", lambda: None)
+    monkeypatch.setattr(
+        hardware,
+        "_resolve_llama_bench",
+        lambda llama_bin: Path("/opt/llama/llama-bench") if llama_bin is not None else None,
+    )
+
+    hardware.assess_hardware(llama_bin=Path("/opt/llama"))
+    assert captured["bench"] == Path("/opt/llama/llama-bench")
+
+
+def test_assess_hardware_appends_llama_bench_fallback_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(hardware, "_detect_cpu_linux", lambda: ("Fake CPU", 4, 8, None, "method"))
+    monkeypatch.setattr(hardware, "_detect_memory_linux", lambda: 8192)
+    monkeypatch.setattr(
+        hardware,
+        "_detect_gpus",
+        lambda os_name, ram_mb, arch, llama_bench=None: (
+            [],
+            ["llama-bench --list-devices found no devices"],
+        ),
+    )
+    monkeypatch.setattr(hardware, "detect_load", lambda: None)
+
+    report = hardware.assess_hardware()
+    assert any("--list-devices" in w for w in report.warnings)
