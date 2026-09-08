@@ -279,16 +279,29 @@ def _method_section(session_meta: dict[str, Any], baseline: dict[str, Any]) -> s
         f"- Target: {options.get('target', '-')}",
         f"- Budget: {options.get('budget_trials', '-')} trials, "
         f"{options.get('budget_minutes') or 'unlimited'} minutes",
-        f"- Repetitions: search={options.get('reps_search', '-')}, "
-        f"confirm={options.get('reps_confirm', '-')}",
-        f"- Baseline runs: {options.get('baseline_runs', '-')}",
-        f"- Workload: pp={options.get('pp', '-')}, tg={options.get('tg', '-')}"
-        + (f", depth={options['depth']}" if options.get("depth") is not None else ""),
-        f"- Lossy dimensions allowed: {options.get('allow_lossy', False)}",
-        f"- Cooldown: {options.get('cooldown_s', 0)} s",
-        *(["- Multi-GPU pooled capacity: enabled"] if options.get("multi_gpu") else []),
-        f"- Noise floor (cv): {_fmt(baseline.get('noise_floor_cv'), 4)}",
     ]
+    allocated = session_meta.get("nightshift")
+    if isinstance(allocated, dict):
+        trials = allocated.get("budget_trials")
+        minutes = allocated.get("budget_minutes")
+        minutes_text = f"{minutes:.2f}" if isinstance(minutes, (int, float)) else "-"
+        lines.append(
+            f"- Night Shift allocated up to {trials if trials is not None else '-'} trials "
+            f"and {minutes_text} minutes of the shift window"
+        )
+    lines.extend(
+        [
+            f"- Repetitions: search={options.get('reps_search', '-')}, "
+            f"confirm={options.get('reps_confirm', '-')}",
+            f"- Baseline runs: {options.get('baseline_runs', '-')}",
+            f"- Workload: pp={options.get('pp', '-')}, tg={options.get('tg', '-')}"
+            + (f", depth={options['depth']}" if options.get("depth") is not None else ""),
+            f"- Lossy dimensions allowed: {options.get('allow_lossy', False)}",
+            f"- Cooldown: {options.get('cooldown_s', 0)} s",
+            *(["- Multi-GPU pooled capacity: enabled"] if options.get("multi_gpu") else []),
+            f"- Noise floor (cv): {_fmt(baseline.get('noise_floor_cv'), 4)}",
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 

@@ -587,6 +587,10 @@ class Session:
         """Read one JSON artifact after confining it to this session."""
         return _read_json(_confine(self._dir, name))
 
+    def write_json(self, name: str, data: dict[str, Any]) -> None:
+        """Write one JSON artifact after confining it to this session."""
+        self._write_json(name, data)
+
     def write_text(self, name: str, text: str) -> None:
         path = _confine(self._dir, name)
         path.parent.mkdir(parents=True, exist_ok=True)

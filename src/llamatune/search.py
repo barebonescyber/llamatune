@@ -94,6 +94,25 @@ class _BudgetExhaustedError(Exception):
     """Internal signal: a budget is exhausted; jump to confirmation."""
 
 
+def _budget_reason(engine: _Engine) -> str:
+    """Name the budget that actually tripped (DESIGN §3; issue #39)."""
+    minutes = engine.options.budget_minutes
+    if minutes is not None:
+        used = min((_monotonic() - engine.start) / 60.0, minutes)
+        reason = (
+            f"the time budget was exhausted "
+            f"({_fmt_minutes(used)} of {_fmt_minutes(minutes)} minutes used)"
+        )
+        return reason
+    return "trial budget was exhausted"
+
+
+def _fmt_minutes(value: float) -> str:
+    if value >= 100:
+        return f"{value:.1f}"
+    return f"{value:.2f}"
+
+
 class _NoFeasibleConfigError(Exception):
     """Internal signal: no measured configuration satisfies a binding cap."""
 
@@ -2232,8 +2251,9 @@ class _Engine:
                     "ctx": self.options.ctx_size,
                     "status": "skipped",
                     "evidence": None,
+                    "reason": _budget_reason(self),
                 }
-                warning = "required context validation skipped because trial budget was exhausted"
+                warning = f"required context validation skipped because {_budget_reason(self)}"
                 if warning not in self.extra_warnings:
                     self.extra_warnings.append(warning)
                     self._emit("warning", message=warning)
@@ -3078,7 +3098,7 @@ class _Engine:
         tg_means: list[float] = []
         for index in range(1, self.options.baseline_runs + 1):
             if not self._can_execute():
-                warning = "confirmation skipped because trial budget was exhausted"
+                warning = f"confirmation skipped because {_budget_reason(self)}"
                 if warning not in self.extra_warnings:
                     self.extra_warnings.append(warning)
                     self._emit("warning", message=warning)

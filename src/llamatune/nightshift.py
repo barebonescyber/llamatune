@@ -404,6 +404,19 @@ def _item_dict(item: WorkItem) -> dict[str, Any]:
     return cast(dict[str, Any], _jsonable(item))
 
 
+def _stamp_nightshift_allocation(session: Any, options: TuneOptions) -> None:
+    """Record the Night Shift allocation in session.json (issue #39)."""
+    try:
+        meta = session.read_json("session.json")
+        meta["nightshift"] = {
+            "budget_trials": options.budget_trials,
+            "budget_minutes": options.budget_minutes,
+        }
+        session.write_json("session.json", meta)
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return
+
+
 def _remaining_minutes(deadline: datetime | None, now: datetime) -> float | None:
     return None if deadline is None else max(0.0, (deadline - now).total_seconds() / 60.0)
 
@@ -784,6 +797,7 @@ def run_nightshift(
                                 argv=sys.argv,
                             )
                             session_dir = session.dir
+                            _stamp_nightshift_allocation(session, tune_options)
                             outcome = run_tuning(
                                 session, current_hardware, model.report, llama, tune_options
                             )
@@ -906,6 +920,7 @@ def run_nightshift(
                         argv=sys.argv,
                     )
                     deepen_session_dir = session.dir
+                    _stamp_nightshift_allocation(session, tune_options)
                     outcome = run_tuning(
                         session, current_hardware, model.report, llama, tune_options
                     )

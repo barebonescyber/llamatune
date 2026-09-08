@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 
@@ -36,6 +38,31 @@ def _calibration_text(calibration: dict[str, Any]) -> str:
     return f"{label} ({', '.join(changes)})" if changes else label
 
 
+def _context_validation_gate(item: dict[str, Any]) -> str | None:
+    """Return the unverified label when required context validation did not pass."""
+    session_dir = item.get("session_dir")
+    if not isinstance(session_dir, str) or not session_dir:
+        return None
+    analysis: Any = None
+    options: Any = None
+    try:
+        base = Path(session_dir)
+        analysis = json.loads((base / "analysis.json").read_text(encoding="utf-8"))
+        options = (json.loads((base / "session.json").read_text(encoding="utf-8")) or {}).get(
+            "options"
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(analysis, dict) or not isinstance(options, dict):
+        return None
+    if options.get("ctx_size") is None:
+        return None
+    validation = analysis.get("context_validation")
+    if isinstance(validation, dict) and validation.get("status") == "ok":
+        return None
+    return "tuned (context validation skipped/failed)"
+
+
 def _item_result(item: dict[str, Any], *, retuned: bool = False) -> str:
     calibration = item.get("calibration")
     if isinstance(calibration, dict):
@@ -49,6 +76,9 @@ def _item_result(item: dict[str, Any], *, retuned: bool = False) -> str:
         improvement = item.get("winner_improvement")
         if improvement is not None:
             text += f", new winner {_pct(improvement)}"
+    gate = _context_validation_gate(item)
+    if gate is not None and not calibration and item.get("outcome") in {"succeeded", "interrupted"}:
+        text = gate
     return text
 
 

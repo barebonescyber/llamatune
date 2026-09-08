@@ -455,6 +455,29 @@ def test_method_reports_multi_gpu_only_when_enabled() -> None:
     assert "Multi-GPU pooled capacity" not in default_text
 
 
+def test_method_reports_night_shift_allocation_next_to_budget() -> None:
+    session_meta = {
+        **_SESSION_META,
+        "nightshift": {"budget_trials": 120, "budget_minutes": 263.5532032333333},
+    }
+    text = report.render(_analysis_with_winner(), session_meta, _HARDWARE, _MODEL, _LLAMACPP)
+    default_text = report.render(
+        _analysis_with_winner(), _SESSION_META, _HARDWARE, _MODEL, _LLAMACPP
+    )
+    assert "Budget: 60 trials, unlimited minutes" in text
+    assert "Night Shift allocated up to 120 trials and 263.55 minutes of the shift window" in text
+    assert "Night Shift allocated" not in default_text
+
+
+def test_method_reports_night_shift_allocation_without_minutes_verbatim() -> None:
+    session_meta = {
+        **_SESSION_META,
+        "nightshift": {"budget_trials": 120, "budget_minutes": None},
+    }
+    text = report.render(_analysis_with_winner(), session_meta, _HARDWARE, _MODEL, _LLAMACPP)
+    assert "Night Shift allocated up to 120 trials and - minutes of the shift window" in text
+
+
 def test_report_real_quality_shape_computes_delta_and_formats_stage3_config() -> None:
     analysis = _analysis_with_winner()
     analysis["quality_gate"] = {"status": "ok", "ppl_lossy": 7.5, "ppl_f16": 7.4}

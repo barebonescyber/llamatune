@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from llamatune.nightreport import render
 
 
@@ -72,3 +75,67 @@ def test_render_tolerates_minimal_summary() -> None:
     text = render({})
     assert "| _None_ |" in text
     assert text.count("_None._") == 2
+
+
+def _write_tune_session(
+    tmp_path: Path,
+    *,
+    ctx_size: int | None,
+    validation_status: str | None,
+) -> str:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    (session_dir / "session.json").write_text(
+        json.dumps({"options": {"ctx_size": ctx_size}}), encoding="utf-8"
+    )
+    validation = None
+    if validation_status is not None:
+        validation = {"ctx": ctx_size, "status": validation_status, "evidence": None}
+    (session_dir / "analysis.json").write_text(
+        json.dumps({"context_validation": validation}), encoding="utf-8"
+    )
+    return str(session_dir)
+
+
+def _tune_item(session_dir: str) -> dict[str, object]:
+    return {
+        "kind": "tune",
+        "model": "model.gguf",
+        "fingerprint": "d" * 64,
+        "outcome": "succeeded",
+        "session_dir": session_dir,
+    }
+
+
+def test_tune_without_required_context_renders_succeeded(tmp_path: Path) -> None:
+    session_dir = _write_tune_session(tmp_path, ctx_size=None, validation_status=None)
+    text = render({"items": [_tune_item(session_dir)]})
+    assert "| model.gguf |" in text
+    assert "succeeded" in text
+    assert "tuned (context validation skipped/failed)" not in text
+
+
+def test_tune_with_ok_context_validation_renders_succeeded(tmp_path: Path) -> None:
+    session_dir = _write_tune_session(tmp_path, ctx_size=8192, validation_status="ok")
+    text = render({"items": [_tune_item(session_dir)]})
+    assert "succeeded" in text
+    assert "tuned (context validation skipped/failed)" not in text
+
+
+def test_tune_with_skipped_context_validation_is_not_succeeded(tmp_path: Path) -> None:
+    session_dir = _write_tune_session(tmp_path, ctx_size=8192, validation_status="skipped")
+    text = render({"items": [_tune_item(session_dir)]})
+    assert "tuned (context validation skipped/failed)" in text
+    assert "| model.gguf" in text
+
+
+def test_tune_with_failed_context_validation_is_not_succeeded(tmp_path: Path) -> None:
+    session_dir = _write_tune_session(tmp_path, ctx_size=8192, validation_status="failed")
+    text = render({"items": [_tune_item(session_dir)]})
+    assert "tuned (context validation skipped/failed)" in text
+
+
+def test_tune_with_missing_evidence_keeps_succeeded(tmp_path: Path) -> None:
+    item = _tune_item(str(tmp_path / "missing"))
+    text = render({"items": [item]})
+    assert "succeeded" in text

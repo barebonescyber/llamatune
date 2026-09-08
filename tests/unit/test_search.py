@@ -1601,6 +1601,62 @@ def test_required_context_validation_respects_exhausted_budget(
     assert any("context validation skipped" in warning for warning in engine.extra_warnings)
 
 
+def test_context_validation_names_minutes_when_time_budget_trips(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, model, llama, options = _setup(
+        tmp_path, fake_bin_dir, tiny_gguf, ctx_size=8192, budget_minutes=10.0
+    )
+    engine = search._Engine(session, hw, model, llama, options)
+    engine.incumbent_config = _envelope_config(20)
+
+    real_can_execute = engine._can_execute
+
+    def exhaust_time() -> bool:
+        engine.start -= 11.0 * 60.0
+        return real_can_execute()
+
+    monkeypatch.setattr(engine, "_can_execute", exhaust_time)
+    monkeypatch.setattr(
+        engine,
+        "_run_child",
+        lambda **_kwargs: pytest.fail("budget exhaustion must prevent context execution"),
+    )
+    engine._validate_recommendation()
+    assert engine.context_validation is not None
+    assert engine.context_validation["status"] == "skipped"
+    assert engine.context_validation["reason"].startswith("the time budget was exhausted")
+    assert "minutes used)" in engine.context_validation["reason"]
+    assert any(
+        "required context validation skipped because the time budget was exhausted" in warning
+        for warning in engine.extra_warnings
+    )
+
+
+def test_context_validation_keeps_trial_wording_when_trials_trip(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+) -> None:
+    session, hw, model, llama, options = _setup(
+        tmp_path, fake_bin_dir, tiny_gguf, ctx_size=8192, budget_trials=1
+    )
+    engine = search._Engine(session, hw, model, llama, options)
+    engine.incumbent_config = _envelope_config(20)
+    engine.executed_count = options.budget_trials
+    engine._validate_recommendation()
+    assert engine.context_validation is not None
+    assert engine.context_validation["status"] == "skipped"
+    assert engine.context_validation["reason"] == "trial budget was exhausted"
+    assert any(
+        "required context validation skipped because trial budget was exhausted" in warning
+        for warning in engine.extra_warnings
+    )
+
+
 def test_confirmation_respects_exhausted_budget(
     tmp_path: Path,
     fake_bin_dir: Path,
@@ -1620,6 +1676,27 @@ def test_confirmation_respects_exhausted_budget(
 
     assert confirmation.confirmed is False
     assert any("confirmation skipped" in warning for warning in engine.extra_warnings)
+
+
+def test_confirmation_names_minutes_when_time_budget_trips(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, model, llama, options = _setup(
+        tmp_path, fake_bin_dir, tiny_gguf, budget_minutes=10.0
+    )
+    engine = search._Engine(session, hw, model, llama, options)
+    monkeypatch.setattr(engine, "_can_execute", lambda: False)
+
+    confirmation = engine._confirm(_envelope_config(0))
+
+    assert confirmation.confirmed is False
+    assert any(
+        "confirmation skipped because the time budget was exhausted" in warning
+        for warning in engine.extra_warnings
+    )
 
 
 def test_envelope_primary_failure_fallback_pass_and_resume_dedup(
