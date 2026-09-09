@@ -559,7 +559,7 @@ def run_nightshift(
     deadline = resolve_deadline(start, options.until, options.max_hours)
     startup_errors: list[str] = []
     try:
-        hardware = assess_hardware()
+        hardware = assess_hardware(llama_bin=options.llama_bin)
     except Exception as exc:
         startup_errors.append(f"hardware assessment failed: {exc}")
         hardware = HardwareReport(
@@ -782,7 +782,7 @@ def run_nightshift(
                             outcome = resume_tuning(session_dir)
                         else:
                             model = by_fingerprint[item.fingerprint or ""]
-                            current_hardware = assess_hardware()
+                            current_hardware = assess_hardware(llama_bin=options.llama_bin)
                             tune_options = _tune_options(
                                 options,
                                 current_hardware,
@@ -911,7 +911,7 @@ def run_nightshift(
                 item_started = clock()
                 deepen_session_dir: Path | None = None
                 try:
-                    current_hardware = assess_hardware()
+                    current_hardware = assess_hardware(llama_bin=options.llama_bin)
                     tune_options = _tune_options(options, current_hardware, remaining, deepen=True)
                     session = Session.create(
                         options.sessions_dir,

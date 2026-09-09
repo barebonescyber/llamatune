@@ -122,3 +122,31 @@ def test_human_dry_run_prints_full_plan(tmp_path: Path, monkeypatch: pytest.Monk
     assert str(tmp_path / "model.gguf") in result.output
     assert "42.0 min" in result.output
     assert "no completed session" in result.output
+
+
+def test_assess_hardware_receives_llama_bin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #37 seam: Night Shift must thread --llama-bin into GPU discovery."""
+    seen: list[Path | None] = []
+    import llamatune.hardware as hw
+
+    llama_bin = tmp_path / "bin"
+    llama_bin.mkdir()
+
+    def fake_assess(llama_bin: Path | None = None) -> object:
+        seen.append(llama_bin)
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(hw, "assess_hardware", fake_assess)
+    result = runner.invoke(
+        app,
+        [
+            "nightshift",
+            str(tmp_path / "models"),
+            "--llama-bin",
+            str(llama_bin),
+        ],
+    )
+    assert seen == [llama_bin]
+    assert result.exit_code != 0
