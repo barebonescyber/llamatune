@@ -91,7 +91,7 @@ def _options(tmp_path: Path, model_dir: Path, **overrides: object) -> Nightshift
     return NightshiftOptions(**values)  # type: ignore[arg-type]
 
 
-def _hardware() -> HardwareReport:
+def _hardware(llama_bin: Path | None = None) -> HardwareReport:
     return HardwareReport(
         os_name="test",
         arch="x86_64",

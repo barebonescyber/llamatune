@@ -367,6 +367,32 @@ def test_render_failed_zero_boundary_does_not_claim_a_fitting_placement() -> Non
     assert "| 0 | 0 | 0 | 2 |" not in text
 
 
+def test_render_boundary_and_max_fitting_annotate_host_spill_suspected() -> None:
+    analysis = _analysis_with_winner()
+    analysis["feasibility"] = {
+        "boundaries": [
+            {
+                "moe_cpu_layers": 0,
+                "max_ok_ngl": 23,
+                "min_fail_ngl": 24,
+                "probes": 7,
+                "spill_suspected": True,
+            }
+        ],
+        "max_fitting": {
+            "gpu_layers": 23,
+            "moe_cpu_layers": 0,
+            "spill_suspected": True,
+        },
+    }
+
+    text = report.render(analysis, _SESSION_META, _HARDWARE, _MODEL, _LLAMACPP)
+
+    assert "| 0 | 23 (host-spill suspected) | 24 | 7 |" in text
+    assert "host-spill suspected" in text.split("## Feasibility and placement")[1].split("## ")[0]
+    assert "_Host-memory spill was suspected" in text
+
+
 def _recommended_export(*, moe: bool = True) -> dict[str, Any]:
     config = _config_dict(moe_cpu_layers=18 if moe else 0)
     if moe:
@@ -453,6 +479,29 @@ def test_method_reports_multi_gpu_only_when_enabled() -> None:
     )
     assert "Multi-GPU pooled capacity: enabled" in enabled_text
     assert "Multi-GPU pooled capacity" not in default_text
+
+
+def test_method_reports_night_shift_allocation_next_to_budget() -> None:
+    session_meta = {
+        **_SESSION_META,
+        "nightshift": {"budget_trials": 120, "budget_minutes": 263.5532032333333},
+    }
+    text = report.render(_analysis_with_winner(), session_meta, _HARDWARE, _MODEL, _LLAMACPP)
+    default_text = report.render(
+        _analysis_with_winner(), _SESSION_META, _HARDWARE, _MODEL, _LLAMACPP
+    )
+    assert "Budget: 60 trials, unlimited minutes" in text
+    assert "Night Shift allocated up to 120 trials and 263.55 minutes of the shift window" in text
+    assert "Night Shift allocated" not in default_text
+
+
+def test_method_reports_night_shift_allocation_without_minutes_verbatim() -> None:
+    session_meta = {
+        **_SESSION_META,
+        "nightshift": {"budget_trials": 120, "budget_minutes": None},
+    }
+    text = report.render(_analysis_with_winner(), session_meta, _HARDWARE, _MODEL, _LLAMACPP)
+    assert "Night Shift allocated up to 120 trials and - minutes of the shift window" in text
 
 
 def test_report_real_quality_shape_computes_delta_and_formats_stage3_config() -> None:
@@ -619,3 +668,64 @@ def test_present_null_binary_hash_is_explicitly_unknown() -> None:
         {**_LLAMACPP, "bench_sha256": None},
     )
     assert "llama-bench SHA-256: `(unknown)`" in text
+
+
+def test_context_section_reports_work_scaled_timeout_and_retries() -> None:
+    """Issue #38: the context-validation section names the timeout policy."""
+    analysis = {
+        "context_validation": {"ctx": 65536, "status": "ok", "evidence": "probes/x"},
+        "probe_timeout": {
+            "scale": 2.5,
+            "floor_s": None,
+            "trial_timeout_s": 122.7,
+            "max_s": 3600.0,
+            "retries": 1,
+        },
+    }
+    text = report._context_section(analysis)
+    assert "work-scaled at 2.5x" in text
+    assert "122.7s" in text
+    assert "1 work-scaled retries" in text
+
+    no_timeout = report._context_section({"context_validation": {"ctx": 1, "status": "ok"}})
+    assert "Probe timeout" not in no_timeout
+
+    zero_retries = report._context_section(
+        {
+            "context_validation": {"ctx": 1, "status": "ok", "evidence": "probes/x"},
+            "probe_timeout": {
+                "scale": 2.5,
+                "trial_timeout_s": 120.0,
+                "max_s": 3600.0,
+                "retries": 0,
+            },
+        }
+    )
+    assert "no retries needed" in zero_retries
+
+
+def test_feasibility_section_renders_default_placement_estimate() -> None:
+    analysis = _analysis_no_winner()
+    analysis["feasibility"] = {
+        "recommended": {"gpu_layers": 0, "moe_cpu_layers": 0, "reason": "x"},
+        "default_placement": {"gpu_layers": 41, "moe_cpu_layers": 0},
+        "estimate": {
+            "weights_mb": 0.0,
+            "kv_mb": 0.0,
+            "compute_mb": 0.0,
+            "total_mb": 0.0,
+            "budget_mb": 10476.0,
+            "kv_basis": "metadata",
+        },
+        "default_placement_estimate": {
+            "weights_mb": 7300.0,
+            "kv_mb": 277.0,
+            "compute_mb": 192.0,
+            "total_mb": 7769.0,
+            "budget_mb": 10476.0,
+            "kv_basis": "metadata",
+        },
+    }
+    text = report.render(analysis, _SESSION_META, _HARDWARE, _MODEL, _LLAMACPP)
+    assert "Default placement (ngl=41)" in text
+    assert "total=7769" in text

@@ -379,7 +379,66 @@ def _detect_gpus_apple(ram_mb: int, arch: str) -> list[GPUInfo]:
     return gpus
 
 
-def _detect_gpus(os_name: str, ram_mb: int, arch: str) -> list[GPUInfo]:
+_LLAMA_BENCH_DEVICE_RE = re.compile(
+    r"^\s*(?P<backend>\w+\d*):\s+(?P<name>.+?)\s+"
+    r"\((?P<total>\d+)\s+MiB(?:,\s*(?P<free>\d+)\s+MiB\s+free)?\)\s*$"
+)
+
+
+def _gpu_vendor_from_name(name: str) -> str:
+    lowered = name.casefold()
+    if "nvidia" in lowered or "geforce" in lowered:
+        return "nvidia"
+    if "amd" in lowered or "radeon" in lowered:
+        return "amd"
+    return "unknown"
+
+
+def _detect_gpus_llama_bench(bench_path: Path) -> list[GPUInfo]:
+    """Detect GPUs via `llama-bench --list-devices` (NVK/Mesa fallback).
+
+    llama.cpp enumerates the devices its own build supports, so this finds
+    GPUs that vendor tooling misses (e.g. NVIDIA under NVK/Mesa). Lines look
+    like `Vulkan0: NVIDIA GeForce RTX 5070 (NVK GB205) (12227 MiB, 2226 MiB
+    free)`; the free-MiB clause is optional. Failure of any kind yields []
+    and never raises.
+    """
+    out = _run_probe([str(bench_path), "--list-devices"])
+    if out is None:
+        return []
+    gpus: list[GPUInfo] = []
+    for line in out.splitlines():
+        match = _LLAMA_BENCH_DEVICE_RE.match(line)
+        if match is None:
+            continue
+        name = match.group("name").strip()
+        vram_mb = int(match.group("total"))
+        free_match = match.group("free")
+        vram_free_mb = int(free_match) if free_match is not None else None
+        gpus.append(
+            GPUInfo(
+                vendor=_gpu_vendor_from_name(name),
+                name=name,
+                vram_mb=vram_mb,
+                method="llama-bench --list-devices",
+                vram_free_mb=vram_free_mb,
+                vram_free_method="llama-bench --list-devices" if vram_free_mb is not None else None,
+                vram_free_at=(datetime.now(UTC).isoformat() if vram_free_mb is not None else None),
+            )
+        )
+    return gpus
+
+
+def _resolve_llama_bench(llama_bin: Path | None) -> Path | None:
+    """Resolve llama-bench for GPU discovery, reusing llama.py's resolution."""
+    from llamatune.llama import _resolve_binary
+
+    return _resolve_binary("llama-bench", llama_bin)
+
+
+def _detect_gpus(
+    os_name: str, ram_mb: int, arch: str, llama_bench: Path | None = None
+) -> tuple[list[GPUInfo], list[str]]:
     gpus: list[GPUInfo] = [*_detect_gpus_nvidia()]
     if os_name == "Windows":
         gpus.extend(_detect_gpus_windows_wmi({gpu.name for gpu in gpus}))
@@ -387,7 +446,18 @@ def _detect_gpus(os_name: str, ram_mb: int, arch: str) -> list[GPUInfo]:
         gpus.extend(_detect_gpus_amd())
     if os_name == "Darwin":
         gpus.extend(_detect_gpus_apple(ram_mb, arch))
-    return gpus
+    if gpus:
+        return gpus, []
+    if llama_bench is None:
+        return [], ["llama-bench not found; GPU fallback skipped"]
+    llama_gpus = _detect_gpus_llama_bench(llama_bench)
+    if llama_gpus:
+        return llama_gpus, []
+    return [], [
+        "vendor GPU probes found no devices and 'llama-bench --list-devices' "
+        "found none either; if this is a CPU-only llama.cpp build, GPU "
+        "detection cannot see a GPU the build does not support"
+    ]
 
 
 def _detect_gpus_windows_wmi(existing_names: set[str] | None = None) -> list[GPUInfo]:
@@ -537,8 +607,13 @@ def detect_load() -> tuple[float, float, float] | None:
 # --------------------------------------------------------------------------
 
 
-def assess_hardware() -> HardwareReport:
-    """Best-effort hardware and environment assessment (DESIGN §4)."""
+def assess_hardware(llama_bin: Path | None = None) -> HardwareReport:
+    """Best-effort hardware and environment assessment (DESIGN §4).
+
+    `llama_bin` is the optional `--llama-bin` directory; when given, the
+    llama-bench GPU-detection fallback resolves the binary from it instead
+    of PATH.
+    """
     warnings: list[str] = []
     os_name = platform.system()
     arch = platform.machine()
@@ -556,7 +631,10 @@ def assess_hardware() -> HardwareReport:
         cpu_model, physical_cores, logical_cores, perf_cores, _method = _detect_cpu_linux()
         ram_mb = _detect_memory_linux()
 
-    gpus = _detect_gpus(os_name, ram_mb, arch)
+    gpus, gpu_warnings = _detect_gpus(
+        os_name, ram_mb, arch, llama_bench=_resolve_llama_bench(llama_bin)
+    )
+    warnings.extend(gpu_warnings)
 
     load = detect_load()
     if load is not None and physical_cores > 0 and load[0] > physical_cores / 2:

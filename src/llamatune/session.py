@@ -231,6 +231,8 @@ def _options_to_dict(options: TuneOptions) -> dict[str, Any]:
         "thermal_threshold_c": options.thermal_threshold_c,
         "thermal_wait_cap_s": options.thermal_wait_cap_s,
         "multi_gpu": options.multi_gpu,
+        "probe_timeout_scale": options.probe_timeout_scale,
+        "probe_timeout_s": options.probe_timeout_s,
     }
 
 
@@ -275,6 +277,10 @@ def _options_from_dict(data: Mapping[str, Any]) -> TuneOptions:
         thermal_threshold_c=float(data.get("thermal_threshold_c", 75.0)),
         thermal_wait_cap_s=float(data.get("thermal_wait_cap_s", 60.0)),
         multi_gpu=bool(data.get("multi_gpu", False)),
+        probe_timeout_scale=float(data.get("probe_timeout_scale", 2.5)),
+        probe_timeout_s=(
+            float(data["probe_timeout_s"]) if data.get("probe_timeout_s") is not None else None
+        ),
     )
 
 
@@ -586,6 +592,10 @@ class Session:
     def read_json(self, name: str) -> dict[str, Any]:
         """Read one JSON artifact after confining it to this session."""
         return _read_json(_confine(self._dir, name))
+
+    def write_json(self, name: str, data: dict[str, Any]) -> None:
+        """Write one JSON artifact after confining it to this session."""
+        self._write_json(name, data)
 
     def write_text(self, name: str, text: str) -> None:
         path = _confine(self._dir, name)

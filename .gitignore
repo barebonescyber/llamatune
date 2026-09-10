@@ -24,3 +24,4 @@ release-roadmap.md
 docs/qwen36-27b-rtx5080-viability.md
 CODEBASE_ASSESSMENT_AND_REMEDIATION_REPORT.md
 .python-version
+.worktrees/

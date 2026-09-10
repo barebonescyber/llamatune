@@ -26,6 +26,9 @@ def test_help_labels_night_shift_experimental() -> None:
         (["--drift-threshold", "-0.1"], "--drift-threshold must be >= 0"),
         (["--calibration-runs", "1"], "--calibration-runs must be >= 2"),
         (["--duplicates", "many"], "--duplicates must be 'one' or 'both'"),
+        (["--probe-timeout-scale", "0.5"], "--probe-timeout-scale must be between"),
+        (["--probe-timeout-scale", "11"], "--probe-timeout-scale must be between"),
+        (["--probe-timeout-s", "0"], "--probe-timeout-s must be > 0"),
     ],
 )
 def test_validation_errors_exit_2(tmp_path: Path, args: list[str], message: str) -> None:
@@ -119,3 +122,31 @@ def test_human_dry_run_prints_full_plan(tmp_path: Path, monkeypatch: pytest.Monk
     assert str(tmp_path / "model.gguf") in result.output
     assert "42.0 min" in result.output
     assert "no completed session" in result.output
+
+
+def test_assess_hardware_receives_llama_bin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #37 seam: Night Shift must thread --llama-bin into GPU discovery."""
+    seen: list[Path | None] = []
+    import llamatune.hardware as hw
+
+    llama_bin = tmp_path / "bin"
+    llama_bin.mkdir()
+
+    def fake_assess(llama_bin: Path | None = None) -> object:
+        seen.append(llama_bin)
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(hw, "assess_hardware", fake_assess)
+    result = runner.invoke(
+        app,
+        [
+            "nightshift",
+            str(tmp_path / "models"),
+            "--llama-bin",
+            str(llama_bin),
+        ],
+    )
+    assert seen == [llama_bin]
+    assert result.exit_code != 0

@@ -26,6 +26,9 @@ See [DESIGN.md](DESIGN.md) for the full behavior and evidence contract.
   full GPU offload is safe.
 - Tunes GPU layers, CPU MoE layers, batch/ubatch, CPU threads, flash attention, mmap, KV
   offload, and other flags supported by the detected llama.cpp build.
+- Detects GPUs through vendor tools first (`nvidia-smi`, `rocm-smi`/sysfs,
+  `system_profiler`) and falls back to `llama-bench --list-devices`, so Mesa/NVK and
+  other vendor-tool-free stacks still enable GPU-layer tuning.
 - Experimentally searches expert tensor overrides and lossy KV-cache types with a
   perplexity quality gate.
 - Validates required context sizes and profiles operating KV depths.
@@ -626,6 +629,17 @@ session still contains recommendation and evidence files.
 Run `scan` and verify that `backends` and capabilities describe the expected build. Ensure
 `--llama-bin` points at the CUDA build directory rather than a CPU-only build elsewhere on
 `PATH`.
+
+### `scan` reports `GPU: none detected` on an NVIDIA GPU with Mesa/NVK
+
+Mesa's NVK driver ships no `nvidia-smi`, and `rocm-smi` and AMD sysfs counters do not apply.
+llamatune then falls back to `llama-bench --list-devices` and reads the device name and
+VRAM from llama.cpp itself. Check the following:
+
+- The `llama-bench` build actually contains the Vulkan backend. `--list-devices` only lists
+  devices the build supports. A CPU-only build shows no devices and scan emits a warning.
+- When `--llama-bin` points at a non-PATH build directory, pass the same directory to
+  `scan` and `tune` so the fallback resolves the right binary.
 
 ### A high GPU-layer trial fails or llama-bench aborts
 

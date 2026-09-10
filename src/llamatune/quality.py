@@ -453,7 +453,7 @@ def _lossless(config: TrialConfig | None) -> TrialConfig | None:
 
 
 def _resolve(options: QualityOptions) -> _Resolved:
-    hardware = assess_hardware()
+    hardware = assess_hardware(llama_bin=options.llama_bin)
     llama = discover_llama(options.llama_bin)
     model = inspect_model(options.model_path)
     suites = _selected_suites(options)

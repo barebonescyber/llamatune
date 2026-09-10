@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 import typer
 
+from llamatune.config import PROBE_TIMEOUT_SCALE_MAX, PROBE_TIMEOUT_SCALE_MIN
+
 if TYPE_CHECKING:
     from llamatune.types import HardwareReport, LlamaCppReport, TuneOutcome
 
@@ -111,7 +113,7 @@ def _matrix_identity(llama_bin: Path) -> tuple[str, str]:
     from llamatune.llama import discover_llama
 
     llama = discover_llama(llama_bin)
-    signature = hardware_signature(assess_hardware())
+    signature = hardware_signature(assess_hardware(llama_bin=llama_bin))
     canonical = json.dumps(signature, sort_keys=True, separators=(",", ":"))
     hardware_hash = hashlib.sha256(canonical.encode()).hexdigest()[:16]
     discriminator = llama.bench_sha256 or llama.help_sha256
@@ -648,7 +650,7 @@ def scan(
     from llamatune.hardware import assess_hardware
     from llamatune.llama import LlamaDiscoveryError, discover_llama
 
-    hardware = assess_hardware()
+    hardware = assess_hardware(llama_bin=llama_bin)
 
     llama_report = None
     llama_error: str | None = None
@@ -901,6 +903,20 @@ def tune(
     thermal_wait_cap_s: Annotated[
         float, typer.Option("--thermal-wait-cap-s", help="Maximum adaptive thermal wait")
     ] = 60.0,
+    probe_timeout_scale: Annotated[
+        float,
+        typer.Option(
+            "--probe-timeout-scale",
+            help="Work-scaled context-probe timeout multiplier (issue #38)",
+        ),
+    ] = 2.5,
+    probe_timeout_s: Annotated[
+        float | None,
+        typer.Option(
+            "--probe-timeout-s",
+            help="Absolute floor override for context-probe timeouts",
+        ),
+    ] = None,
     multi_gpu: Annotated[
         bool,
         typer.Option(
@@ -986,6 +1002,12 @@ def tune(
         (thermal_threshold_c <= 0, "--thermal-threshold-c must be > 0"),
         (thermal_wait_cap_s < 0, "--thermal-wait-cap-s must be >= 0"),
         (
+            not (PROBE_TIMEOUT_SCALE_MIN <= probe_timeout_scale <= PROBE_TIMEOUT_SCALE_MAX),
+            f"--probe-timeout-scale must be between "
+            f"{PROBE_TIMEOUT_SCALE_MIN} and {PROBE_TIMEOUT_SCALE_MAX}",
+        ),
+        (probe_timeout_s is not None and probe_timeout_s <= 0, "--probe-timeout-s must be > 0"),
+        (
             initial_gpu_layers is not None
             and max_gpu_layers_value is not None
             and initial_gpu_layers > max_gpu_layers_value,
@@ -1032,7 +1054,7 @@ def tune(
         )
         raise typer.Exit(code=3) from exc
 
-    hardware_report = assess_hardware()
+    hardware_report = assess_hardware(llama_bin=llama_bin)
     effective_progress = (
         ProgressMode.none if json_output and progress == ProgressMode.auto else progress
     )
@@ -1071,6 +1093,8 @@ def tune(
         depth_profile=depth_profile_value,
         thermal_threshold_c=thermal_threshold_c,
         thermal_wait_cap_s=thermal_wait_cap_s,
+        probe_timeout_scale=probe_timeout_scale,
+        probe_timeout_s=probe_timeout_s,
         multi_gpu=multi_gpu,
     )
 
@@ -1288,6 +1312,20 @@ def nightshift(
     reps_search: Annotated[int | None, typer.Option("--reps-search")] = None,
     reps_confirm: Annotated[int | None, typer.Option("--reps-confirm")] = None,
     baseline_runs: Annotated[int | None, typer.Option("--baseline-runs")] = None,
+    probe_timeout_scale: Annotated[
+        float,
+        typer.Option(
+            "--probe-timeout-scale",
+            help="Work-scaled context-probe timeout multiplier (issue #38)",
+        ),
+    ] = 2.5,
+    probe_timeout_s: Annotated[
+        float | None,
+        typer.Option(
+            "--probe-timeout-s",
+            help="Absolute floor override for context-probe timeouts",
+        ),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Experimental: tune and verify local GGUF models unattended."""
@@ -1334,6 +1372,13 @@ def nightshift(
         error = "--cooldown must be >= 0"
     if depth is not None and depth < 0:
         error = "--depth must be >= 0"
+    if not (PROBE_TIMEOUT_SCALE_MIN <= probe_timeout_scale <= PROBE_TIMEOUT_SCALE_MAX):
+        error = (
+            f"--probe-timeout-scale must be between "
+            f"{PROBE_TIMEOUT_SCALE_MIN} and {PROBE_TIMEOUT_SCALE_MAX}"
+        )
+    if probe_timeout_s is not None and probe_timeout_s <= 0:
+        error = "--probe-timeout-s must be > 0"
     if error is not None:
         typer.echo(f"error: {error}", err=True)
         raise typer.Exit(code=2)
@@ -1363,6 +1408,8 @@ def nightshift(
         reps_confirm=reps_confirm,
         baseline_runs=baseline_runs,
         depth=depth,
+        probe_timeout_scale=probe_timeout_scale,
+        probe_timeout_s=probe_timeout_s,
     )
     outcome = run_nightshift(options)
     if json_output:
@@ -1577,7 +1624,7 @@ def best_cmd(
     except (ModelInspectionError, LlamaDiscoveryError, OSError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=3) from exc
-    hardware = assess_hardware()
+    hardware = assess_hardware(llama_bin=llama_bin)
     result = lookup(
         sessions_dir / "registry.jsonl",
         model,

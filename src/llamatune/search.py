@@ -28,9 +28,13 @@ from typing import Any, cast
 from llamatune import bench, executor, recommend, stats
 from llamatune.config import (
     DIMENSION_ORDER,
+    SPILL_TG_TOLERANCE,
+    SPILL_VRAM_DELTA_FRACTION,
     applicable_dimensions,
     candidates_for,
+    context_probe_timeout_s,
     dimension_value,
+    estimate_diverged,
     estimate_ram,
     estimate_reason,
     estimate_vram,
@@ -40,6 +44,9 @@ from llamatune.config import (
     gpu_present,
     hardware_signature,
     has_gpu_backend,
+    is_cpu_class_speed,
+    is_fully_offloaded,
+    is_spill_vram_delta,
     is_valid_config,
     moe_cpu_layer_candidates,
     multi_gpu_capacity_check,
@@ -61,6 +68,7 @@ from llamatune.types import (
     TuneOptions,
     TuneOutcome,
     VramCalibration,
+    VramEstimate,
 )
 
 #: Maximum full coordinate-ascent passes (DESIGN §10 step 5).
@@ -71,6 +79,13 @@ _TRIAL_TIMEOUT_MIN_S = 120.0
 _TRIAL_TIMEOUT_MAX_S = 3600.0
 _DEEP_TRIAL_TIMEOUT_MAX_S = 7200.0
 _THERMAL_WAIT_CYCLE_S = 10.0
+
+#: Multiplier applied to a timed-out context probe on its single retry (issue #38).
+_CONTEXT_PROBE_RETRY_TIMEOUT_FACTOR = 2.0
+
+#: Backends that hard-fail over-allocation through stderr signatures; spill
+#: detection (issue #36) does not apply to them.
+_TRUSTED_OOM_BACKENDS = ("CUDA", "cuda", "Metal")
 
 
 def _sample_gpu_state() -> GpuSample | None:
@@ -92,6 +107,27 @@ def _boundary_has_fit(boundary: FeasibilityBoundary) -> bool:
 
 class _BudgetExhaustedError(Exception):
     """Internal signal: a budget is exhausted; jump to confirmation."""
+
+
+def _budget_reason(engine: _Engine) -> str:
+    """Name the budget that actually tripped (DESIGN §3; issue #39)."""
+    if engine.executed_count >= engine._trial_limit():
+        return "trial budget was exhausted"
+    minutes = engine.options.budget_minutes
+    if minutes is not None:
+        used = min((_monotonic() - engine.start) / 60.0, minutes)
+        reason = (
+            f"the time budget was exhausted "
+            f"({_fmt_minutes(used)} of {_fmt_minutes(minutes)} minutes used)"
+        )
+        return reason
+    return "trial budget was exhausted"
+
+
+def _fmt_minutes(value: float) -> str:
+    if value >= 100:
+        return f"{value:.1f}"
+    return f"{value:.2f}"
 
 
 class _NoFeasibleConfigError(Exception):
@@ -121,6 +157,14 @@ class _Measured:
     tg: Any
     entry: dict[str, Any] | None
     oom_pattern: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ProbeOutcome:
+    """Journal record plus terminal status of one probe (possibly retried)."""
+
+    status: str
+    record: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,7 +444,7 @@ class _Engine:
                 self.known[entry["trial_id"]] = entry
                 if entry.get("status") in ("oom", "gpu_resource"):
                     self.oom_points.append((dict(entry["config"]), entry["trial_id"]))
-            elif entry.get("type") == "probe" and "probe_id" in entry:
+            elif entry.get("type") in ("probe", "probe_final") and "probe_id" in entry:
                 self.probes[entry["probe_id"]] = entry
 
         self.executed_count = _count_executed(session.entries)
@@ -423,6 +467,7 @@ class _Engine:
         self.context_envelope: list[dict[str, Any]] | None = None
         self.cli_validation: dict[str, Any] | None = None
         self.estimate_vs_observed: dict[str, Any] | None = None
+        self._estimate_divergence: dict[str, dict[str, Any]] = {}
         self._observations: dict[str, _RunObservation] = {}
         self.coverage: dict[str, dict[str, Any]] = {}
         self.quality_gate: dict[str, Any] | None = None
@@ -1071,7 +1116,14 @@ class _Engine:
 
         Always anchors the incumbent on the baseline first, so a budget
         exhausted (or failing) seed trial still leaves a measured reference.
+        A baseline demoted as a host spill never anchors the search; the
+        incumbent re-anchors on the measured ngl=0 reference instead.
         """
+        if self.baseline.fallback != "cpu":
+            self._check_baseline_spill()
+        if self.baseline.kind == "host_spill":
+            self._seed_incumbent_after_spill()
+            return
         self._set_incumbent(
             self.default_config,
             self.baseline.pp.mean,
@@ -1081,6 +1133,127 @@ class _Engine:
 
         # Boundary discovery, rather than an unproven full-offload seed,
         # advances from this measured anchor.
+
+    def _seed_incumbent_after_spill(self) -> None:
+        """Anchor the incumbent on the CPU reference after a spilled baseline (issue #36)."""
+        means = self._cpu_reference_means()
+        if means is None:
+            return
+        pp, tg = means
+        self._set_incumbent(
+            dataclasses.replace(self.default_config, gpu_layers=0),
+            pp,
+            tg,
+            self._score(pp, tg),
+        )
+
+    def _check_baseline_spill(self) -> None:
+        """Detect a full-offload baseline that runs at CPU-class speed (issue #36).
+
+        Reuses the ngl=0 CPU-fallback runs as the reference when the baseline
+        previously fell back to CPU; otherwise spends at most one bounded
+        ngl=0 reference trial. A suspicious full-offload baseline is demoted
+        to `host_spill` so it never anchors the search as a feasible GPU
+        placement; the search then re-anchors through boundary discovery.
+        """
+        defaults = self.default_config
+        tg_mean = self.baseline.tg.mean
+        if tg_mean is None or tg_mean <= 0:
+            return
+        cpu_tg = self._cpu_reference_tg()
+        has_reference_attempt = any(
+            entry.get("type") == "baseline_run" and entry.get("cpu_reference")
+            for entry in self.session.entries
+        )
+        if (
+            cpu_tg is None
+            and not has_reference_attempt
+            and self._spill_applicable()
+            and self._can_execute()
+        ):
+            argv = bench.build_baseline_argv(
+                bench_path=self.llama.bench_path,
+                model_path=self.model.path,
+                pp=self.options.pp,
+                tg=self.options.tg,
+                reps=self.options.reps_confirm,
+                ngl=0,
+                capabilities=self.caps,
+                depth=self.options.depth,
+            )
+            run_dir = self.session.baseline_dir(self.options.baseline_runs + 1)
+            result, observation = self._run_child(
+                kind="baseline",
+                label="baseline CPU reference 1/1",
+                run_id=f"baseline-{self.options.baseline_runs + 1}",
+                argv=argv,
+                timeout_s=_BASELINE_TIMEOUT_S,
+                stdout_path=run_dir / "stdout.json",
+                stderr_path=run_dir / "stderr.log",
+            )
+            self.executed_count += 1
+            reference = self._classify(result, self.options.reps_confirm)
+            self._write_command(
+                f"baseline/run-{self.options.baseline_runs + 1}",
+                argv,
+                result,
+                self.options.reps_confirm,
+                self._record_load(self.hardware.physical_cores),
+                observation,
+            )
+            if reference.status == "ok" and reference.tg is not None:
+                self._append(
+                    {
+                        "type": "baseline_run",
+                        "run": self.options.baseline_runs + 1,
+                        "ngl": 0,
+                        "status": "ok",
+                        "pp_mean": reference.pp.mean if reference.pp is not None else None,
+                        "tg_mean": reference.tg.mean,
+                        "oom_pattern": None,
+                        "cpu_reference": True,
+                    }
+                )
+                cpu_tg = reference.tg.mean
+            else:
+                self._append(
+                    {
+                        "type": "baseline_run",
+                        "run": self.options.baseline_runs + 1,
+                        "ngl": 0,
+                        "status": reference.status,
+                        "pp_mean": None,
+                        "tg_mean": None,
+                        "oom_pattern": reference.oom_pattern,
+                        "cpu_reference": True,
+                    }
+                )
+        if cpu_tg is None or not is_cpu_class_speed(tg_mean, cpu_tg):
+            return
+        demoted = f"baseline tg {tg_mean:.2f} t/s is within {SPILL_TG_TOLERANCE}x of the CPU reference {cpu_tg:.2f} t/s; host-memory spill suspected"  # noqa: E501
+        self._append(
+            {
+                "type": "stage",
+                "stage": "host_spill_suspected",
+                "config": defaults.to_dict(),
+                "reasons": [demoted],
+            }
+        )
+        self._emit("warning", message=f"host-memory spill suspected at baseline: {demoted}")
+        self.baseline = dataclasses.replace(self.baseline, kind="host_spill")
+        self.known[defaults.trial_id] = {
+            "type": "trial",
+            "trial_id": defaults.trial_id,
+            "config": defaults.to_dict(),
+            "status": "host_spill",
+            "pp_mean": self.baseline.pp.mean,
+            "tg_mean": tg_mean,
+            "score": None,
+            "flags": list(defaults.bench_args(self.caps)),
+            "dim": "baseline",
+            "oom_pattern": None,
+            "pruned_from": None,
+        }
 
     def _set_incumbent(self, config: TrialConfig, pp: float, tg: float, score: float) -> None:
         self.incumbent_config = config
@@ -1169,7 +1342,13 @@ class _Engine:
         for ncmoe in ladder:
             boundary = self._discover_boundary(self.incumbent_config, ncmoe, warm_cap)
             self.boundaries.append(boundary)
-            self._append({"type": "stage", "stage": "boundary", **dataclasses.asdict(boundary)})
+            self._append(
+                {
+                    "type": "stage",
+                    "stage": "boundary",
+                    **dataclasses.asdict(boundary),
+                }
+            )
             self._emit("boundary", **dataclasses.asdict(boundary))
             warm_cap = boundary.max_ok_ngl if _boundary_has_fit(boundary) else None
         self._bisect_minimum_spill()
@@ -1239,6 +1418,7 @@ class _Engine:
         base = dataclasses.replace(base, moe_cpu_layers=ncmoe)
         low: int | None = None
         failed, used = None, 0
+        spill_suspected = False
         limit = 2 * max(1, max(1, self.model.ngl_all).bit_length()) + 4
         baseline_verified = (
             hasattr(self, "baseline")
@@ -1252,12 +1432,27 @@ class _Engine:
             guess = self.options.initial_gpu_layers
             if guess is None or guess > cap:
                 guess = min(cap, 1)
-            status = self._probe(dataclasses.replace(base, gpu_layers=guess), "boundary", None)
+            probe_cfg = dataclasses.replace(base, gpu_layers=guess)
+            status = self._probe(probe_cfg, "boundary", None)
             used += 1
+            spill = (
+                self._boundary_spill_suspected(
+                    probe_cfg,
+                    self._probe_measured(probe_cfg, None, status),
+                    run_id=_probe_id("boundary", probe_cfg, None),
+                )
+                if status == "ok"
+                else None
+            )
+            spill = self._handle_spill_suspected(probe_cfg, spill)
+            if spill is not None:
+                status = "host_spill"
             if status == "ok":
                 low = guess
             else:
                 failed = guess
+                if status == "host_spill":
+                    spill_suspected = True
                 if guess > 0 and used < limit:
                     status = self._probe(dataclasses.replace(base, gpu_layers=0), "boundary", None)
                     used += 1
@@ -1270,16 +1465,44 @@ class _Engine:
             cfg = dataclasses.replace(base, gpu_layers=guess)
             status = self._probe(cfg, "boundary", None)
             used += 1
+            if status == "ok" and is_fully_offloaded(guess, self.model.ngl_all):
+                spill = self._handle_spill_suspected(
+                    cfg,
+                    self._boundary_spill_suspected(
+                        cfg,
+                        self._probe_measured(cfg, None, status),
+                        run_id=_probe_id("boundary", cfg, None),
+                    ),
+                )
+                if spill is not None:
+                    status = "host_spill"
+                    spill_suspected = True
             if status == "ok":
                 low = guess
             else:
                 failed = guess
         while low is not None and failed is not None and failed - low > 1 and used < limit:
             guess = (low + failed) // 2
-            if self._probe(dataclasses.replace(base, gpu_layers=guess), "boundary", None) == "ok":
+            bisect_cfg = dataclasses.replace(base, gpu_layers=guess)
+            status = self._probe(bisect_cfg, "boundary", None)
+            spill = (
+                self._boundary_spill_suspected(
+                    bisect_cfg,
+                    self._probe_measured(bisect_cfg, None, status),
+                    run_id=_probe_id("boundary", bisect_cfg, None),
+                )
+                if status == "ok"
+                else None
+            )
+            spill = self._handle_spill_suspected(bisect_cfg, spill)
+            if spill is not None:
+                status = "host_spill"
+            if status == "ok":
                 low = guess
             else:
                 failed = guess
+            if status == "host_spill":
+                spill_suspected = True
             used += 1
         compliant: list[tuple[TrialConfig, float, float, float]] = []
         neighbors = (
@@ -1288,6 +1511,8 @@ class _Engine:
         for ngl in neighbors:
             cfg = dataclasses.replace(base, gpu_layers=ngl)
             trial = self._evaluate(cfg, "boundary_neighbor")
+            if trial.status == "host_spill":
+                spill_suspected = True
             if (
                 trial.status in ("ok", "unstable")
                 and trial.score is not None
@@ -1313,6 +1538,7 @@ class _Engine:
             probes=used,
             cap_ngl=cap,
             cap_source=cap_source,
+            spill_suspected=spill_suspected,
         )
 
     def _refine_joint(self) -> None:
@@ -1450,6 +1676,66 @@ class _Engine:
                 depth=self.options.depth,
             )
         )
+        if ctx is not None:
+            timeout_s = self._context_probe_timeout_s(cfg, ctx)
+        else:
+            timeout_s = self.trial_timeout
+        measured = self._execute_probe(cfg, purpose, ctx, probe_id, argv, timeout_s)
+        retry_run_id: str | None = None
+        if measured.status == "timeout" and ctx is not None:
+            # One work-scaled retry at a doubled timeout before recording the
+            # failure (issue #38). Both attempts are journaled and each
+            # consumes budget (DESIGN §7 retry semantics, as for thermal
+            # retries). The retry gets a distinct run id so attempt-2
+            # artifacts do not overwrite attempt-1, and is refused when the
+            # budget is exhausted (as for thermal retries).
+            retry_timeout = min(
+                timeout_s * _CONTEXT_PROBE_RETRY_TIMEOUT_FACTOR, self._probe_timeout_max_s()
+            )
+            if not self._can_execute():
+                self.probes[probe_id] = measured.record
+                self._cooldown()
+                return measured.status
+            retry_run_id = f"{probe_id}-retry-2"
+            retry_measured = self._execute_probe(
+                cfg, purpose, ctx, retry_run_id, argv, retry_timeout, attempt=2
+            )
+            if retry_measured.status != "timeout":
+                measured = retry_measured
+        self.probes[probe_id] = measured.record
+        if retry_run_id is not None:
+            self.probes[retry_run_id] = measured.record
+            # Resume replay keys probes by probe_id; journal the surviving
+            # attempt under the base id as a non-counted marker so a resumed
+            # session replays the winning outcome, not attempt-1's timeout.
+            final_record = {
+                **measured.record,
+                "type": "probe_final",
+                "probe_id": probe_id,
+                "superseded_run_id": retry_run_id,
+            }
+            self.probes[probe_id] = final_record
+            self._append(final_record)
+        if measured.status in ("oom", "gpu_resource"):
+            self.oom_points.append((cfg.to_dict(), probe_id))
+        if ctx is not None and measured.status == "ok":
+            divergence = self._journal_estimate_divergence(cfg, ctx, probe_id)
+            if divergence is not None:
+                self._estimate_divergence[cfg.trial_id] = divergence
+        self._cooldown()
+        return measured.status
+
+    def _execute_probe(
+        self,
+        cfg: TrialConfig,
+        purpose: str,
+        ctx: int | None,
+        probe_id: str,
+        argv: tuple[str, ...],
+        timeout_s: float,
+        attempt: int = 1,
+    ) -> _ProbeOutcome:
+        """Run one bounded probe attempt and journal its outcome."""
         probe_dir = self.session.probe_dir(probe_id)
         label = f"{purpose} {self._config_label(cfg)}"
         result, observation = self._run_child(
@@ -1457,7 +1743,7 @@ class _Engine:
             label=label,
             run_id=probe_id,
             argv=argv,
-            timeout_s=self.trial_timeout,
+            timeout_s=timeout_s,
             stdout_path=probe_dir / "stdout.json",
             stderr_path=probe_dir / "stderr.log",
         )
@@ -1470,7 +1756,11 @@ class _Engine:
             "config": cfg.to_dict(),
             "ctx": ctx,
             "status": measured.status,
+            "attempt": attempt,
+            "timeout_s": timeout_s,
             "pattern": measured.oom_pattern,
+            "pp_mean": measured.pp.mean if measured.pp is not None else None,
+            "tg_mean": measured.tg.mean if measured.tg is not None else None,
             "estimate_reason": estimate_reason(
                 config=cfg,
                 model=self.model,
@@ -1484,11 +1774,7 @@ class _Engine:
         )
         self._append(record)
         self._emit_exec_end(label, probe_id, result, measured)
-        self.probes[probe_id] = record
-        if measured.status in ("oom", "gpu_resource"):
-            self.oom_points.append((cfg.to_dict(), probe_id))
-        self._cooldown()
-        return measured.status
+        return _ProbeOutcome(measured.status, record)
 
     def _sweep(self, dim: str) -> None:
         candidates = candidates_for(
@@ -2050,6 +2336,15 @@ class _Engine:
 
         pp_mean = measured.pp.mean if measured.pp is not None else None
         tg_mean = measured.tg.mean if measured.tg is not None else None
+        spill = (
+            self._boundary_spill_suspected(cfg, measured)
+            if measured.status in ("ok", "unstable")
+            else None
+        )
+        demoting_spill = self._handle_spill_suspected(cfg, spill)
+        measured = self._classify_spill(measured, demoting_spill)
+        if demoting_spill is not None:
+            self._emit("warning", message=f"host-memory spill suspected at {cfg.trial_id}")
         primary_thermal_rejected = thermal.contaminated and (
             not thermal.retried or thermal.retry_contaminated is True
         )
@@ -2198,6 +2493,276 @@ class _Engine:
 
     # -- classification -------------------------------------------------
 
+    def _spill_applicable(self) -> bool:
+        """Whether spill detection applies (issue #36).
+
+        Gates run when a GPU is available and the backend is Vulkan-like or
+        unknown; CUDA hard-fails OOM through stderr regexes instead.
+        """
+        if not gpu_available(self.hardware, self.llama):
+            return False
+        backends = self.llama.backends
+        if backends is None:
+            return True
+        return not any(name in backends for name in _TRUSTED_OOM_BACKENDS)
+
+    def _cpu_reference_entries(self) -> list[dict[str, Any]]:
+        """Journaled ok ngl=0 reference runs with measured speeds (issue #36)."""
+        return [
+            entry
+            for entry in self.session.entries
+            if entry.get("type") == "baseline_run"
+            and entry.get("ngl") == 0
+            and entry.get("status") == "ok"
+            and entry.get("tg_mean") is not None
+        ]
+
+    def _cpu_reference_tg(self) -> float | None:
+        """Median tg of the recorded ngl=0 reference runs, if any (issue #36)."""
+        speeds = [float(entry["tg_mean"]) for entry in self._cpu_reference_entries()]
+        if not speeds:
+            return None
+        return statistics.median(speeds)
+
+    def _cpu_reference_means(self) -> tuple[float, float] | None:
+        """(pp, tg) of the median-speed ok ngl=0 reference run, if any (issue #36)."""
+        entries = self._cpu_reference_entries()
+        if not entries:
+            return None
+        median_tg = statistics.median(float(entry["tg_mean"]) for entry in entries)
+        entry = next(e for e in entries if float(e["tg_mean"]) == median_tg)
+        pp = entry.get("pp_mean")
+        tg = float(entry["tg_mean"])
+        if pp is None:
+            return None
+        return float(pp), tg
+
+    def _probe_timeout_max_s(self) -> float:
+        """Upper bound for any single invocation, deep-aware (DESIGN §7)."""
+        return (
+            _DEEP_TRIAL_TIMEOUT_MAX_S
+            if self.options.depth is not None and self.options.depth > 0
+            else _TRIAL_TIMEOUT_MAX_S
+        )
+
+    def _probe_timeout_summary(self) -> dict[str, Any] | None:
+        """Work-scaled context-probe timeout summary for the report (issue #38)."""
+        if self.options.ctx_size is None:
+            return None
+        context_probes = [
+            entry
+            for entry in self.session.entries
+            if entry.get("type") == "probe" and entry.get("purpose") == "context"
+        ]
+        if not context_probes:
+            return None
+        return {
+            "scale": self.options.probe_timeout_scale,
+            "floor_s": self.options.probe_timeout_s,
+            "trial_timeout_s": self.trial_timeout,
+            "max_s": self._probe_timeout_max_s(),
+            "retries": self._count_journaled_retries(),
+        }
+
+    def _count_journaled_retries(self) -> int:
+        """Work-scaled retries, reconstructed from the journal (resume-safe)."""
+        return sum(
+            1
+            for entry in self.session.entries
+            if entry.get("type") == "probe" and entry.get("attempt") == 2
+        )
+
+    def _context_probe_timeout_s(self, cfg: TrialConfig, ctx: int) -> float:
+        """Work-scaled timeout for one context probe (issue #38).
+
+        Boundary probes keep the search-trial timeout: their workload is the
+        small search pp/tg, so no ctx scaling applies. Context probes scale
+        with ``ctx / measured_pp * scale`` when baseline prompt throughput is
+        known; an absolute floor override takes precedence over the trial
+        timeout. The result is bounded by the per-invocation maximum.
+        """
+        measured_pp = self._measured_pp_mean()
+        return context_probe_timeout_s(
+            trial_timeout_s=self.trial_timeout,
+            ctx=ctx,
+            measured_pp_mean=measured_pp,
+            scale=self.options.probe_timeout_scale,
+            floor_s=self.options.probe_timeout_s,
+            max_s=self._probe_timeout_max_s(),
+        )
+
+    def _measured_pp_mean(self) -> float | None:
+        """Measured baseline prompt throughput, if the baseline is measured."""
+        if hasattr(self, "baseline") and self.baseline.pp.n > 0:
+            mean = self.baseline.pp.mean
+            if mean > 0:
+                return mean
+        return None
+
+    def _journal_estimate_divergence(
+        self, cfg: TrialConfig, ctx: int, probe_id: str
+    ) -> dict[str, Any] | None:
+        """Flag a candidate whose VRAM estimate diverged from observation (issue #35).
+
+        A diverged estimate must not drive layer-step sweeps or feasibility
+        pruning; the spill gate classifies the placement instead. Returns the
+        divergence record, or None when no measurement contradicts the estimate.
+        """
+        if not self._spill_applicable():
+            return None
+        estimate = estimate_vram(
+            config=cfg,
+            model=self.model,
+            ctx=self.options.ctx_size,
+            vram_reserve_mb=self.vram_reserve_mb,
+            vram_total_mb=total_vram_mb(self.hardware, multi_gpu=self.options.multi_gpu),
+            vram_free_mb=free_vram_mb(self.hardware, multi_gpu=self.options.multi_gpu),
+            calibration=self.calibration,
+        )
+        observation = self._estimate_observation(cfg, estimate.total_mb, probe_id)
+        if observation is None:
+            return None
+        delta = float(observation["observed_used_delta_mb"])
+        if not estimate_diverged(estimate.total_mb, delta):
+            return None
+        record = {
+            "type": "stage",
+            "stage": "estimate_diverged",
+            "config": cfg.to_dict(),
+            "estimated_total_mb": estimate.total_mb,
+            "observed_used_delta_mb": delta,
+            "estimate_diverged": True,
+            "skip_layer_steps": True,
+        }
+        self._append(record)
+        self._emit("estimate_diverged", **record)
+        return {
+            "estimated_total_mb": estimate.total_mb,
+            "observed_used_delta_mb": delta,
+            "estimate_diverged": True,
+            "skip_layer_steps": True,
+        }
+
+    def _boundary_spill_suspected(
+        self, config: TrialConfig, measured: _Measured, run_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Why a full-offload boundary stage looks like a host spill (issue #36).
+
+        Speed gate (authoritative): a fully offloaded run whose tg is
+        CPU-class relative to the ngl=0 reference. Evidence gate
+        (corroborating): an observed device-memory delta far below the
+        estimated need. The delta arm alone never demotes — some drivers
+        (NVK/Mesa GTT) report near-zero deltas for GPU-resident work — it
+        returns an advisory anomaly instead. Returns None when neither
+        fires.
+        """
+        if not is_fully_offloaded(config.gpu_layers, self.model.ngl_all):
+            return None
+        speed_reasons: list[str] = []
+        if measured.tg is not None:
+            cpu_tg = self._cpu_reference_tg()
+            if cpu_tg is not None and is_cpu_class_speed(measured.tg.mean, cpu_tg):
+                speed_reasons.append(
+                    f"tg {measured.tg.mean:.2f} t/s is within {SPILL_TG_TOLERANCE}x "
+                    f"of the CPU reference {cpu_tg:.2f} t/s at full offload"
+                )
+        delta_reasons: list[str] = []
+        if self._spill_applicable() and measured.status in ("ok", "unstable"):
+            estimate = estimate_vram(
+                config=config,
+                model=self.model,
+                ctx=self.options.ctx_size,
+                vram_reserve_mb=self.vram_reserve_mb,
+                vram_total_mb=total_vram_mb(self.hardware, multi_gpu=self.options.multi_gpu),
+                vram_free_mb=free_vram_mb(self.hardware, multi_gpu=self.options.multi_gpu),
+                calibration=self.calibration,
+            )
+            observation = self._estimate_observation(config, estimate.total_mb, run_id)
+            delta = (
+                float(observation["observed_used_delta_mb"]) if observation is not None else None
+            )
+            if delta is not None and is_spill_vram_delta(delta, estimate.total_mb):
+                delta_reasons.append(
+                    f"observed VRAM delta {delta:.0f} MiB is below "
+                    f"{SPILL_VRAM_DELTA_FRACTION:.0%} of the estimated "
+                    f"{estimate.total_mb:.0f} MiB at full offload"
+                )
+        if speed_reasons:
+            return {"reasons": speed_reasons + delta_reasons}
+        if delta_reasons:
+            return {"reasons": delta_reasons, "advisory": True}
+        return None
+
+    def _recommend_reason(self, config: TrialConfig) -> str:
+        """Accurate validation provenance for the emitted recommendation."""
+        if config.trial_id in self.validated_configs:
+            return "passed full-context validation"
+        status = (self.context_validation or {}).get("status")
+        if self.options.ctx_size is None:
+            return "best measured; no full-context validation requested"
+        if status == "ok":
+            return "fallback placement; context validation covered the search placement only"
+        if status == "skipped":
+            return "context validation skipped before this placement was reached"
+        return "full-context validation failed"
+
+    def _probe_measured(self, cfg: TrialConfig, ctx: int | None, status: str) -> _Measured:
+        """Build a _Measured for a completed probe from its journal record.
+
+        Boundary probes run llama-bench, so their records carry the measured
+        pp/tg means; the spill speed gate needs the tg mean to fire.
+        """
+        record = self.probes.get(_probe_id("boundary", cfg, ctx)) or {}
+        tg_mean = record.get("tg_mean")
+        tg = stats.sample_stats(float(tg_mean), 0.0, 1) if tg_mean else None
+        return _Measured(status, None, tg, None, None)
+
+    def _handle_spill_suspected(
+        self, config: TrialConfig, spill: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Journal a spill verdict; advisory anomalies never demote.
+
+        Returns the spill dict for demotion, or None after recording an
+        advisory `vram_delta_anomaly` stage for a delta-only suspicion.
+        """
+        if spill is None:
+            return None
+        if spill.get("advisory"):
+            self._append(
+                {
+                    "type": "stage",
+                    "stage": "vram_delta_anomaly",
+                    "config": config.to_dict(),
+                    "trial_id": config.trial_id,
+                    "advisory": True,
+                    **spill,
+                }
+            )
+            self._emit(
+                "warning",
+                message=(
+                    "VRAM delta far below estimate at full offload (may be a driver "
+                    "reporting artifact); kept as measured — " + "; ".join(spill["reasons"])
+                ),
+            )
+            return None
+        self._append(
+            {
+                "type": "stage",
+                "stage": "host_spill_suspected",
+                "config": config.to_dict(),
+                "trial_id": config.trial_id,
+                **spill,
+            }
+        )
+        return spill
+
+    def _classify_spill(self, measured: _Measured, spill: dict[str, Any] | None) -> _Measured:
+        """Demote an ok or unstable full-offload measurement to host_spill (issue #36)."""
+        if spill is None or measured.status not in ("ok", "unstable"):
+            return measured
+        return dataclasses.replace(measured, status="host_spill")
+
     def _classify(self, result: executor.ExecResult, reps: int) -> _Measured:
         if result.timed_out:
             return _Measured("timeout", None, None, None, None)
@@ -2232,8 +2797,9 @@ class _Engine:
                     "ctx": self.options.ctx_size,
                     "status": "skipped",
                     "evidence": None,
+                    "reason": _budget_reason(self),
                 }
-                warning = "required context validation skipped because trial budget was exhausted"
+                warning = f"required context validation skipped because {_budget_reason(self)}"
                 if warning not in self.extra_warnings:
                     self.extra_warnings.append(warning)
                     self._emit("warning", message=warning)
@@ -2263,11 +2829,17 @@ class _Engine:
     def _context_candidates(self, base: TrialConfig) -> list[TrialConfig]:
         cap = gpu_layer_cap(self.model, self.options)
         candidates = [base] if base.gpu_layers <= cap else []
+        # An estimate proven diverged from observation must not drive the
+        # descending layer-step ladder (issue #35); the spill gate classifies
+        # the placement instead.
+        diverged = self._estimate_divergence.get(base.trial_id)
         for boundary in sorted(
             (boundary for boundary in self.boundaries if _boundary_has_fit(boundary)),
             key=lambda b: b.max_ok_ngl,
             reverse=True,
         ):
+            if diverged is not None and boundary.max_ok_ngl >= base.gpu_layers:
+                continue
             candidates.extend(
                 dataclasses.replace(base, gpu_layers=ngl, moe_cpu_layers=boundary.moe_cpu_layers)
                 for ngl in range(boundary.max_ok_ngl, -1, -1)
@@ -2612,6 +3184,18 @@ class _Engine:
         max_boundary = (
             max(fitting_boundaries, key=lambda b: b.max_ok_ngl) if fitting_boundaries else None
         )
+        spill_suspected = any(
+            entry.get("stage") == "host_spill_suspected" for entry in self.session.entries
+        )
+        if spill_suspected and not any(
+            w.startswith("host-memory spill suspected") for w in warnings
+        ):
+            warnings.append(
+                "host-memory spill suspected: a fully offloaded placement ran at CPU-class "
+                "speed or used far less device memory than estimated, so the backend may be "
+                "spilling to host memory (issue #36); its results were excluded from "
+                "feasibility and scoring"
+            )
         estimate = estimate_vram(
             config=recommend_config,
             model=self.model,
@@ -2622,6 +3206,19 @@ class _Engine:
             calibration=self.calibration,
         )
         ram_estimate = estimate_ram(recommend_config, self.model, self.options.ctx_size)
+        default_placement_estimate: VramEstimate | None = None
+        if recommend_config.gpu_layers == 0 and self.default_config.gpu_layers > 0:
+            # A CPU-only fallback renders a degenerate all-zero pressure line;
+            # keep the default placement's estimate visible for comparison.
+            default_placement_estimate = estimate_vram(
+                config=self.default_config,
+                model=self.model,
+                ctx=self.options.ctx_size,
+                vram_reserve_mb=self.vram_reserve_mb,
+                vram_total_mb=total_vram_mb(self.hardware, multi_gpu=self.options.multi_gpu),
+                vram_free_mb=free_vram_mb(self.hardware, multi_gpu=self.options.multi_gpu),
+                calibration=self.calibration,
+            )
         if self.hardware.ram_mb and ram_estimate.total_mb > 0.9 * self.hardware.ram_mb:
             warnings.append(
                 f"estimated host RAM use {ram_estimate.total_mb:.0f} MiB "
@@ -2654,6 +3251,11 @@ class _Engine:
                 {
                     "gpu_layers": max_boundary.max_ok_ngl,
                     "moe_cpu_layers": max_boundary.moe_cpu_layers,
+                    **(
+                        {"spill_suspected": True}
+                        if any(b.spill_suspected for b in fitting_boundaries)
+                        else {}
+                    ),
                 }
                 if max_boundary
                 else None
@@ -2672,19 +3274,20 @@ class _Engine:
             "recommended": {
                 "gpu_layers": recommend_config.gpu_layers,
                 "moe_cpu_layers": recommend_config.moe_cpu_layers,
-                "reason": (
-                    "passed full-context validation"
-                    if self.context_validation
-                    and self.context_validation.get("status") == "ok"
-                    and recommend_config.trial_id in self.validated_configs
-                    else "full-context validation failed"
-                    if self.options.ctx_size is not None
-                    else "best measured; no full-context validation"
-                ),
+                "reason": self._recommend_reason(recommend_config),
             },
             "vram_reserve_mb": self.vram_reserve_mb,
             "reserve_provenance": self.reserve_provenance,
             "estimate": dataclasses.asdict(estimate),
+            "default_placement_estimate": (
+                dataclasses.asdict(default_placement_estimate)
+                if default_placement_estimate is not None
+                else None
+            ),
+            "default_placement": {
+                "gpu_layers": self.default_config.gpu_layers,
+                "moe_cpu_layers": self.default_config.moe_cpu_layers,
+            },
             "ram_estimate": dataclasses.asdict(ram_estimate),
         }
         analysis = recommend.build_analysis(
@@ -2697,6 +3300,7 @@ class _Engine:
             default_probe=self.default_probe,
             feasibility=feasibility,
             context_validation=self.context_validation,
+            probe_timeout=self._probe_timeout_summary(),
             cli_validation=self.cli_validation,
             estimate_vs_observed=self.estimate_vs_observed,
             coverage=self.coverage,
@@ -2877,13 +3481,16 @@ class _Engine:
             self._emit("warning", message=warning)
 
     def _estimate_observation(
-        self, config: TrialConfig, estimated_total_mb: float
+        self, config: TrialConfig, estimated_total_mb: float, run_id: str | None = None
     ) -> dict[str, Any] | None:
-        observations = [
-            observation
-            for run_id, observation in self._observations.items()
-            if run_id.startswith(config.trial_id)
-        ]
+        if run_id is not None and run_id in self._observations:
+            observations = [self._observations[run_id]]
+        else:
+            observations = [
+                observation
+                for key, observation in self._observations.items()
+                if key.startswith(config.trial_id)
+            ]
         samples = [sample for observation in observations for sample in observation.samples]
         if not samples:
             return None
@@ -3017,9 +3624,17 @@ class _Engine:
         return None, config, expected, False
 
     def _fallback_recommendation(self) -> tuple[TrialConfig, dict[str, Any]]:
-        """Return defaults, or the best measured config satisfying a binding cap."""
+        """Return defaults, or the best measured config satisfying a binding cap.
+
+        A default demoted as a host spill is never recommended unmeasured;
+        the measured ngl=0 CPU reference is offered instead (issue #36).
+        """
         cap = gpu_layer_cap(self.model, self.options)
-        if self.default_config.gpu_layers <= cap:
+        default_record = self.known.get(self.default_config.trial_id)
+        spilled_default = (
+            default_record is not None and default_record.get("status") == "host_spill"
+        )
+        if self.default_config.gpu_layers <= cap and not spilled_default:
             return self.default_config, self._defaults_expected()
         candidates = [
             record
@@ -3041,6 +3656,19 @@ class _Engine:
                 },
             }
             return TrialConfig.from_dict(best["config"]), expected
+        means = self._cpu_reference_means()
+        if means is not None and self.default_config.gpu_layers <= cap:
+            pp, tg = means
+            expected = {
+                "pp": pp,
+                "tg": tg,
+                "improvement_pct": {
+                    "pp": _improvement(pp, self.baseline.pp.mean),
+                    "tg": _improvement(tg, self.baseline.tg.mean),
+                    "score": (self._score(pp, tg) - 1) * 100,
+                },
+            }
+            return dataclasses.replace(self.default_config, gpu_layers=0), expected
         raise _NoFeasibleConfigError(
             f"no successful measured configuration satisfies max_gpu_layers={cap}"
         )
@@ -3078,7 +3706,7 @@ class _Engine:
         tg_means: list[float] = []
         for index in range(1, self.options.baseline_runs + 1):
             if not self._can_execute():
-                warning = "confirmation skipped because trial budget was exhausted"
+                warning = f"confirmation skipped because {_budget_reason(self)}"
                 if warning not in self.extra_warnings:
                     self.extra_warnings.append(warning)
                     self._emit("warning", message=warning)

@@ -204,7 +204,7 @@ def _patch_runtime(
         "handlers": {},
     }
 
-    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda: hardware)
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda llama_bin=None: hardware)
     monkeypatch.setattr("llamatune.llama.discover_llama", lambda llama_bin: llama)
     monkeypatch.setattr(
         "llamatune.model.inspect_model",

@@ -243,8 +243,15 @@ proportional fallback.
 
 ## 8. Trial outcome classification
 
-`ok | unstable | oom | cuda_error | gpu_resource | timeout | crash | parse_error | pruned` (pruned =
-never executed, carries the pruning ancestor trial id). OOM detection:
+`ok | unstable | host_spill | oom | cuda_error | gpu_resource | timeout | crash | parse_error | pruned` (pruned =
+never executed, carries the pruning ancestor trial id). `host_spill` = a fully
+offloaded placement whose speed is CPU-class (within `SPILL_TG_TOLERANCE` of the
+measured ngl=0 reference); it is treated as infeasible (issue #36). The speed
+arm is authoritative. The VRAM-delta arm (observed device-memory delta far
+below the estimate) only corroborates a speed-based verdict; alone it is
+recorded as an advisory `vram_delta_anomaly` stage and never demotes, because
+some drivers (e.g. NVK/Mesa GTT) report near-zero deltas for GPU-resident
+work. OOM detection:
 nonzero exit AND stderr matching any of the case-insensitive regexes
 `failed to allocate`, `out of memory`, `cudaMalloc`, `kIOGPUCommandBuffer.*OutOfMemory`,
 `ggml_backend.*alloc.*fail`; the matched pattern is recorded.

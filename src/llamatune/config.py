@@ -361,6 +361,69 @@ def is_fully_offloaded(gpu_layers: int, ngl_all: int) -> bool:
     return gpu_layers >= ngl_all
 
 
+#: A fully-offloaded run whose tg is within this factor of a pure-CPU
+#: reference is treated as host-memory spill suspected (issue #36).
+SPILL_TG_TOLERANCE = 1.3
+
+#: A fully-offloaded run whose observed device-memory delta is below this
+#: fraction of the estimated total need is treated as host-memory spill
+#: suspected (issue #36).
+SPILL_VRAM_DELTA_FRACTION = 0.5
+
+#: Default multiplier for work-scaled context-probe timeouts (issue #38): the
+#: probe budget is ``max(trial_timeout, ctx / measured_pp * scale)`` seconds.
+PROBE_TIMEOUT_SCALE_DEFAULT = 2.5
+
+#: Bounds for the ``--probe-timeout-scale`` multiplier (issue #38).
+PROBE_TIMEOUT_SCALE_MIN = 1.0
+PROBE_TIMEOUT_SCALE_MAX = 10.0
+
+
+def context_probe_timeout_s(
+    *,
+    trial_timeout_s: float,
+    ctx: int,
+    measured_pp_mean: float | None,
+    scale: float = PROBE_TIMEOUT_SCALE_DEFAULT,
+    floor_s: float | None = None,
+    max_s: float = 7200.0,
+) -> float:
+    """Work-scaled timeout for one context-validation probe (issue #38).
+
+    The search-trial timeout is calibrated on small-context work; a full-ctx
+    probe does proportionally more prefill work. The timeout therefore grows
+    with ``ctx / measured_pp_mean * scale`` when a measured baseline prompt
+    throughput is available, floored at ``trial_timeout_s`` (or ``floor_s``)
+    and capped at ``max_s``. Without a measurement, the trial timeout is kept.
+    """
+    base = trial_timeout_s if floor_s is None else max(trial_timeout_s, floor_s)
+    if measured_pp_mean is None or measured_pp_mean <= 0 or ctx <= 0:
+        return min(max(base, 0.0), max_s)
+    return min(max(ctx / measured_pp_mean * scale, base), max_s)
+
+
+def estimate_diverged(estimated_total_mb: float, observed_used_delta_mb: float) -> bool:
+    """Whether an observation falls far below the advisory estimate (issue #35).
+
+    Reuses the issue #36 spill threshold: when the observed device-memory
+    delta is below half the estimated need, the estimate is treated as
+    diverged from reality and must not drive further fallback work.
+    """
+    return is_spill_vram_delta(observed_used_delta_mb, estimated_total_mb)
+
+
+def is_cpu_class_speed(tg_mean: float, cpu_reference_tg: float) -> bool:
+    """Whether a measured tg is indistinguishable from the CPU reference."""
+    return cpu_reference_tg > 0 and tg_mean <= cpu_reference_tg * SPILL_TG_TOLERANCE
+
+
+def is_spill_vram_delta(observed_used_delta_mb: float, estimated_total_mb: float) -> bool:
+    """Whether an observed device-memory delta is far below the estimate."""
+    return estimated_total_mb > 0 and observed_used_delta_mb < (
+        estimated_total_mb * SPILL_VRAM_DELTA_FRACTION
+    )
+
+
 def has_gpu_backend(llama: LlamaCppReport) -> bool | None:
     """Whether the baseline reported a non-CPU llama.cpp backend."""
     if llama.backends is None:

@@ -538,7 +538,7 @@ def run_marathon(
     deadline = resolve_deadline(start, options.until, options.max_hours)
     try:
         hardware, llama, model = (
-            assess_hardware(),
+            assess_hardware(llama_bin=options.llama_bin),
             discover_llama(options.llama_bin),
             inspect_model(options.model_path, full_hash=options.full_hash),
         )
@@ -803,7 +803,7 @@ def run_marathon(
             session = Session.create(
                 options.sessions_dir,
                 model=model,
-                hardware=assess_hardware(),
+                hardware=assess_hardware(llama_bin=options.llama_bin),
                 llama=llama,
                 options=tune_options,
                 argv=list(sys.argv),

@@ -308,6 +308,8 @@ class TuneOptions:
     thermal_threshold_c: float = 75.0
     thermal_wait_cap_s: float = 60.0
     multi_gpu: bool = False
+    probe_timeout_scale: float = 2.5
+    probe_timeout_s: float | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -367,6 +369,7 @@ class FeasibilityBoundary:
     probes: int
     cap_ngl: int | None = None
     cap_source: str = "model"
+    spill_suspected: bool = False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -468,6 +471,8 @@ class NightshiftOptions:
     baseline_runs: int | None
     depth: int | None = None
     ctx_ladder: tuple[int, ...] = ()
+    probe_timeout_scale: float = 2.5
+    probe_timeout_s: float | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

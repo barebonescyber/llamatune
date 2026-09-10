@@ -396,12 +396,27 @@ def _tune_options(
         ctx_ladder=options.ctx_ladder,
         depth=depth if depth is not None else options.depth,
         vram_reserve_mb=options.vram_reserve_mb,
+        probe_timeout_scale=options.probe_timeout_scale,
+        probe_timeout_s=options.probe_timeout_s,
         quiet_load=hardware.physical_cores / 2,
     )
 
 
 def _item_dict(item: WorkItem) -> dict[str, Any]:
     return cast(dict[str, Any], _jsonable(item))
+
+
+def _stamp_nightshift_allocation(session: Any, options: TuneOptions) -> None:
+    """Record the Night Shift allocation in session.json (issue #39)."""
+    try:
+        meta = session.read_json("session.json")
+        meta["nightshift"] = {
+            "budget_trials": options.budget_trials,
+            "budget_minutes": options.budget_minutes,
+        }
+        session.write_json("session.json", meta)
+    except (OSError, ValueError, KeyError, TypeError):
+        return
 
 
 def _remaining_minutes(deadline: datetime | None, now: datetime) -> float | None:
@@ -544,7 +559,7 @@ def run_nightshift(
     deadline = resolve_deadline(start, options.until, options.max_hours)
     startup_errors: list[str] = []
     try:
-        hardware = assess_hardware()
+        hardware = assess_hardware(llama_bin=options.llama_bin)
     except Exception as exc:
         startup_errors.append(f"hardware assessment failed: {exc}")
         hardware = HardwareReport(
@@ -767,7 +782,7 @@ def run_nightshift(
                             outcome = resume_tuning(session_dir)
                         else:
                             model = by_fingerprint[item.fingerprint or ""]
-                            current_hardware = assess_hardware()
+                            current_hardware = assess_hardware(llama_bin=options.llama_bin)
                             tune_options = _tune_options(
                                 options,
                                 current_hardware,
@@ -784,6 +799,7 @@ def run_nightshift(
                                 argv=sys.argv,
                             )
                             session_dir = session.dir
+                            _stamp_nightshift_allocation(session, tune_options)
                             outcome = run_tuning(
                                 session, current_hardware, model.report, llama, tune_options
                             )
@@ -895,7 +911,7 @@ def run_nightshift(
                 item_started = clock()
                 deepen_session_dir: Path | None = None
                 try:
-                    current_hardware = assess_hardware()
+                    current_hardware = assess_hardware(llama_bin=options.llama_bin)
                     tune_options = _tune_options(options, current_hardware, remaining, deepen=True)
                     session = Session.create(
                         options.sessions_dir,
@@ -906,6 +922,7 @@ def run_nightshift(
                         argv=sys.argv,
                     )
                     deepen_session_dir = session.dir
+                    _stamp_nightshift_allocation(session, tune_options)
                     outcome = run_tuning(
                         session, current_hardware, model.report, llama, tune_options
                     )

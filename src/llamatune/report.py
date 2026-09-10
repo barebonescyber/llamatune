@@ -279,16 +279,29 @@ def _method_section(session_meta: dict[str, Any], baseline: dict[str, Any]) -> s
         f"- Target: {options.get('target', '-')}",
         f"- Budget: {options.get('budget_trials', '-')} trials, "
         f"{options.get('budget_minutes') or 'unlimited'} minutes",
-        f"- Repetitions: search={options.get('reps_search', '-')}, "
-        f"confirm={options.get('reps_confirm', '-')}",
-        f"- Baseline runs: {options.get('baseline_runs', '-')}",
-        f"- Workload: pp={options.get('pp', '-')}, tg={options.get('tg', '-')}"
-        + (f", depth={options['depth']}" if options.get("depth") is not None else ""),
-        f"- Lossy dimensions allowed: {options.get('allow_lossy', False)}",
-        f"- Cooldown: {options.get('cooldown_s', 0)} s",
-        *(["- Multi-GPU pooled capacity: enabled"] if options.get("multi_gpu") else []),
-        f"- Noise floor (cv): {_fmt(baseline.get('noise_floor_cv'), 4)}",
     ]
+    allocated = session_meta.get("nightshift")
+    if isinstance(allocated, dict):
+        trials = allocated.get("budget_trials")
+        minutes = allocated.get("budget_minutes")
+        minutes_text = f"{minutes:.2f}" if isinstance(minutes, (int, float)) else "-"
+        lines.append(
+            f"- Night Shift allocated up to {trials if trials is not None else '-'} trials "
+            f"and {minutes_text} minutes of the shift window"
+        )
+    lines.extend(
+        [
+            f"- Repetitions: search={options.get('reps_search', '-')}, "
+            f"confirm={options.get('reps_confirm', '-')}",
+            f"- Baseline runs: {options.get('baseline_runs', '-')}",
+            f"- Workload: pp={options.get('pp', '-')}, tg={options.get('tg', '-')}"
+            + (f", depth={options['depth']}" if options.get("depth") is not None else ""),
+            f"- Lossy dimensions allowed: {options.get('allow_lossy', False)}",
+            f"- Cooldown: {options.get('cooldown_s', 0)} s",
+            *(["- Multi-GPU pooled capacity: enabled"] if options.get("multi_gpu") else []),
+            f"- Noise floor (cv): {_fmt(baseline.get('noise_floor_cv'), 4)}",
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -342,6 +355,7 @@ def _counts_section(counts: dict[str, Any]) -> str:
         "executed",
         "ok",
         "unstable",
+        "host_spill",
         "oom",
         "cuda_error",
         "gpu_resource",
@@ -470,6 +484,8 @@ def _pair(label: str, value: Any) -> str:
             f", pp={_fmt(value.get('pp'))}, tg={_fmt(value.get('tg'))}, "
             f"score={_fmt(value.get('score'), 4)}"
         )
+    if value.get("spill_suspected"):
+        metrics = f"{metrics}, host-spill suspected" if metrics else ", host-spill suspected"
     reason = f" — {value['reason']}" if value.get("reason") else ""
     return f"- {label}: `{placement}`{metrics}{reason}"
 
@@ -507,6 +523,8 @@ def _feasibility_section(analysis: dict[str, Any]) -> str:
                 if warm_start_capped
                 else str(max_ok)
             )
+            if boundary.get("spill_suspected"):
+                max_display = f"{max_display} (host-spill suspected)"
             lines.append(
                 f"| {boundary.get('moe_cpu_layers', '-')} | {max_display} | "
                 f"{min_fail if min_fail is not None else '-'} | "
@@ -519,6 +537,12 @@ def _feasibility_section(analysis: dict[str, Any]) -> str:
             lines += [
                 "",
                 "_A search cap is inherited from another boundary; it is not a measured maximum._",
+            ]
+        if any(boundary.get("spill_suspected") for boundary in boundaries):
+            lines += [
+                "",
+                "_Host-memory spill was suspected at a fully offloaded placement; its "
+                "measurements were excluded from feasibility and scoring._",
             ]
     else:
         lines.append("- Boundaries: not evaluated")
@@ -541,6 +565,17 @@ def _feasibility_section(analysis: dict[str, Any]) -> str:
             lines.append("- Warning: KV estimate used fallback heuristic")
         if estimate.get("calibrated"):
             lines.append("- Estimate calibration: calibrated from observed sessions")
+        default_estimate = feasibility.get("default_placement_estimate")
+        default_placement = feasibility.get("default_placement")
+        if isinstance(default_estimate, dict) and isinstance(default_placement, dict):
+            lines.append(
+                "- Default placement "
+                f"(ngl={default_placement.get('gpu_layers')}): "
+                f"weights={_fmt(default_estimate.get('weights_mb'))} MiB, "
+                f"KV={_fmt(default_estimate.get('kv_mb'))} MiB, "
+                f"compute={_fmt(default_estimate.get('compute_mb'))} MiB, "
+                f"total={_fmt(default_estimate.get('total_mb'))} MiB"
+            )
     else:
         lines.append("- Estimated memory pressure: not evaluated")
     return "\n".join(lines) + "\n"
@@ -550,6 +585,19 @@ def _context_section(analysis: dict[str, Any]) -> str:
     validation = analysis.get("context_validation")
     if not isinstance(validation, dict):
         return "**Warning:** no full-context validation was performed.\n"
+    timeout = analysis.get("probe_timeout")
+    timeout_line = ""
+    if isinstance(timeout, dict) and timeout.get("retries") is not None:
+        retry_text = (
+            f", {timeout.get('retries')} work-scaled retries"
+            if timeout.get("retries")
+            else ", no retries needed"
+        )
+        timeout_line = (
+            f"\n- Probe timeout: work-scaled at {timeout.get('scale')}x, "
+            f"search-trial floor {timeout.get('trial_timeout_s')}s, "
+            f"cap {timeout.get('max_s')}s{retry_text}"
+        )
     return (
         "\n".join(
             [
@@ -558,6 +606,7 @@ def _context_section(analysis: dict[str, Any]) -> str:
                 f"- Evidence: `{validation.get('evidence', '-')}`",
             ]
         )
+        + timeout_line
         + "\n"
     )
 
