@@ -565,6 +565,17 @@ def _feasibility_section(analysis: dict[str, Any]) -> str:
             lines.append("- Warning: KV estimate used fallback heuristic")
         if estimate.get("calibrated"):
             lines.append("- Estimate calibration: calibrated from observed sessions")
+        default_estimate = feasibility.get("default_placement_estimate")
+        default_placement = feasibility.get("default_placement")
+        if isinstance(default_estimate, dict) and isinstance(default_placement, dict):
+            lines.append(
+                "- Default placement "
+                f"(ngl={default_placement.get('gpu_layers')}): "
+                f"weights={_fmt(default_estimate.get('weights_mb'))} MiB, "
+                f"KV={_fmt(default_estimate.get('kv_mb'))} MiB, "
+                f"compute={_fmt(default_estimate.get('compute_mb'))} MiB, "
+                f"total={_fmt(default_estimate.get('total_mb'))} MiB"
+            )
     else:
         lines.append("- Estimated memory pressure: not evaluated")
     return "\n".join(lines) + "\n"

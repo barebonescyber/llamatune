@@ -702,3 +702,30 @@ def test_context_section_reports_work_scaled_timeout_and_retries() -> None:
         }
     )
     assert "no retries needed" in zero_retries
+
+
+def test_feasibility_section_renders_default_placement_estimate() -> None:
+    analysis = _analysis_no_winner()
+    analysis["feasibility"] = {
+        "recommended": {"gpu_layers": 0, "moe_cpu_layers": 0, "reason": "x"},
+        "default_placement": {"gpu_layers": 41, "moe_cpu_layers": 0},
+        "estimate": {
+            "weights_mb": 0.0,
+            "kv_mb": 0.0,
+            "compute_mb": 0.0,
+            "total_mb": 0.0,
+            "budget_mb": 10476.0,
+            "kv_basis": "metadata",
+        },
+        "default_placement_estimate": {
+            "weights_mb": 7300.0,
+            "kv_mb": 277.0,
+            "compute_mb": 192.0,
+            "total_mb": 7769.0,
+            "budget_mb": 10476.0,
+            "kv_basis": "metadata",
+        },
+    }
+    text = report.render(analysis, _SESSION_META, _HARDWARE, _MODEL, _LLAMACPP)
+    assert "Default placement (ngl=41)" in text
+    assert "total=7769" in text

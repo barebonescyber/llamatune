@@ -2211,6 +2211,16 @@ def _unstable_status() -> search._Measured:
     )
 
 
+def _unstable_cpu_class() -> search._Measured:
+    return search._Measured(
+        "unstable",
+        MetricStats(mean=40.0, stdev=8.0, cv=0.2, n=3),
+        MetricStats(mean=1.8, stdev=0.4, cv=0.2, n=3),
+        {},
+        None,
+    )
+
+
 def _unstable_measured() -> search._Measured:
     return search._Measured(
         "ok",
@@ -3071,11 +3081,12 @@ class TestHostSpillDetection:
                 search._RunObservation(None, None, ()),
             ),
         )
-        monkeypatch.setattr(engine, "_classify", lambda result, reps: _measured())
+        monkeypatch.setattr(engine, "_classify", lambda result, reps: _measured(40.0, 1.8))
         monkeypatch.setattr(search, "_detect_gpu_throttle", lambda samples: False)
         monkeypatch.setattr(engine, "_write_command", lambda *args: None)
         monkeypatch.setattr(engine, "_record_load", lambda threads: None)
         monkeypatch.setattr(engine, "_cooldown", lambda: None)
+        monkeypatch.setattr(engine, "_cpu_reference_tg", lambda: 2.0)
 
         engine._execute_trial(trial_config, "spill_gate")
 
@@ -3186,7 +3197,7 @@ class TestHostSpillReviewRound2:
         monkeypatch.setattr(engine, "_cooldown", lambda: None)
         return session, engine
 
-    def test_spilled_boundary_probe_flags_boundary_and_not_max_ok(
+    def test_spilled_boundary_probe_with_cpu_speed_flags_boundary(
         self,
         tmp_path: Path,
         fake_bin_dir: Path,
@@ -3215,7 +3226,8 @@ class TestHostSpillReviewRound2:
             return _exec_result(tmp_path, "probe"), observation
 
         monkeypatch.setattr(engine, "_run_child", fake_run_child)
-        monkeypatch.setattr(engine, "_classify", lambda result, reps: _measured())
+        monkeypatch.setattr(engine, "_classify", lambda result, reps: _measured(40.0, 1.8))
+        monkeypatch.setattr(engine, "_cpu_reference_tg", lambda: 2.0)
 
         boundary = engine._discover_boundary(_envelope_config(33), 0)
 
@@ -3275,7 +3287,7 @@ class TestHostSpillReviewRound2:
         assert config != engine.default_config
         assert config.gpu_layers == 0
 
-    def test_unstable_full_offload_trial_with_tiny_vram_delta_is_demoted(
+    def test_unstable_full_offload_trial_with_cpu_speed_and_tiny_delta_is_demoted(
         self,
         tmp_path: Path,
         fake_bin_dir: Path,
@@ -3298,8 +3310,9 @@ class TestHostSpillReviewRound2:
                 search._RunObservation(None, None, ()),
             ),
         )
-        monkeypatch.setattr(engine, "_classify", lambda result, reps: _unstable_status())
+        monkeypatch.setattr(engine, "_classify", lambda result, reps: _unstable_cpu_class())
         monkeypatch.setattr(search, "_detect_gpu_throttle", lambda samples: False)
+        monkeypatch.setattr(engine, "_cpu_reference_tg", lambda: 2.0)
 
         engine._execute_trial(trial_config, "spill_gate")
 
@@ -3731,3 +3744,318 @@ class TestProbeRetryResumeSafety:
             ctx_ladder=(),
         )
         assert engine._probe_timeout_summary() is None
+
+
+class TestSpillSpeedCorroboration:
+    """Issue #40 follow-up: the VRAM-delta arm alone must not demote.
+
+    Real-host evidence (NVK/Mesa GTT, overnight 2026-09-09): nvidia-smi sees
+    near-zero deltas for genuinely GPU-resident runs, so delta-only demotion
+    misclassified every full-offload placement and collapsed the
+    recommendation to ngl=0. The speed arm is authoritative; the delta arm
+    corroborates or, alone, records an advisory anomaly.
+    """
+
+    def _engine(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        observe_vram: bool = True,
+        **option_overrides: Any,
+    ) -> tuple[Session, search._Engine]:
+        session, engine = TestHostSpillDetection._baseline_engine(
+            self,  # type: ignore[arg-type]
+            tmp_path,
+            fake_bin_dir,
+            tiny_gguf,
+            observe_vram=observe_vram,
+            **option_overrides,
+        )
+        monkeypatch.setattr(engine, "_write_command", lambda *args: None)
+        monkeypatch.setattr(engine, "_record_load", lambda threads: None)
+        monkeypatch.setattr(engine, "_cooldown", lambda: None)
+        return session, engine
+
+    def _tiny_delta(self, engine: search._Engine, config: TrialConfig) -> None:
+        engine._observations[config.trial_id] = search._RunObservation(
+            _gpu_sample(45.0),
+            _gpu_sample(45.0),
+            (_gpu_sample(45.0),) * 4,
+        )
+
+    def test_full_offload_trial_tiny_delta_gpu_speed_not_demoted(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """NVK-shaped run: GPU-class tg, delta far below estimate -> stays ok."""
+        session, engine = self._engine(tmp_path, fake_bin_dir, tiny_gguf, monkeypatch)
+        trial_config = _envelope_config(33)
+        self._tiny_delta(engine, trial_config)
+        monkeypatch.setattr(
+            engine,
+            "_run_child",
+            lambda **kwargs: (
+                _exec_result(tmp_path, "x"),
+                search._RunObservation(None, None, ()),
+            ),
+        )
+        monkeypatch.setattr(engine, "_classify", lambda result, reps: _measured(100.0, 10.0))
+        monkeypatch.setattr(search, "_detect_gpu_throttle", lambda samples: False)
+
+        engine._execute_trial(trial_config, "spill_gate")
+
+        assert engine.known[trial_config.trial_id]["status"] == "ok"
+        assert not any(entry.get("stage") == "host_spill_suspected" for entry in session.entries)
+        advisory = [
+            entry for entry in session.entries if entry.get("stage") == "vram_delta_anomaly"
+        ]
+        assert advisory and advisory[0]["advisory"] is True
+
+    def test_full_offload_trial_cpu_speed_still_demoted_with_delta(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Speed arm corroborated by delta -> host_spill (unchanged behavior)."""
+        session, engine = self._engine(tmp_path, fake_bin_dir, tiny_gguf, monkeypatch)
+        monkeypatch.setattr(engine, "_cpu_reference_tg", lambda: 8.0)
+        trial_config = _envelope_config(33)
+        self._tiny_delta(engine, trial_config)
+        monkeypatch.setattr(
+            engine,
+            "_run_child",
+            lambda **kwargs: (
+                _exec_result(tmp_path, "x"),
+                search._RunObservation(None, None, ()),
+            ),
+        )
+        monkeypatch.setattr(engine, "_classify", lambda result, reps: _measured(40.0, 1.8))
+        monkeypatch.setattr(search, "_detect_gpu_throttle", lambda samples: False)
+
+        engine._execute_trial(trial_config, "spill_gate")
+
+        assert engine.known[trial_config.trial_id]["status"] == "host_spill"
+        stages = [
+            entry for entry in session.entries if entry.get("stage") == "host_spill_suspected"
+        ]
+        assert stages
+        assert any("CPU reference" in reason for reason in stages[0]["reasons"])
+
+    def test_boundary_probe_gpu_speed_tiny_delta_accepts_cap(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Boundary probe with GPU-class tg and tiny delta: no spill, cap kept."""
+        _session, engine = self._engine(tmp_path, fake_bin_dir, tiny_gguf, monkeypatch)
+        engine.incumbent_config = _envelope_config(33)
+        engine.options = dataclasses.replace(engine.options, initial_gpu_layers=33)
+        monkeypatch.setattr(
+            engine,
+            "_run_child",
+            lambda **kwargs: (
+                _exec_result(tmp_path, "x"),
+                search._RunObservation(
+                    _gpu_sample(45.0), _gpu_sample(45.0), (_gpu_sample(45.0),) * 4
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            engine,
+            "_classify",
+            lambda result, reps: _measured(2000.0, 120.0),
+        )
+        boundary = engine._discover_boundary(_envelope_config(33), 0)
+        assert boundary.max_ok_ngl == engine.model.ngl_all
+        assert boundary.spill_suspected is False
+
+    def test_boundary_probe_record_carries_tg_mean(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Boundary probe journal records carry the measured pp/tg means."""
+        _session, engine = self._engine(
+            tmp_path, fake_bin_dir, tiny_gguf, monkeypatch, observe_vram=False
+        )
+        cfg = _envelope_config(33)
+        monkeypatch.setattr(
+            engine,
+            "_run_child",
+            lambda **kwargs: (
+                _exec_result(tmp_path, "x"),
+                search._RunObservation(None, None, ()),
+            ),
+        )
+        monkeypatch.setattr(engine, "_classify", lambda result, reps: _measured(2000.0, 120.0))
+
+        engine._probe(cfg, "boundary", None)
+
+        record = engine.probes[search._probe_id("boundary", cfg, None)]
+        assert record["pp_mean"] == 2000.0
+        assert record["tg_mean"] == 120.0
+
+    def test_spilled_boundary_walks_down_and_recommends_best_safe(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Genuine spill at full offload: boundary walks down, best safe wins."""
+        _session, engine = self._engine(
+            tmp_path, fake_bin_dir, tiny_gguf, monkeypatch, observe_vram=False
+        )
+        engine.incumbent_config = _envelope_config(33)
+        engine.model = dataclasses.replace(engine.model, n_layer=32, ngl_all=33)
+        monkeypatch.setattr(engine, "_cpu_reference_tg", lambda: 2.0)
+        boundary_probe_calls: list[int] = []
+
+        def fake_probe(cfg: TrialConfig, purpose: str, ctx: int | None) -> str:
+            if purpose != "boundary":
+                return "ok"
+            ngl = cfg.gpu_layers
+            boundary_probe_calls.append(ngl)
+            if ngl == engine.model.ngl_all:
+                # CPU-class speed at full offload: recorded so the spill gate
+                # can demote on the speed arm.
+                probe_id = search._probe_id("boundary", cfg, None)
+                record = {
+                    "type": "probe",
+                    "probe_id": probe_id,
+                    "purpose": purpose,
+                    "config": cfg.to_dict(),
+                    "ctx": ctx,
+                    "status": "ok",
+                    "attempt": 1,
+                    "timeout_s": 60.0,
+                    "pattern": None,
+                    "pp_mean": 40.0,
+                    "tg_mean": 1.8,
+                    "estimate_reason": None,
+                }
+                engine.probes[probe_id] = record
+                return "ok"
+            return "ok"
+
+        monkeypatch.setattr(engine, "_probe", fake_probe)
+
+        def fake_evaluate(cfg: TrialConfig, purpose: str) -> search._Trial:
+            ngl = cfg.gpu_layers
+            return (
+                search._Trial("ok", 2000.0, 120.0, 1.05)
+                if ngl < engine.model.ngl_all
+                else search._Trial("host_spill", None, None, None)
+            )
+
+        monkeypatch.setattr(engine, "_evaluate", fake_evaluate)
+        boundary = engine._discover_boundary(_envelope_config(32), 0)
+        assert boundary.max_ok_ngl < engine.model.ngl_all
+        assert boundary.spill_suspected is True
+
+
+class TestRecommendationReporting:
+    """Report coherence: accurate reason strings and comparison estimates."""
+
+    def _engine(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> search._Engine:
+        _session, engine = TestHostSpillDetection._baseline_engine(
+            self,  # type: ignore[arg-type]
+            tmp_path,
+            fake_bin_dir,
+            tiny_gguf,
+        )
+        monkeypatch.setattr(engine, "_write_command", lambda *args: None)
+        monkeypatch.setattr(engine, "_record_load", lambda threads: None)
+        monkeypatch.setattr(engine, "_cooldown", lambda: None)
+        return engine
+
+    def test_reason_names_fallback_when_validation_covered_other_config(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        engine = self._engine(tmp_path, fake_bin_dir, tiny_gguf, monkeypatch)
+        engine.options = dataclasses.replace(engine.options, ctx_size=4096)
+        engine.context_validation = {"ctx": 4096, "status": "ok", "evidence": "probes/x"}
+
+        reason = engine._recommend_reason(_envelope_config(0))
+
+        assert reason == "fallback placement; context validation covered the search placement only"
+
+    def test_reason_names_skipped_validation(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        engine = self._engine(tmp_path, fake_bin_dir, tiny_gguf, monkeypatch)
+        engine.options = dataclasses.replace(engine.options, ctx_size=4096)
+        engine.context_validation = {"ctx": 4096, "status": "skipped", "evidence": None}
+
+        reason = engine._recommend_reason(engine.default_config)
+
+        assert reason == "context validation skipped before this placement was reached"
+
+    def test_reason_names_failed_validation(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        engine = self._engine(tmp_path, fake_bin_dir, tiny_gguf, monkeypatch)
+        engine.options = dataclasses.replace(engine.options, ctx_size=4096)
+        engine.context_validation = {"ctx": 4096, "status": "failed", "evidence": None}
+
+        reason = engine._recommend_reason(engine.default_config)
+
+        assert reason == "full-context validation failed"
+
+    def test_reason_validated_config(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        engine = self._engine(tmp_path, fake_bin_dir, tiny_gguf, monkeypatch)
+        engine.context_validation = {"ctx": 4096, "status": "ok", "evidence": "probes/x"}
+        engine.validated_configs.add(engine.default_config.trial_id)
+
+        reason = engine._recommend_reason(engine.default_config)
+
+        assert reason == "passed full-context validation"
+
+    def test_reason_no_ctx_requested(
+        self,
+        tmp_path: Path,
+        fake_bin_dir: Path,
+        tiny_gguf: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        engine = self._engine(tmp_path, fake_bin_dir, tiny_gguf, monkeypatch)
+
+        reason = engine._recommend_reason(engine.default_config)
+
+        assert reason == "best measured; no full-context validation requested"

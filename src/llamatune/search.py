@@ -68,6 +68,7 @@ from llamatune.types import (
     TuneOptions,
     TuneOutcome,
     VramCalibration,
+    VramEstimate,
 )
 
 #: Maximum full coordinate-ascent passes (DESIGN §10 step 5).
@@ -1437,21 +1438,14 @@ class _Engine:
             spill = (
                 self._boundary_spill_suspected(
                     probe_cfg,
-                    _Measured(status, None, None, None, None),
+                    self._probe_measured(probe_cfg, None, status),
                     run_id=_probe_id("boundary", probe_cfg, None),
                 )
                 if status == "ok"
                 else None
             )
+            spill = self._handle_spill_suspected(probe_cfg, spill)
             if spill is not None:
-                self._append(
-                    {
-                        "type": "stage",
-                        "stage": "host_spill_suspected",
-                        "config": probe_cfg.to_dict(),
-                        **spill,
-                    }
-                )
                 status = "host_spill"
             if status == "ok":
                 low = guess
@@ -1471,6 +1465,18 @@ class _Engine:
             cfg = dataclasses.replace(base, gpu_layers=guess)
             status = self._probe(cfg, "boundary", None)
             used += 1
+            if status == "ok" and is_fully_offloaded(guess, self.model.ngl_all):
+                spill = self._handle_spill_suspected(
+                    cfg,
+                    self._boundary_spill_suspected(
+                        cfg,
+                        self._probe_measured(cfg, None, status),
+                        run_id=_probe_id("boundary", cfg, None),
+                    ),
+                )
+                if spill is not None:
+                    status = "host_spill"
+                    spill_suspected = True
             if status == "ok":
                 low = guess
             else:
@@ -1482,21 +1488,14 @@ class _Engine:
             spill = (
                 self._boundary_spill_suspected(
                     bisect_cfg,
-                    _Measured(status, None, None, None, None),
+                    self._probe_measured(bisect_cfg, None, status),
                     run_id=_probe_id("boundary", bisect_cfg, None),
                 )
                 if status == "ok"
                 else None
             )
+            spill = self._handle_spill_suspected(bisect_cfg, spill)
             if spill is not None:
-                self._append(
-                    {
-                        "type": "stage",
-                        "stage": "host_spill_suspected",
-                        "config": bisect_cfg.to_dict(),
-                        **spill,
-                    }
-                )
                 status = "host_spill"
             if status == "ok":
                 low = guess
@@ -1760,6 +1759,8 @@ class _Engine:
             "attempt": attempt,
             "timeout_s": timeout_s,
             "pattern": measured.oom_pattern,
+            "pp_mean": measured.pp.mean if measured.pp is not None else None,
+            "tg_mean": measured.tg.mean if measured.tg is not None else None,
             "estimate_reason": estimate_reason(
                 config=cfg,
                 model=self.model,
@@ -2340,16 +2341,9 @@ class _Engine:
             if measured.status in ("ok", "unstable")
             else None
         )
-        measured = self._classify_spill(measured, spill)
-        if spill is not None:
-            self._append(
-                {
-                    "type": "stage",
-                    "stage": "host_spill_suspected",
-                    "trial_id": cfg.trial_id,
-                    **spill,
-                }
-            )
+        demoting_spill = self._handle_spill_suspected(cfg, spill)
+        measured = self._classify_spill(measured, demoting_spill)
+        if demoting_spill is not None:
             self._emit("warning", message=f"host-memory spill suspected at {cfg.trial_id}")
         primary_thermal_rejected = thermal.contaminated and (
             not thermal.retried or thermal.retry_contaminated is True
@@ -2654,20 +2648,25 @@ class _Engine:
     ) -> dict[str, Any] | None:
         """Why a full-offload boundary stage looks like a host spill (issue #36).
 
-        Speed gate: a fully offloaded run whose tg is CPU-class relative to
-        the ngl=0 reference. Evidence gate: an observed device-memory delta
-        far below the estimated need. Returns None when neither fires.
+        Speed gate (authoritative): a fully offloaded run whose tg is
+        CPU-class relative to the ngl=0 reference. Evidence gate
+        (corroborating): an observed device-memory delta far below the
+        estimated need. The delta arm alone never demotes — some drivers
+        (NVK/Mesa GTT) report near-zero deltas for GPU-resident work — it
+        returns an advisory anomaly instead. Returns None when neither
+        fires.
         """
         if not is_fully_offloaded(config.gpu_layers, self.model.ngl_all):
             return None
-        reasons: list[str] = []
+        speed_reasons: list[str] = []
         if measured.tg is not None:
             cpu_tg = self._cpu_reference_tg()
             if cpu_tg is not None and is_cpu_class_speed(measured.tg.mean, cpu_tg):
-                reasons.append(
+                speed_reasons.append(
                     f"tg {measured.tg.mean:.2f} t/s is within {SPILL_TG_TOLERANCE}x "
                     f"of the CPU reference {cpu_tg:.2f} t/s at full offload"
                 )
+        delta_reasons: list[str] = []
         if self._spill_applicable() and measured.status in ("ok", "unstable"):
             estimate = estimate_vram(
                 config=config,
@@ -2683,14 +2682,80 @@ class _Engine:
                 float(observation["observed_used_delta_mb"]) if observation is not None else None
             )
             if delta is not None and is_spill_vram_delta(delta, estimate.total_mb):
-                reasons.append(
+                delta_reasons.append(
                     f"observed VRAM delta {delta:.0f} MiB is below "
                     f"{SPILL_VRAM_DELTA_FRACTION:.0%} of the estimated "
                     f"{estimate.total_mb:.0f} MiB at full offload"
                 )
-        if not reasons:
+        if speed_reasons:
+            return {"reasons": speed_reasons + delta_reasons}
+        if delta_reasons:
+            return {"reasons": delta_reasons, "advisory": True}
+        return None
+
+    def _recommend_reason(self, config: TrialConfig) -> str:
+        """Accurate validation provenance for the emitted recommendation."""
+        if config.trial_id in self.validated_configs:
+            return "passed full-context validation"
+        status = (self.context_validation or {}).get("status")
+        if self.options.ctx_size is None:
+            return "best measured; no full-context validation requested"
+        if status == "ok":
+            return "fallback placement; context validation covered the search placement only"
+        if status == "skipped":
+            return "context validation skipped before this placement was reached"
+        return "full-context validation failed"
+
+    def _probe_measured(self, cfg: TrialConfig, ctx: int | None, status: str) -> _Measured:
+        """Build a _Measured for a completed probe from its journal record.
+
+        Boundary probes run llama-bench, so their records carry the measured
+        pp/tg means; the spill speed gate needs the tg mean to fire.
+        """
+        record = self.probes.get(_probe_id("boundary", cfg, ctx)) or {}
+        tg_mean = record.get("tg_mean")
+        tg = stats.sample_stats(float(tg_mean), 0.0, 1) if tg_mean else None
+        return _Measured(status, None, tg, None, None)
+
+    def _handle_spill_suspected(
+        self, config: TrialConfig, spill: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Journal a spill verdict; advisory anomalies never demote.
+
+        Returns the spill dict for demotion, or None after recording an
+        advisory `vram_delta_anomaly` stage for a delta-only suspicion.
+        """
+        if spill is None:
             return None
-        return {"reasons": reasons}
+        if spill.get("advisory"):
+            self._append(
+                {
+                    "type": "stage",
+                    "stage": "vram_delta_anomaly",
+                    "config": config.to_dict(),
+                    "trial_id": config.trial_id,
+                    "advisory": True,
+                    **spill,
+                }
+            )
+            self._emit(
+                "warning",
+                message=(
+                    "VRAM delta far below estimate at full offload (may be a driver "
+                    "reporting artifact); kept as measured — " + "; ".join(spill["reasons"])
+                ),
+            )
+            return None
+        self._append(
+            {
+                "type": "stage",
+                "stage": "host_spill_suspected",
+                "config": config.to_dict(),
+                "trial_id": config.trial_id,
+                **spill,
+            }
+        )
+        return spill
 
     def _classify_spill(self, measured: _Measured, spill: dict[str, Any] | None) -> _Measured:
         """Demote an ok or unstable full-offload measurement to host_spill (issue #36)."""
@@ -3141,6 +3206,19 @@ class _Engine:
             calibration=self.calibration,
         )
         ram_estimate = estimate_ram(recommend_config, self.model, self.options.ctx_size)
+        default_placement_estimate: VramEstimate | None = None
+        if recommend_config.gpu_layers == 0 and self.default_config.gpu_layers > 0:
+            # A CPU-only fallback renders a degenerate all-zero pressure line;
+            # keep the default placement's estimate visible for comparison.
+            default_placement_estimate = estimate_vram(
+                config=self.default_config,
+                model=self.model,
+                ctx=self.options.ctx_size,
+                vram_reserve_mb=self.vram_reserve_mb,
+                vram_total_mb=total_vram_mb(self.hardware, multi_gpu=self.options.multi_gpu),
+                vram_free_mb=free_vram_mb(self.hardware, multi_gpu=self.options.multi_gpu),
+                calibration=self.calibration,
+            )
         if self.hardware.ram_mb and ram_estimate.total_mb > 0.9 * self.hardware.ram_mb:
             warnings.append(
                 f"estimated host RAM use {ram_estimate.total_mb:.0f} MiB "
@@ -3196,19 +3274,20 @@ class _Engine:
             "recommended": {
                 "gpu_layers": recommend_config.gpu_layers,
                 "moe_cpu_layers": recommend_config.moe_cpu_layers,
-                "reason": (
-                    "passed full-context validation"
-                    if self.context_validation
-                    and self.context_validation.get("status") == "ok"
-                    and recommend_config.trial_id in self.validated_configs
-                    else "full-context validation failed"
-                    if self.options.ctx_size is not None
-                    else "best measured; no full-context validation"
-                ),
+                "reason": self._recommend_reason(recommend_config),
             },
             "vram_reserve_mb": self.vram_reserve_mb,
             "reserve_provenance": self.reserve_provenance,
             "estimate": dataclasses.asdict(estimate),
+            "default_placement_estimate": (
+                dataclasses.asdict(default_placement_estimate)
+                if default_placement_estimate is not None
+                else None
+            ),
+            "default_placement": {
+                "gpu_layers": self.default_config.gpu_layers,
+                "moe_cpu_layers": self.default_config.moe_cpu_layers,
+            },
             "ram_estimate": dataclasses.asdict(ram_estimate),
         }
         analysis = recommend.build_analysis(
