@@ -489,6 +489,10 @@ warning. (v1 deliberately does not hash-chain the journal — it is
 honest-operator evidence, not tamper-proof; documented divergence from
 infer-tune.)
 
+Marathon journal recovery has its own reader-specific policy. See
+`docs/marathon-design.md` §13.4; it does not change this strict session
+resume reader or its warned torn-final-line recovery.
+
 Thermally observed `trial` and `confirmation_run` records carry contamination,
 retry, and replacement-contamination state. A final trial rejected for thermal
 provenance additionally carries `thermal_rejected: true` and has `score: null`.

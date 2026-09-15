@@ -11,6 +11,7 @@ import signal
 import statistics
 import sys
 import time
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
@@ -277,13 +278,26 @@ def _entries(run_dir: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     result: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for number, line in enumerate(
+        path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1
+    ):
+        if not line.strip():
+            continue
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
-            break
-        if isinstance(value, dict):
-            result.append(value)
+            warnings.warn(
+                f"journal.jsonl line {number}: invalid JSON ignored", RuntimeWarning, stacklevel=2
+            )
+            continue
+        if not isinstance(value, dict):
+            warnings.warn(
+                f"journal.jsonl line {number}: non-object record ignored",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            continue
+        result.append(value)
     return result
 
 

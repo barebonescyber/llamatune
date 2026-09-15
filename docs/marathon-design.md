@@ -600,6 +600,12 @@ in Phase 0, completed matrix cells and A/B blocks are skipped via their
 journal entries. A mismatch in any identity-bearing option starts a fresh
 run and leaves the old one untouched, with a warning naming it.
 
+Marathon recovery skips malformed or non-object journal records with a line-numbered
+warning and retains later valid records. Blank lines are ignored. The reader does
+not alter journal bytes. A later valid marathon_end prevents automatic re-entry.
+This policy does not change the strict tuning-session resume reader or its warned
+torn-final-line recovery.
+
 ## 14. Safety invariants
 
 All of DESIGN §14 and Night Shift §11 unchanged: strictly additive on
