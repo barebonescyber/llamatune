@@ -10,10 +10,12 @@ written evidence files it needs to render the report.
 from __future__ import annotations
 
 import json
+import shlex
 from typing import TYPE_CHECKING, Any
 
 from llamatune import report as report_module
 from llamatune import stats
+from llamatune.runtimeflags import runtime_flags
 from llamatune.types import BaselineResult, LlamaCppReport, ModelReport, TrialConfig, TuneOptions
 
 if TYPE_CHECKING:
@@ -195,29 +197,7 @@ def build_recommended_json(
 
 
 def _cli_flags(config: TrialConfig, *, moe: bool) -> list[str]:
-    flags = [
-        "-ngl",
-        str(config.gpu_layers),
-        "-b",
-        str(config.batch),
-        "-ub",
-        str(config.ubatch),
-        "-t",
-        str(config.threads),
-    ]
-    if moe and config.moe_cpu_layers > 0:
-        flags += ["--n-cpu-moe", str(config.moe_cpu_layers)]
-    if config.flash_attn:
-        flags += ["-fa", "on"]
-    if not config.mmap:
-        flags.append("--no-mmap")
-    if config.no_kv_offload:
-        flags.append("--no-kv-offload")
-    if config.cache_type_k != "f16":
-        flags += ["-ctk", config.cache_type_k]
-    if config.cache_type_v != "f16":
-        flags += ["-ctv", config.cache_type_v]
-    return flags
+    return runtime_flags(config, moe=moe)
 
 
 def build_recommended_sh(
@@ -235,7 +215,6 @@ def build_recommended_sh(
     runtime_flags = _cli_flags(config, moe=moe)
     if ctx_size is not None:
         runtime_flags += ["-c", str(ctx_size)]
-    flags = " ".join(runtime_flags)
     model_path = str(model.path)
     improvement = expected.get("improvement_pct", {})
     verdict = "confirmed improvement" if confirmed else "no confirmed improvement (defaults)"
@@ -253,10 +232,10 @@ def build_recommended_sh(
     lines += [
         "#",
         "# llama-server:",
-        f"# llama-server -m {model_path} {flags}",
+        "# " + shlex.join(["llama-server", "-m", model_path, *runtime_flags]),
         "#",
         "# llama-cli:",
-        f"# llama-cli -m {model_path} {flags}",
+        "# " + shlex.join(["llama-cli", "-m", model_path, *runtime_flags]),
         "",
     ]
     seen_alternates: set[tuple[int, str]] = set()
@@ -270,7 +249,6 @@ def build_recommended_sh(
             continue
         seen_alternates.add(alternate_key)
         alternate_flags = [*_cli_flags(alternate, moe=moe), "-c", str(row["ctx"])]
-        alternate_text = " ".join(alternate_flags)
         lines.append(f"# Alternate for {row['ctx']} context:")
         if not _is_lossless(alternate.to_dict()):
             lines.append(
@@ -278,8 +256,8 @@ def build_recommended_sh(
                 "before adoption."
             )
         lines += [
-            f"# llama-server -m {model_path} {alternate_text}",
-            f"# llama-cli -m {model_path} {alternate_text}",
+            "# " + shlex.join(["llama-server", "-m", model_path, *alternate_flags]),
+            "# " + shlex.join(["llama-cli", "-m", model_path, *alternate_flags]),
             "",
         ]
     return "\n".join(lines)
