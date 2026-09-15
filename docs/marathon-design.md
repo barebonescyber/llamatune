@@ -675,9 +675,10 @@ performance model and `LLAMATUNE_FAKE_SPEED_SCALE`:
 ## 16. Documentation
 
 README gains a "Marathon" section (synopsis, one worked example, stopping
-semantics, relationship to Night Shift, where the report lands). DESIGN.md
-and nightshift-design.md are not modified; this document is the Marathon
-spec.
+semantics, relationship to Night Shift, where the report lands). Only the
+Marathon journal-recovery cross-reference is added to DESIGN.md section 12.
+Other DESIGN.md content and nightshift-design.md remain unchanged by this
+feature. This document remains the Marathon spec.
 
 ## 17. Future work (post-v1)
 

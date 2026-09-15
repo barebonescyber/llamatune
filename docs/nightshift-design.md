@@ -702,8 +702,9 @@ calibration at 0.85 (drift) or 1.0 (consistent) without touching evidence.
 ## 14. Documentation
 
 README gains a "Night Shift" section (command synopsis, one worked example
-using `./models`, deadline semantics, where the report lands). DESIGN.md is
-not modified; this document is the Night Shift spec.
+using `./models`, deadline semantics, where the report lands). DESIGN.md may
+be updated only to align Night Shift exit-code documentation. This document
+remains the Night Shift spec.
 
 ## 15. Future work (post-v1)
 
