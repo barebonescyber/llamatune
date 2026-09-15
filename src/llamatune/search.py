@@ -14,6 +14,7 @@ import contextlib
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import signal
 import statistics
@@ -3061,13 +3062,70 @@ class _Engine:
         best = max(candidates, key=lambda record: (record["score"], record["trial_id"]))
         return TrialConfig.from_dict(best["config"])
 
+    def _confirmation_key(self, config: TrialConfig) -> dict[str, Any]:
+        return {
+            "config": config.to_dict(),
+            "model_fingerprint": self.model.fingerprint,
+            "bench_sha256": self.llama.bench_sha256,
+            "help_sha256": self.llama.help_sha256,
+            "pp": self.options.pp,
+            "tg": self.options.tg,
+            "depth": self.options.depth,
+            "reps_confirm": self.options.reps_confirm,
+            "baseline_runs": self.options.baseline_runs,
+        }
+
+    def _reusable_confirmations(self, config: TrialConfig) -> dict[int, tuple[float, float]]:
+        if not self._tuning_budget_enforced or self.llama.bench_sha256 is None:
+            return {}
+        key = self._confirmation_key(config)
+        latest: dict[int, dict[str, Any]] = {}
+        for entry in self.session.entries:
+            index = entry.get("run")
+            if (
+                entry.get("type") == "confirmation_run"
+                and entry.get("trial_id") == config.trial_id
+                and entry.get("purpose") == "confirmation"
+                and entry.get("confirmation_key") == key
+                and isinstance(index, int)
+                and not isinstance(index, bool)
+                and 1 <= index <= self.options.baseline_runs
+            ):
+                latest[index] = entry
+        result: dict[int, tuple[float, float]] = {}
+        for index, entry in latest.items():
+            pp, tg = entry.get("pp_mean"), entry.get("tg_mean")
+            if entry.get("status") != "ok":
+                continue
+            if entry.get("thermally_contaminated") and not (
+                entry.get("thermal_retried") is True
+                and entry.get("thermal_retry_contaminated") is False
+            ):
+                continue
+            if (
+                isinstance(pp, (int, float))
+                and not isinstance(pp, bool)
+                and isinstance(tg, (int, float))
+                and not isinstance(tg, bool)
+                and math.isfinite(pp)
+                and math.isfinite(tg)
+                and pp > 0
+                and tg > 0
+            ):
+                result[index] = (float(pp), float(tg))
+        return result
+
     def _confirm(self, config: TrialConfig) -> _Confirm:
         if self._hard_cap_ancestor(config) is not None:
             return _Confirm(False, None, None, 0.0)
-        self._quiet_gate("confirmation")
+        reusable = self._reusable_confirmations(config)
+        missing = self.options.baseline_runs - len(reusable)
+        if missing:
+            self._quiet_gate("confirmation")
         if (
-            self._tuning_budget_enforced
-            and self.executed_count + self.options.baseline_runs > self.options.budget_trials
+            missing > 0
+            and self._tuning_budget_enforced
+            and self.executed_count + missing > self.options.budget_trials
         ):
             warning = "confirmation skipped because trial budget was exhausted"
             if warning not in self.extra_warnings:
@@ -3077,6 +3135,11 @@ class _Engine:
         pp_means: list[float] = []
         tg_means: list[float] = []
         for index in range(1, self.options.baseline_runs + 1):
+            if index in reusable:
+                pp_mean, tg_mean = reusable[index]
+                pp_means.append(pp_mean)
+                tg_means.append(tg_mean)
+                continue
             if not self._can_execute():
                 warning = "confirmation skipped because trial budget was exhausted"
                 if warning not in self.extra_warnings:
@@ -3093,9 +3156,9 @@ class _Engine:
                 capabilities=self.caps,
                 depth=self.options.depth,
             )
-            confirm_dir = self.session.trial_dir(config.trial_id) / f"confirm-{index}"
-            confirm_dir.mkdir(parents=True, exist_ok=True)
-            run_id = f"{config.trial_id}-confirm-{index}"
+            confirm_dir = self.session.confirmation_dir(config.trial_id, index)
+            confirm_rel = str(confirm_dir.relative_to(self.session.dir))
+            run_id = f"{config.trial_id}-{confirm_dir.name}"
             label = (
                 f"confirmation {index}/{self.options.baseline_runs} {self._config_label(config)}"
             )
@@ -3111,7 +3174,7 @@ class _Engine:
             self.executed_count += 1
             measured = self._classify(result, self.options.reps_confirm)
             self._write_command(
-                f"trials/{config.trial_id}/confirm-{index}",
+                confirm_rel,
                 argv,
                 result,
                 self.options.reps_confirm,
@@ -3128,7 +3191,7 @@ class _Engine:
                 reps=self.options.reps_confirm,
                 threads=config.threads,
                 retry_dir=confirm_dir / "thermal-retry",
-                retry_rel_dir=(f"trials/{config.trial_id}/confirm-{index}/thermal-retry"),
+                retry_rel_dir=f"{confirm_rel}/thermal-retry",
                 result=result,
                 observation=observation,
                 measured=measured,
@@ -3146,6 +3209,9 @@ class _Engine:
                     "thermally_contaminated": thermal.contaminated,
                     "thermal_retried": thermal.retried,
                     "thermal_retry_contaminated": thermal.retry_contaminated,
+                    "confirmation_key": self._confirmation_key(config),
+                    "purpose": "confirmation" if self._tuning_budget_enforced else "revalidation",
+                    "capture_dir": confirm_rel,
                 }
             )
             self._emit(

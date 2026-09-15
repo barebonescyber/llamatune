@@ -2841,3 +2841,141 @@ def test_thermal_cooldown_honors_clock_throttle_while_gpu_is_cool(
     assert len(pauses) == 6
     assert all(entry["reason"] == "throttle" for entry in pauses)
     assert pauses[-1]["cap_reached"] is True
+
+
+@pytest.mark.parametrize("budget", [6, 60])
+def test_confirmation_interrupt_resume_does_not_repeat_completed_runs(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    budget: int,
+) -> None:
+    session, hw, model, llama, options = _setup(
+        tmp_path, fake_bin_dir, tiny_gguf, budget_trials=budget
+    )
+    engine = search._Engine(session, hw, model, llama, options)
+    engine._establish_baseline()
+    engine._finalizing = True
+    cfg = _envelope_config(1)
+    append = engine._append
+
+    def interrupt_after_first(record: dict[str, Any]) -> None:
+        append(record)
+        if record.get("type") == "confirmation_run":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(engine, "_append", interrupt_after_first)
+    with pytest.raises(KeyboardInterrupt):
+        engine._confirm(cfg)
+    first = Session.load(session.dir)
+    assert len([e for e in first.entries if e.get("type") == "confirmation_run"]) == 1
+    before = search._count_executed(first.entries)
+    captures = {
+        str(p.relative_to(session.dir)): p.read_bytes()
+        for p in (session.dir / "trials").rglob("*")
+        if p.is_file()
+    }
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda: hw)
+
+    def finish_confirmation(resumed: search._Engine) -> TuneOutcome:
+        resumed._establish_baseline()
+        resumed._finalizing = True
+        resumed._confirm(cfg)
+        return TuneOutcome(session_dir=resumed.session.dir, analysis={}, exit_code=0)
+
+    monkeypatch.setattr(search._Engine, "run", finish_confirmation)
+    assert search.resume_tuning(session.dir).exit_code == 0
+    loaded = Session.load(session.dir)
+    rows = [e for e in loaded.entries if e.get("type") == "confirmation_run"]
+    assert [e["run"] for e in rows] == [1, 2, 3]
+    assert search._count_executed(loaded.entries) == before + 2
+    assert all((session.dir / name).read_bytes() == data for name, data in captures.items())
+    assert search.resume_tuning(session.dir).exit_code == 0
+    after_second_resume = Session.load(session.dir)
+    assert [e for e in after_second_resume.entries if e.get("type") == "confirmation_run"] == rows
+    assert search._count_executed(after_second_resume.entries) == before + 2
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"status": "timeout"},
+        {"pp_mean": float("nan")},
+        {"tg_mean": 0.0},
+        {"thermally_contaminated": True},
+        {"confirmation_key": {}},
+        {"purpose": "revalidation"},
+    ],
+)
+def test_confirmation_reuse_rejects_invalid_or_foreign_evidence(
+    tmp_path: Path, fake_bin_dir: Path, tiny_gguf: Path, change: dict[str, Any]
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    engine = search._Engine(session, hw, model, llama, options)
+    cfg = _envelope_config(1)
+    row = {
+        "type": "confirmation_run",
+        "trial_id": cfg.trial_id,
+        "run": 1,
+        "confirmation_key": engine._confirmation_key(cfg),
+        "purpose": "confirmation",
+        "status": "ok",
+        "pp_mean": 100.0,
+        "tg_mean": 20.0,
+        "thermally_contaminated": False,
+    }
+    session.append(row)
+    assert engine._reusable_confirmations(cfg) == {1: (100.0, 20.0)}
+    session.append({**row, **change})
+    if "confirmation_key" in change or "purpose" in change:
+        assert engine._reusable_confirmations(cfg) == {1: (100.0, 20.0)}
+    else:
+        assert engine._reusable_confirmations(cfg) == {}
+    foreign = dataclasses.replace(llama, bench_sha256="different-build")
+    assert search._Engine(session, hw, model, foreign, options)._reusable_confirmations(cfg) == {}
+    engine._tuning_budget_enforced = False
+    assert engine._reusable_confirmations(cfg) == {}
+
+
+def test_confirmation_all_cached_needs_no_remaining_budget(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    engine = search._Engine(session, hw, model, llama, options)
+    engine._establish_baseline()
+    cfg = _envelope_config(1)
+    for index in range(1, options.baseline_runs + 1):
+        session.append(
+            {
+                "type": "confirmation_run",
+                "trial_id": cfg.trial_id,
+                "run": index,
+                "confirmation_key": engine._confirmation_key(cfg),
+                "purpose": "confirmation",
+                "status": "ok",
+                "pp_mean": 100.0,
+                "tg_mean": 20.0,
+            }
+        )
+    engine.executed_count = options.budget_trials
+    monkeypatch.setattr(engine, "_run_child", lambda **_kwargs: pytest.fail("cached run executed"))
+    result = engine._confirm(cfg)
+    assert result.pp is not None and result.tg is not None
+    assert engine.executed_count == options.budget_trials
+
+
+def test_confirmation_capture_allocation_preserves_previous_attempt(
+    tmp_path: Path, fake_bin_dir: Path, tiny_gguf: Path
+) -> None:
+    session, _, _, _, _ = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    first = session.confirmation_dir("trial", 1)
+    (first / "stdout.json").write_bytes(b"retained")
+    second = session.confirmation_dir("trial", 1)
+    assert second != first and second.is_dir()
+    assert (first / "stdout.json").read_bytes() == b"retained"
+    with pytest.raises(SessionPathError):
+        session.confirmation_dir("../../../outside", 1)

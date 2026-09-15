@@ -518,6 +518,12 @@ every countable execution entry, including stability reruns, thermal retries,
 pair checks, validation runs, and confirmation; restarting the engine therefore
 does not restore budget consumed by auxiliary measurements.
 
+Confirmation resume reuses only successful measurements with matching configuration,
+model fingerprint, benchmark/help hashes, workload, depth, and confirmation settings.
+Each new confirmation_run carries confirmation_key, purpose, and capture_dir.
+Records without that identity remain evidence and budget-counted but are not reused.
+Revalidation always measures again. New attempts use distinct capture directories.
+
 ## 13. Architecture
 
 ```
