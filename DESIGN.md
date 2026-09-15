@@ -708,7 +708,7 @@ versioned in `check_module_coverage.py`; experimental orchestration and quality
 evaluation modules are not used to weaken or average away this per-module
 gate.
 
-Dependencies: `typer<1`, `gguf<1` (numpy transitively). Dev: `pytest`,
+Dependencies: `typer>=0.27.0,<1`, `gguf>=0.19.0,<1` (numpy transitively). Dev: `pytest`,
 `pytest-cov`, `ruff`, `mypy`. Python >= 3.11.
 
 ## 17. Future work (post-v1)
