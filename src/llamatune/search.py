@@ -1355,6 +1355,7 @@ class _Engine:
         step_index = 0
         misses = 0
         started = self.executed_count
+        visited: set[str] = set()
         while misses < 2 and self.executed_count - started < 12 and self._can_execute():
             current = self.incumbent_config
             value = min(
@@ -1364,6 +1365,9 @@ class _Engine:
             if value == current.moe_cpu_layers:
                 break
             cfg = dataclasses.replace(current, moe_cpu_layers=value)
+            if cfg.trial_id in visited:
+                break
+            visited.add(cfg.trial_id)
             before = self.executed_count
             trial = self._evaluate(cfg, "joint_refine")
             improved = bool(
@@ -1387,10 +1391,9 @@ class _Engine:
                 misses = 0
                 step_index = min(step_index + 1, len(steps) - 1)
             else:
-                misses += 1
+                if self.executed_count > before:
+                    misses += 1
                 step_index = 0
-            if self.executed_count == before:
-                misses += 1
 
     def _probe(
         self,

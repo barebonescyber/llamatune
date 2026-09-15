@@ -1577,6 +1577,47 @@ def _envelope_config(ngl: int) -> TrialConfig:
     )
 
 
+@pytest.mark.parametrize("cached", [True, False])
+def test_hill_climb_moe_reaches_improvement_after_cache_replay(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cached: bool,
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    model = dataclasses.replace(model, moe=True, n_layer=32, ngl_all=33, expert_count=8)
+    engine = search._Engine(session, hw, model, llama, options)
+    cfg = _envelope_config(1)
+    metric = MetricStats(mean=100.0, stdev=0.0, cv=0.0, n=3)
+    engine.baseline = BaselineResult(
+        runs=3,
+        pp=metric,
+        tg=metric,
+        noise_floor_cv=0.01,
+        fallback=None,
+        resolved_defaults=cfg.to_dict(),
+    )
+    engine.incumbent_config = cfg
+    engine.incumbent_score = 1.0
+    visited: list[int] = []
+
+    def evaluate(candidate: TrialConfig, dim: str) -> search._Trial:
+        del dim
+        visited.append(candidate.moe_cpu_layers)
+        if not cached:
+            engine.executed_count += 1
+        score = {1: 1.2, 3: 1.1, 2: 1.3}.get(candidate.moe_cpu_layers, 1.0)
+        return search._Trial("ok", 100.0, 100.0, score)
+
+    monkeypatch.setattr(engine, "_evaluate", evaluate)
+    engine._hill_climb_moe(1)
+    assert visited[:3] == [1, 3, 2]
+    assert engine.incumbent_config.moe_cpu_layers == 2
+    assert len(visited) == len(set(visited))
+    assert engine.executed_count <= 12
+
+
 def test_required_context_validation_respects_exhausted_budget(
     tmp_path: Path,
     fake_bin_dir: Path,
