@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import signal
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -239,6 +240,62 @@ def test_one_failed_model_does_not_prevent_the_next_model(
     outcome = run_nightshift(_options(tmp_path, tmp_path))
     assert outcome.exit_code == 1
     assert [item["outcome"] for item in outcome.summary["items"]] == ["failed", "failed"]
+
+
+def test_three_model_failure_breaker_exits_one(
+    tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = inspect_model(tiny_gguf)
+    models = tuple(
+        DiscoveredModel(
+            path=tiny_gguf,
+            report=dataclasses.replace(original, fingerprint=f"model-{index}"),
+            shard_paths=(),
+            group_key=None,
+            representative=True,
+        )
+        for index in range(4)
+    )
+    _patch_foundation(monkeypatch, tmp_path, models[0])
+    monkeypatch.setattr(discovery, "discover_models", lambda *a, **k: models)
+    calls: list[Path] = []
+
+    def failed(session: Any, *args: object, **kwargs: object) -> TuneOutcome:
+        del args, kwargs
+        calls.append(session.dir)
+        return TuneOutcome(session_dir=session.dir, analysis={}, exit_code=3)
+
+    monkeypatch.setattr(search, "run_tuning", failed)
+    result = run_nightshift(_options(tmp_path, tmp_path))
+    assert result.exit_code == 1
+    assert len(calls) == 3
+    assert any("circuit breaker" in value for value in result.summary["warnings"])
+    assert result.summary["window"]["outcome"] == "failed"
+
+
+def test_first_user_signal_retains_exit_four(
+    tmp_path: Path, tiny_gguf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = DiscoveredModel(
+        path=tiny_gguf,
+        report=inspect_model(tiny_gguf),
+        shard_paths=(),
+        group_key=None,
+        representative=True,
+    )
+    _patch_foundation(monkeypatch, tmp_path, model)
+
+    def signal_then_finish(session: Any, *args: object, **kwargs: object) -> TuneOutcome:
+        del args, kwargs
+        handler = signal.getsignal(signal.SIGINT)
+        assert callable(handler)
+        handler(signal.SIGINT, None)
+        return TuneOutcome(session_dir=session.dir, analysis={}, exit_code=0)
+
+    monkeypatch.setattr(search, "run_tuning", signal_then_finish)
+    result = run_nightshift(_options(tmp_path, tmp_path))
+    assert result.exit_code == 4
+    assert result.summary["window"]["outcome"] == "interrupted"
 
 
 def test_consistent_calibration_does_not_retune(

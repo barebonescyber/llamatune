@@ -111,6 +111,10 @@ configuration error; `3` environment error (missing/unusable llama-bench,
 unreadable model); `4` interrupted or failed mid-run with a resumable
 session.
 
+Night Shift exits 4 for user interruption or an interrupted child session.
+The consecutive tune-failure circuit breaker exits 1 and records a failed window.
+A stop caused only by the work window ending is not a user interruption.
+
 An exit-3 tuning outcome is rendered as `tuning did not start`, with its
 failure stage, reason, and session evidence path. It is never described as a
 completed search with no confirmed improvement.
