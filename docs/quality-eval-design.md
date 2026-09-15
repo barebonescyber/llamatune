@@ -131,9 +131,13 @@ llamatune quality MODEL.gguf [options]
   against the §6 schema.
 - `--list-suites` — print bundled suite ids, task counts, and exit 0.
 - `--tasks GLOB` (repeatable) — filter task ids within selected suites.
-- `--exec` — enable the §7.1 execution sandbox tier for graders that
-  declare `requires_exec`. Off by default; without it those graders are
-  skipped and scored per §7.1.
+- `--exec`: Generated-code execution is temporarily disabled on every platform.
+  Passing `--exec` returns exit 2 before model discovery or run creation.
+  Resuming a run whose saved options enable execution also returns exit 2.
+  Quality evaluation without `--exec` remains available and skips `exec_python` graders.
+  The retained resource-limit runner is not a security boundary for untrusted code.
+  Re-enablement requires mandatory filesystem and network confinement, verified memory
+  limits, and adversarial tests. No reduced-isolation override is supported.
 - `--ctx-size N` (default 8192) — server context. When the config source
   records a validated context smaller than N, warn; needle tasks
   auto-scale to fit (§6.4). Values below a suite's `ctx_min` skip those
@@ -434,14 +438,17 @@ runner (§7.1), used solely by `exec_python`. Every grader records
 `{"grader": type, "passed": bool, "detail": str}` — grades must be
 explainable from evidence alone.
 
-### 7.1 Execution sandbox (`sandbox.py`) — opt-in tier
+### 7.1 Execution sandbox (`sandbox.py`): disabled pending verified confinement
 
-Disabled unless `--exec` is passed. When disabled, `exec_python` graders
-are **skipped**: the task is scored from its remaining graders and
-flagged `exec_skipped`; suite metrics report `exec_enabled` so scores
-with and without the tier are never silently conflated.
+Generated-code execution is temporarily disabled on every platform.
+Passing --exec returns exit 2 before model discovery or run creation.
+Resuming a run whose saved options enable execution also returns exit 2.
+Quality evaluation without --exec remains available and skips exec_python graders.
+The retained resource-limit runner is not a security boundary for untrusted code.
+Re-enablement requires mandatory filesystem and network confinement, verified memory
+limits, and adversarial tests. No reduced-isolation override is supported.
 
-When enabled, each `exec_python` grade runs as: write the extracted code
+Inactive implementation detail: When enabled, each `exec_python` grade runs as: write the extracted code
 plus the task's assert lines to `main.py` in a fresh temp directory;
 spawn `sys.executable -I -S -B main.py` via a dedicated sandbox runner
 with: argv-list execution (no shell), an **empty environment** except
@@ -457,8 +464,8 @@ generated code under the operator's own opt-in, not a security boundary
 against adversarial models. On Linux, when `unshare` with user+network
 namespaces is available, the runner additionally wraps the child in
 `unshare -rn` (probed once; absence degrades with a journal note). On
-Windows and platforms without `resource`, `--exec` exits 2 with a message
-naming the limitation (v1; §15).
+Windows and platforms without `resource`, `--exec` previously exited 2
+with a message naming the limitation.
 
 This tier is the sole, explicit amendment to the "model output is data,
 never executed" invariant — see §12.

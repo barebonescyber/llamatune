@@ -453,6 +453,10 @@ def _lossless(config: TrialConfig | None) -> TrialConfig | None:
 
 
 def _resolve(options: QualityOptions) -> _Resolved:
+    if options.exec_enabled:
+        from llamatune.sandbox import require_exec_isolation
+
+        require_exec_isolation()
     hardware = assess_hardware()
     llama = discover_llama(options.llama_bin)
     model = inspect_model(options.model_path)
