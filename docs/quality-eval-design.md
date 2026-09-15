@@ -734,8 +734,9 @@ exit 2 before model discovery or run creation, and Quality evaluation
 without it skips `exec_python` graders. The retained runner in §7.1 is
 inactive implementation detail, not a security boundary or an available
 execution path. Graders parse, match, and AST-inspect; agentic "tools" are
-pure JSON state transitions; nothing model-authored reaches a shell, an
-interpreter, or the filesystem.
+pure JSON state transitions; Quality never executes model-authored output or
+passes it to a shell or interpreter. Its confined QualityRun writer records
+bounded response data as FR-12 evidence.
 
 Unchanged and load-bearing: never `shell=True`; exactly one active child
 process at any moment (server or perplexity); bounded
