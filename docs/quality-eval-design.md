@@ -23,7 +23,7 @@ grades every response with auditable graders, and records a quality vector
 alongside full request/response evidence:
 
 - **coding** — coding correctness: self-contained programming tasks graded
-  by static checks and (opt-in) sandboxed execution of generated code;
+  by static checks; declared execution graders are currently skipped;
 - **tooluse** — tool-use quality: scripted single- and multi-turn tool-call
   scenarios grading call validity, tool selection, and argument accuracy;
 - **agentic** — agentic evaluation: multi-step goal tasks against a
@@ -68,12 +68,12 @@ Concurrent requests (strictly serial — one in-flight request, one child
 process at a time, ever); sampling-parameter sweeps (temperature/seed are
 fixed for determinism; sweeps are future work §15); native OpenAI `tools`
 API usage (v1 uses the prompt-embedded protocol §6.2 for
-build-independence); executing model-generated code by default (execution
-is the opt-in §7.1 sandbox tier only); network access beyond the loopback
+build-independence); executing model-generated code (temporarily disabled
+per §7.1); network access beyond the loopback
 server (hard requirement, §12); downloading suites, models, or corpora;
 judging by another LLM (all graders are deterministic code); Elo or
-cross-run statistical modeling; Windows support for the execution sandbox
-(graders degrade per §7.1).
+cross-run statistical modeling; re-enabling execution support on Windows
+(§7.1).
 
 ## 2. Definitions
 
@@ -90,8 +90,9 @@ cross-run statistical modeling; Windows support for the execution sandbox
   task scores plus suite-specific rates (§7.2).
 - **Evaluated configuration**: the exact `TrialConfig` (or defaults =
   `None`) mapped to `llama-server` flags for the run (§4.2).
-- **Exec tier**: the opt-in sandboxed execution of model-generated code
-  (§7.1), enabled only by `--exec`.
+- **Exec tier**: the retained, inactive resource-limit runner for
+  model-generated code (§7.1). `--exec` is currently refused on every
+  platform.
 - **Simulated environment**: the deterministic state machine an agentic
   task defines (§6.3); tool calls mutate JSON state via declarative
   effects; nothing outside the harness process is touched.
@@ -129,7 +130,8 @@ llamatune quality MODEL.gguf [options]
   `perplexity`) — bundled suite name (`coding`, `tooluse`, `agentic`,
   `ifollow`, `perplexity`) or a path to a user task file validated
   against the §6 schema.
-- `--list-suites` — print bundled suite ids, task counts, and exit 0.
+- `--list-suites`: print bundled suite ids, task counts, and exit 0 unless
+  the disabled `--exec` option is also passed, which exits 2.
 - `--tasks GLOB` (repeatable) — filter task ids within selected suites.
 - `--exec`: Generated-code execution is temporarily disabled on every platform.
   Passing `--exec` returns exit 2 before model discovery or run creation.
@@ -171,7 +173,7 @@ options) exit 2 with a one-line `error:` message.
 - `0` — run completed; every selected task was graded (pass **and** fail
   are both valid grades — scores are data, not success criteria).
 - `1` — run completed but at least one task ended `error` (harness-level:
-  request timeout, malformed server reply, sandbox failure) or a suite
+  request timeout, malformed server reply, or another grader failure) or a suite
   was skipped after server relaunch failure (§5.3); evidence and reports
   are still written.
 - `2` — usage or configuration error.
@@ -320,13 +322,13 @@ suite; the schema is language-open), `graders`: ordered list of
 | `defines` | `name`, `kind: function\|class` | AST contains the definition |
 | `signature` | `name`, `params: [..]` | definition's parameters match exactly |
 | `contains_regex` / `absent_regex` | `pattern` | regex over the extracted code |
-| `exec_python` | `tests` (assert lines), `requires_exec: true` | §7.1 sandbox: run code + tests; all asserts pass |
+| `exec_python` | `tests` (assert lines), `requires_exec: true` | Execution disabled: skipped with a recorded reason |
 
 Task score: all listed graders are conjunctive gates except those marked
 `"partial": true`, which contribute fractionally (`score = passed_weight /
 total_weight` over partial graders, gated by the conjunctive ones).
-Grading never imports or evaluates model output in-process — `exec_python`
-is the only execution path and it exists solely inside the §7.1 sandbox.
+Grading never imports or evaluates model output in-process. No execution
+path is active; `exec_python` is skipped while §7.1 remains disabled.
 
 ### 6.2 `tooluse` tasks and the embedded tool protocol
 
@@ -448,27 +450,28 @@ The retained resource-limit runner is not a security boundary for untrusted code
 Re-enablement requires mandatory filesystem and network confinement, verified memory
 limits, and adversarial tests. No reduced-isolation override is supported.
 
-Inactive implementation detail: When enabled, each `exec_python` grade runs as: write the extracted code
-plus the task's assert lines to `main.py` in a fresh temp directory;
-spawn `sys.executable -I -S -B main.py` via a dedicated sandbox runner
+Inactive implementation detail: The retained resource-limit runner writes
+the extracted code plus the task's assert lines to `main.py` in a fresh temp
+directory; it would spawn `sys.executable -I -S -B main.py` via a dedicated sandbox runner
 with: argv-list execution (no shell), an **empty environment** except
 `PATH` to the interpreter's directory, cwd = the temp dir,
 `start_new_session` + group kill semantics (executor §7 discipline),
 RLIMIT_CPU 10 s (wall cap 30 s), RLIMIT_AS 512 MiB, RLIMIT_FSIZE 1 MiB,
 RLIMIT_NOFILE 32, RLIMIT_CORE 0, stdout/stderr capped at 64 KiB. Pass =
-exit 0. The temp directory is removed afterward.
+exit 0. The temp directory would be removed afterward. No shipped entry
+point invokes this runner while execution is disabled.
 
-Honest limits (documented in README and report): POSIX rlimits do not
-block network syscalls; the sandbox is an *accident barrier* for locally
-generated code under the operator's own opt-in, not a security boundary
-against adversarial models. On Linux, when `unshare` with user+network
-namespaces is available, the runner additionally wraps the child in
-`unshare -rn` (probed once; absence degrades with a journal note). On
-Windows and platforms without `resource`, `--exec` previously exited 2
-with a message naming the limitation.
+Inactive historical limitation: POSIX rlimits do not block network
+syscalls. The retained runner was an *accident barrier* for locally
+generated code, not a security boundary against adversarial models. On
+Linux, when `unshare` with user+network namespaces is available, the
+retained runner wraps its child in `unshare -rn` (probed once; absence
+degrades with a journal note). On Windows and platforms without `resource`,
+the prior implementation returned exit 2 with a message naming the
+limitation.
 
-This tier is the sole, explicit amendment to the "model output is data,
-never executed" invariant — see §12.
+No execution tier currently amends the "model output is data, never
+executed" invariant. See §12.
 
 ### 7.2 Aggregation
 
@@ -495,11 +498,11 @@ the Results Matrix ingests (results-matrix §4.3).
 
 ## 8. Interruption and signals
 
-First `SIGINT`/`SIGTERM`: stop flag; the in-flight request (or sandbox
-child) finishes or times out, the current task journals its state,
+First `SIGINT`/`SIGTERM`: stop flag; the in-flight request finishes or
+times out, the current task journals its state,
 `quality.json` and the report are written from graded work, the server is
 stopped, exit 4. Second signal: process-group termination of the child
-(server or sandbox), `interrupted` journal entry, evidence remains
+(server only), `interrupted` journal entry, evidence remains
 resumable. No signal path may orphan the server: `stop` runs in a
 `finally` on every exit route, and the process-group kill covers escapes.
 
@@ -606,7 +609,7 @@ src/llamatune/
   qualsuites.py     # §6  — schema, loading, validation, suite_id, bundled
                     #       suite access, haystack generation (pure + pkg data)
   qualscore.py      # §7  — graders, extraction rules, aggregation (pure)
-  sandbox.py        # §7.1 — opt-in exec runner (process mgmt only)
+  sandbox.py        # §7.1: retained inactive exec runner (process mgmt only)
   qualserver.py     # §5  — ServerHandle lifecycle + loopback HTTP client
   qualityreport.py  # §11.4 — quality-report.md rendering from quality.json
   quality.py        # §§4, 8, 9 — QualityRun writer, phases, resume,
@@ -625,9 +628,10 @@ tests/
 Layering (extends DESIGN §13): `qualsuites` and `qualscore` import
 nothing above stdlib + `types` and never touch processes or the network
 (`qualsuites` reads only its package data and given task paths;
-`qualscore` receives the exec runner as an injected callable);
-`sandbox` manages exactly one child process with executor-grade
-discipline and no parsing of benchmark semantics; `qualserver` owns the
+`qualscore` receives the retained exec runner as an injected callable);
+the retained `sandbox` implementation manages at most one child process
+with executor-grade discipline and no parsing of benchmark semantics, but
+no shipped entry point invokes it; `qualserver` owns the
 server child and the loopback client and writes only via `QualityRun`
 handles passed in; `qualityreport` renders strings from dicts, no I/O;
 `quality` orchestrates and owns the only writer for its run directory;
@@ -677,7 +681,7 @@ qualscore.grade_task(task: dict, responses: tuple[str, ...],
     -> TaskGrade
 qualscore.aggregate(kind: str, grades: tuple[TaskGrade, ...],
                     *, exec_enabled: bool) -> dict[str, float]
-sandbox.run_python(code: str, *, timeout_s: float) -> ExecVerdict
+sandbox.run_python(code: str, *, timeout_s: float) -> ExecVerdict  # inactive: raises
 qualserver.start(run: QualityRun, argv: tuple[str, ...],
                  *, start_timeout_s: float) -> ServerHandle
 ServerHandle.chat(messages, *, max_tokens, seed,
@@ -717,7 +721,7 @@ quality` invocation and server argv). Rendering consumes only
 
 ## 12. Safety invariants
 
-All of DESIGN §14 unchanged, with two explicit, narrow amendments:
+All of DESIGN §14 remains unchanged except for the loopback exception:
 
 1. **Loopback exception to "no network"**: `quality` communicates over
    HTTP exclusively with the `llama-server` child it launched, on literal
@@ -725,16 +729,16 @@ All of DESIGN §14 unchanged, with two explicit, narrow amendments:
    or interface is ever contacted; the client contains no redirect
    following and ignores proxy environment variables. The no-network
    invariant remains in force for everything else.
-2. **Sandboxed-execution exception to "model output is data, never
-   executed"**: model-generated code is executed only inside the §7.1
-   sandbox, only for graders declaring `requires_exec`, and only when the
-   operator passes `--exec`. Everywhere else the original invariant is
-   untouched — graders parse, match, and AST-inspect; agentic "tools" are
-   pure JSON state transitions; nothing model-authored reaches a shell,
-   an interpreter, or the filesystem outside the sandbox temp directory.
+No generated-code execution exception is active. Passing `--exec` returns
+exit 2 before model discovery or run creation, and Quality evaluation
+without it skips `exec_python` graders. The retained runner in §7.1 is
+inactive implementation detail, not a security boundary or an available
+execution path. Graders parse, match, and AST-inspect; agentic "tools" are
+pure JSON state transitions; nothing model-authored reaches a shell, an
+interpreter, or the filesystem.
 
-Unchanged and load-bearing: never `shell=True`; exactly one child process
-at any moment (server, perplexity, or sandbox — never two); bounded
+Unchanged and load-bearing: never `shell=True`; exactly one active child
+process at any moment (server or perplexity); bounded
 captures everywhere; writes confined to the run directory; no
 system-state mutation; no credentials or environment values in evidence;
 suites, corpora, and models are never downloaded.
@@ -769,8 +773,9 @@ suites with known-correct and known-wrong answers.
   goal subset, step caps, invalid-call accounting) as pure state tests;
   ifollow constraints incl. JSON schema subset; aggregation math and
   worst-of-reps; `exec_skipped` scoring path.
-- Sandbox: rlimit assembly, empty-env allowlist, timeout kill and group
-  reap (tiny scripts), verdict fields, unavailable-platform error path.
+- Sandbox: retained rlimit assembly, empty-env allowlist, timeout kill and
+  group reap (tiny scripts), verdict fields, unavailable-platform error
+  path, and shipped entry-point refusal before any runner activity.
 - Server: port selection, readiness polling with fake clock, §5.3
   relaunch-once policy, bounded response reads, loopback-literal
   assertion (the client refuses non-127.0.0.1 by construction), stop
@@ -778,7 +783,7 @@ suites with known-correct and known-wrong answers.
 - Report: §11.4 structural assertions from a canned `quality.json`,
   including comparison and degradation-warning rendering.
 - CLI: validation exits (unknown suite, corpus missing for perplexity,
-  conflicting config flags, `--exec` on unsupported platform), option
+  conflicting config flags, disabled `--exec` on every platform), option
   assembly, `--list-suites`, `--dry-run` plan content.
 
 ### 13.3 Integration (fake server + tiny GGUFs, no GPU, no network)
@@ -789,9 +794,9 @@ suites with known-correct and known-wrong answers.
 2. Mixed script (some wrong, one malformed reply) → exit 1; wrong
    answers graded 0 with grader details; malformed reply is task
    `error`; aggregation and pass rates correct.
-3. `--exec` with a passing and a failing `exec_python` task (real
-   sandboxed `python -I`) → exec grades recorded; without `--exec` the
-   same tasks report `exec_skipped` and `exec_enabled: false`.
+3. `--exec` → exit 2 before model discovery or run creation; without
+   `--exec`, `exec_python` graders report `exec_skipped` and
+   `exec_enabled: false`.
 4. `DIE_AFTER_N` mid-suite → one relaunch, task retried, run completes;
    a second scripted death marks remaining suite tasks
    `server_unavailable`, exit 1.
@@ -811,10 +816,10 @@ suites with known-correct and known-wrong answers.
 
 README gains a "Quality evaluation" section: what each suite measures,
 the suite-relative-score caveat, config sources, the lossy-comparison
-workflow, `--exec` and its honest limits, one worked example, evidence
-layout, and how results surface in the Results Matrix. DESIGN.md is not
-modified; this document is the Quality Evaluation spec, and §12's two
-amendments are recorded here.
+workflow, the disabled `--exec` policy and inactive retained runner, one
+worked example, evidence layout, and how results surface in the Results
+Matrix. DESIGN.md is not modified; this document is the Quality Evaluation
+spec, and §12's loopback exception is recorded here.
 
 ## 15. Future work (post-v1)
 
@@ -847,10 +852,10 @@ Functional:
 - FR-6 Task, suite, and overall aggregation follow §7.2, including
   worst-of-reps, `unstable`, skip exclusion, and `exec_enabled`
   visibility.
-- FR-7 Without `--exec`, no model output is ever executed and
-  `exec_python` graders are skipped with recorded reasons.
-- FR-8 With `--exec`, execution occurs only in the §7.1 sandbox with the
-  full rlimit/isolation set; unsupported platforms exit 2 up front.
+- FR-7 No model output is ever executed, and `exec_python` graders are
+  skipped with recorded reasons.
+- FR-8 Passing `--exec` returns exit 2 before model discovery or run
+  creation on every platform.
 - FR-9 Agentic environments are pure JSON state machines; goal,
   efficiency, and invalid-call grading follow §6.3.
 - FR-10 `quality-report.md` renders per §11.4 from `quality.json` alone.
@@ -887,6 +892,6 @@ Non-functional:
 - NFR-6 No modifications to `search.py`, `bench.py`, `stats.py`,
   `calibrate.py`, or any engine module; `executor.py` may gain additive
   public helpers only when required by the documented interface.
-- NFR-7 The §12 amendments are the only relaxations of DESIGN §14, and
-  both are inert unless the operator invokes `quality` (and, for
-  execution, passes `--exec`).
+- NFR-7 The §12 loopback exception is the only relaxation of DESIGN §14
+  and is inert unless the operator invokes `quality`. No Quality invocation
+  activates a model-output execution exception.

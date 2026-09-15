@@ -213,6 +213,14 @@ def test_quality_exec_is_rejected_before_run_creation(tmp_path: Path) -> None:
     assert not (tmp_path / "quality").exists()
 
 
+def test_quality_exec_is_rejected_with_list_suites() -> None:
+    result = runner.invoke(app, ["quality", "--list-suites", "--exec"])
+
+    assert result.exit_code == 2
+    assert "generated-code execution is disabled" in result.stderr
+    assert result.stdout == ""
+
+
 def test_quality_resume_wiring_and_conflicts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
