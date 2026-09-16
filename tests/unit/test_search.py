@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import errno
 import json
+import os
 import signal
 import sys
 from pathlib import Path
@@ -14,7 +15,7 @@ import pytest
 
 from llamatune import bench, config, executor, search
 from llamatune.bench import BenchParseError
-from llamatune.llama import discover_llama
+from llamatune.llama import discover_llama, hash_binary
 from llamatune.model import inspect_model
 from llamatune.session import Session, SessionPathError
 from llamatune.types import (
@@ -3220,3 +3221,190 @@ def test_revalidation_records_live_identity_after_baseline_restore(
     assert len(new_rows) == 3
     assert all(row["purpose"] == "revalidation" for row in new_rows)
     assert all(row["confirmation_key"]["bench_sha256"] == rebuilt.bench_sha256 for row in new_rows)
+
+
+def test_public_default_discovery_binds_confirmation_and_retry_to_live_build(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench_name = "llama-bench.cmd" if sys.platform == "win32" else "llama-bench"
+    old_bin = tmp_path / "old-bin"
+    fresh_bin = tmp_path / "fresh-bin"
+    old_bin.mkdir()
+    fresh_bin.mkdir()
+    source = fake_bin_dir / bench_name
+    old_path = old_bin / bench_name
+    fresh_path = fresh_bin / bench_name
+    old_path.write_bytes(source.read_bytes())
+    fresh_path.write_bytes(source.read_bytes() + b"\n# different build\n")
+    if sys.platform != "win32":
+        old_path.chmod(0o755)
+        fresh_path.chmod(0o755)
+
+    hw = _hardware()
+    saved_llama = discover_llama(old_bin)
+    model = inspect_model(tiny_gguf)
+    options = dataclasses.replace(
+        _options(tmp_path / "sessions", old_bin, budget_trials=60, observe_vram=True),
+        llama_bin=None,
+    )
+    session = Session.create(
+        options.sessions_dir,
+        model=model,
+        hardware=hw,
+        llama=saved_llama,
+        options=options,
+        argv=["llamatune", "tune", str(tiny_gguf)],
+    )
+    assert options.llama_bin is None
+    assert discover_llama(fresh_bin).help_sha256 == saved_llama.help_sha256
+    assert discover_llama(fresh_bin).bench_sha256 != saved_llama.bench_sha256
+
+    initial = search.run_tuning(session, hw, model, saved_llama, options)
+    assert initial.exit_code == 0
+    old_rows = _confirmation_rows(session.dir)
+    journal_prefix = (session.dir / "journal.jsonl").read_bytes()
+    metadata = (session.dir / "llamacpp.json").read_bytes()
+    captures = {
+        str(path.relative_to(session.dir)): path.read_bytes()
+        for path in (session.dir / "trials").rglob("*")
+        if path.is_file()
+    }
+    entries_before = Session.load(session.dir).entries
+    count_before = search._count_executed(entries_before)
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda: hw)
+    monkeypatch.setattr("llamatune.hardware.sample_gpu_states", lambda: ())
+    monkeypatch.setenv("PATH", str(fresh_bin) + os.pathsep + os.defpath)
+
+    original_child = search._Engine._run_child
+    original_load = search._Engine._load_baseline_stage
+    restored: list[tuple[Path, Path]] = []
+    confirmation_argv: list[tuple[str, ...]] = []
+    contaminate_next_primary = True
+
+    def observe_child(
+        engine: search._Engine, **kwargs: Any
+    ) -> tuple[executor.ExecResult, search._RunObservation]:
+        nonlocal contaminate_next_primary
+        result, observation = original_child(engine, **kwargs)
+        if kwargs["kind"] not in {"confirm", "confirmation"}:
+            return result, observation
+        argv = kwargs["argv"]
+        confirmation_argv.append(argv)
+        if kwargs["run_id"].endswith("-thermal-retry"):
+            return result, search._RunObservation(None, None, (_gpu_sample(70.0),))
+        if contaminate_next_primary:
+            contaminate_next_primary = False
+            return result, search._RunObservation(None, None, (_gpu_sample(90.0),))
+        return result, search._RunObservation(None, None, ())
+
+    def observe_load(engine: search._Engine, stage: dict[str, Any]) -> None:
+        discovered = engine.llama.bench_path
+        original_load(engine, stage)
+        restored.append((discovered, engine.llama.bench_path))
+
+    monkeypatch.setattr(search._Engine, "_run_child", observe_child)
+    monkeypatch.setattr(search._Engine, "_load_baseline_stage", observe_load)
+    monkeypatch.setattr(
+        search,
+        "_detect_gpu_throttle",
+        lambda samples: bool(samples and samples[0].temperature_c == 90.0),
+    )
+
+    live_llama = discover_llama()
+    resumed = search.resume_tuning(session.dir)
+    resumed_rows = _confirmation_rows(session.dir)[len(old_rows) :]
+    entries_after_resume = Session.load(session.dir).entries
+    count_after_resume = search._count_executed(entries_after_resume)
+    resumed_pair_checks = [
+        entry
+        for entry in entries_after_resume[len(entries_before) :]
+        if entry.get("type") == "pair_check"
+    ]
+
+    assert live_llama.bench_path == fresh_path
+    assert restored == [(fresh_path, old_path)]
+    assert resumed.exit_code == 0
+    assert len(resumed_rows) == options.baseline_runs
+    assert len(resumed_pair_checks) == 2
+    assert count_after_resume == count_before + len(confirmation_argv) + len(resumed_pair_checks)
+    assert all(
+        row["confirmation_key"]["bench_sha256"] == live_llama.bench_sha256 for row in resumed_rows
+    )
+    assert all(Path(argv[0]) == fresh_path for argv in confirmation_argv)
+    assert all(
+        row["confirmation_key"]["bench_sha256"]
+        == hash_binary(
+            Path(
+                json.loads((session.dir / row["capture_dir"] / "command.json").read_text())["argv"][
+                    0
+                ]
+            )
+        )
+        for row in resumed_rows
+    )
+    retry_commands = list((session.dir / "trials").glob("*/confirm-1*/thermal-retry/command.json"))
+    assert len(retry_commands) == 1
+    assert Path(json.loads(retry_commands[0].read_text())["argv"][0]) == fresh_path
+    assert (
+        hash_binary(Path(json.loads(retry_commands[0].read_text())["argv"][0]))
+        == live_llama.bench_sha256
+    )
+    assert (
+        len(
+            [
+                entry
+                for entry in Session.load(session.dir).entries
+                if entry.get("type") == "thermal_retry" and entry.get("run_kind") == "confirmation"
+            ]
+        )
+        == 1
+    )
+    assert _confirmation_rows(session.dir)[: len(old_rows)] == old_rows
+    assert (session.dir / "journal.jsonl").read_bytes().startswith(journal_prefix)
+    assert (session.dir / "llamacpp.json").read_bytes() == metadata
+    assert all((session.dir / path).read_bytes() == data for path, data in captures.items())
+
+    confirmation_argv.clear()
+    second_resume = search.resume_tuning(session.dir)
+    entries_after_second_resume = Session.load(session.dir).entries
+    second_resume_pair_checks = [
+        entry
+        for entry in entries_after_second_resume[len(entries_after_resume) :]
+        if entry.get("type") == "pair_check"
+    ]
+    assert second_resume.exit_code == 0
+    assert _confirmation_rows(session.dir) == old_rows + resumed_rows
+    assert len(second_resume_pair_checks) == 2
+    assert search._count_executed(entries_after_second_resume) == count_after_resume + len(
+        second_resume_pair_checks
+    )
+    assert confirmation_argv == []
+
+    contaminate_next_primary = True
+    confirmation_argv.clear()
+    before_revalidation = len(_confirmation_rows(session.dir))
+    revalidated = search.revalidate_session(session.dir)
+    revalidation_rows = _confirmation_rows(session.dir)[before_revalidation:]
+
+    assert revalidated.exit_code == 0
+    assert len(revalidation_rows) == options.baseline_runs
+    assert all(row["purpose"] == "revalidation" for row in revalidation_rows)
+    assert all(
+        row["confirmation_key"]["bench_sha256"] == live_llama.bench_sha256
+        for row in revalidation_rows
+    )
+    assert all(Path(argv[0]) == fresh_path for argv in confirmation_argv)
+    assert all(
+        row["confirmation_key"]["bench_sha256"]
+        == hash_binary(
+            Path(
+                json.loads((session.dir / row["capture_dir"] / "command.json").read_text())["argv"][
+                    0
+                ]
+            )
+        )
+        for row in revalidation_rows
+    )

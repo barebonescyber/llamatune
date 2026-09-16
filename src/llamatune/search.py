@@ -3151,7 +3151,7 @@ class _Engine:
                     self._emit("warning", message=warning)
                 return _Confirm(False, None, None, 0.0)
             argv = bench.build_bench_argv(
-                bench_path=self.llama.bench_path,
+                bench_path=self.execution_llama.bench_path,
                 model_path=self.model.path,
                 pp=self.options.pp,
                 tg=self.options.tg,
