@@ -385,6 +385,7 @@ class _Engine:
         self.hardware = hardware
         self.model = model
         self.llama = llama
+        self.execution_llama = llama
         self.options = options
         self.reporter = reporter
         self.calibration = calibration
@@ -3069,8 +3070,8 @@ class _Engine:
         return {
             "config": config.to_dict(),
             "model_fingerprint": self.model.fingerprint,
-            "bench_sha256": self.llama.bench_sha256,
-            "help_sha256": self.llama.help_sha256,
+            "bench_sha256": self.execution_llama.bench_sha256,
+            "help_sha256": self.execution_llama.help_sha256,
             "pp": self.options.pp,
             "tg": self.options.tg,
             "depth": self.options.depth,
@@ -3079,7 +3080,7 @@ class _Engine:
         }
 
     def _reusable_confirmations(self, config: TrialConfig) -> dict[int, tuple[float, float]]:
-        if not self._tuning_budget_enforced or self.llama.bench_sha256 is None:
+        if not self._tuning_budget_enforced or self.execution_llama.bench_sha256 is None:
             return {}
         key = self._confirmation_key(config)
         latest: dict[int, dict[str, Any]] = {}

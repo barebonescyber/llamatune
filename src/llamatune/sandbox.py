@@ -191,7 +191,7 @@ def terminate_active() -> bool:
 
 
 def run_python(code: str, *, timeout_s: float) -> ExecVerdict:
-    """Execute Python with bounded POSIX resources and process-group cleanup."""
+    """Unconditionally refuse execution; retained sandbox mechanics are inactive."""
     require_exec_isolation()
     if os.name != "posix" or _resource is None:
         raise RuntimeError("Python execution sandbox requires POSIX resource limits")

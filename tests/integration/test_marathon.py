@@ -363,9 +363,14 @@ def test_reentry_retains_mismatched_unfinished_run(tmp_path: Path) -> None:
     assert mismatches == (run.dir,)
 
 
-def test_journal_reader_ignores_non_records_and_stops_at_torn_tail(tmp_path: Path) -> None:
+def test_journal_reader_recovers_from_non_records_and_invalid_json(tmp_path: Path) -> None:
     (tmp_path / "journal.jsonl").write_text('1\n{"type":"phase"}\n{"torn"')
-    assert _entries(tmp_path) == [{"type": "phase"}]
+    with pytest.warns(RuntimeWarning) as warnings:
+        assert _entries(tmp_path) == [{"type": "phase"}]
+    assert [str(warning.message) for warning in warnings] == [
+        "journal.jsonl line 1: non-object record ignored",
+        "journal.jsonl line 3: invalid JSON ignored",
+    ]
     assert _entries(tmp_path / "absent") == []
 
 
