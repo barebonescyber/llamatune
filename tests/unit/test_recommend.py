@@ -341,8 +341,29 @@ class TestRecommendedSh:
         assert "--no-kv-offload" in text
         assert "-ctk q8_0" in text
         assert "-ctv q8_0" in text
-        assert f"llama-server -m {_model().path}" in text
-        assert f"llama-cli -m {_model().path}" in text
+        expected_runtime_flags = [
+            "-ngl",
+            "33",
+            "-b",
+            "2048",
+            "-ub",
+            "512",
+            "-t",
+            "8",
+            "--n-cpu-moe",
+            "24",
+            "-fa",
+            "on",
+            "--no-mmap",
+            "--no-kv-offload",
+            "-ctk",
+            "q8_0",
+            "-ctv",
+            "q8_0",
+        ]
+        for program in ("llama-server", "llama-cli"):
+            line = next(line[2:] for line in text.splitlines() if line.startswith(f"# {program} "))
+            assert shlex.split(line) == [program, "-m", str(_model().path), *expected_runtime_flags]
         # Reference only: every content line is commented out.
         for line in text.splitlines():
             assert line == "" or line.startswith("#")

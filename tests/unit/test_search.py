@@ -3056,7 +3056,7 @@ def _rebuild_fake_bench(fake_bin_dir: Path) -> LlamaCppReport:
     bench_path = fake_bin_dir / ("llama-bench.cmd" if sys.platform == "win32" else "llama-bench")
     previous = discover_llama(fake_bin_dir)
     comment = (
-        b"\r\nREM rebuilt without help changes\r\n"
+        b"\r\n@REM rebuilt without help changes\r\n"
         if sys.platform == "win32"
         else b"\n# rebuilt without help changes\n"
     )
