@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import errno
 import json
+import os
 import signal
 import sys
 from pathlib import Path
@@ -14,7 +15,7 @@ import pytest
 
 from llamatune import bench, config, executor, search
 from llamatune.bench import BenchParseError
-from llamatune.llama import discover_llama
+from llamatune.llama import discover_llama, hash_binary
 from llamatune.model import inspect_model
 from llamatune.session import Session, SessionPathError
 from llamatune.types import (
@@ -1577,6 +1578,47 @@ def _envelope_config(ngl: int) -> TrialConfig:
     )
 
 
+@pytest.mark.parametrize("cached", [True, False])
+def test_hill_climb_moe_reaches_improvement_after_cache_replay(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cached: bool,
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    model = dataclasses.replace(model, moe=True, n_layer=32, ngl_all=33, expert_count=8)
+    engine = search._Engine(session, hw, model, llama, options)
+    cfg = _envelope_config(1)
+    metric = MetricStats(mean=100.0, stdev=0.0, cv=0.0, n=3)
+    engine.baseline = BaselineResult(
+        runs=3,
+        pp=metric,
+        tg=metric,
+        noise_floor_cv=0.01,
+        fallback=None,
+        resolved_defaults=cfg.to_dict(),
+    )
+    engine.incumbent_config = cfg
+    engine.incumbent_score = 1.0
+    visited: list[int] = []
+
+    def evaluate(candidate: TrialConfig, dim: str) -> search._Trial:
+        del dim
+        visited.append(candidate.moe_cpu_layers)
+        if not cached:
+            engine.executed_count += 1
+        score = {1: 1.2, 3: 1.1, 2: 1.3}.get(candidate.moe_cpu_layers, 1.0)
+        return search._Trial("ok", 100.0, 100.0, score)
+
+    monkeypatch.setattr(engine, "_evaluate", evaluate)
+    engine._hill_climb_moe(1)
+    assert visited[:3] == [1, 3, 2]
+    assert engine.incumbent_config.moe_cpu_layers == 2
+    assert len(visited) == len(set(visited))
+    assert engine.executed_count <= 12
+
+
 def test_required_context_validation_respects_exhausted_budget(
     tmp_path: Path,
     fake_bin_dir: Path,
@@ -2841,3 +2883,543 @@ def test_thermal_cooldown_honors_clock_throttle_while_gpu_is_cool(
     assert len(pauses) == 6
     assert all(entry["reason"] == "throttle" for entry in pauses)
     assert pauses[-1]["cap_reached"] is True
+
+
+@pytest.mark.parametrize("budget", [6, 60])
+def test_confirmation_interrupt_resume_does_not_repeat_completed_runs(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    budget: int,
+) -> None:
+    session, hw, model, llama, options = _setup(
+        tmp_path, fake_bin_dir, tiny_gguf, budget_trials=budget
+    )
+    engine = search._Engine(session, hw, model, llama, options)
+    engine._establish_baseline()
+    engine._finalizing = True
+    cfg = _envelope_config(1)
+    append = engine._append
+
+    def interrupt_after_first(record: dict[str, Any]) -> None:
+        append(record)
+        if record.get("type") == "confirmation_run":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(engine, "_append", interrupt_after_first)
+    with pytest.raises(KeyboardInterrupt):
+        engine._confirm(cfg)
+    first = Session.load(session.dir)
+    assert len([e for e in first.entries if e.get("type") == "confirmation_run"]) == 1
+    before = search._count_executed(first.entries)
+    captures = {
+        str(p.relative_to(session.dir)): p.read_bytes()
+        for p in (session.dir / "trials").rglob("*")
+        if p.is_file()
+    }
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda: hw)
+
+    def finish_confirmation(resumed: search._Engine) -> TuneOutcome:
+        resumed._establish_baseline()
+        resumed._finalizing = True
+        resumed._confirm(cfg)
+        return TuneOutcome(session_dir=resumed.session.dir, analysis={}, exit_code=0)
+
+    monkeypatch.setattr(search._Engine, "run", finish_confirmation)
+    assert search.resume_tuning(session.dir).exit_code == 0
+    loaded = Session.load(session.dir)
+    rows = [e for e in loaded.entries if e.get("type") == "confirmation_run"]
+    assert [e["run"] for e in rows] == [1, 2, 3]
+    assert search._count_executed(loaded.entries) == before + 2
+    assert all((session.dir / name).read_bytes() == data for name, data in captures.items())
+    assert search.resume_tuning(session.dir).exit_code == 0
+    after_second_resume = Session.load(session.dir)
+    assert [e for e in after_second_resume.entries if e.get("type") == "confirmation_run"] == rows
+    assert search._count_executed(after_second_resume.entries) == before + 2
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"status": "timeout"},
+        {"pp_mean": float("nan")},
+        {"tg_mean": 0.0},
+        {"thermally_contaminated": True},
+        {"confirmation_key": {}},
+        {"purpose": "revalidation"},
+    ],
+)
+def test_confirmation_reuse_rejects_invalid_or_foreign_evidence(
+    tmp_path: Path, fake_bin_dir: Path, tiny_gguf: Path, change: dict[str, Any]
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    engine = search._Engine(session, hw, model, llama, options)
+    cfg = _envelope_config(1)
+    row = {
+        "type": "confirmation_run",
+        "trial_id": cfg.trial_id,
+        "run": 1,
+        "confirmation_key": engine._confirmation_key(cfg),
+        "purpose": "confirmation",
+        "status": "ok",
+        "pp_mean": 100.0,
+        "tg_mean": 20.0,
+        "thermally_contaminated": False,
+    }
+    session.append(row)
+    assert engine._reusable_confirmations(cfg) == {1: (100.0, 20.0)}
+    session.append({**row, **change})
+    if "confirmation_key" in change or "purpose" in change:
+        assert engine._reusable_confirmations(cfg) == {1: (100.0, 20.0)}
+    else:
+        assert engine._reusable_confirmations(cfg) == {}
+    foreign = dataclasses.replace(llama, bench_sha256="different-build")
+    assert search._Engine(session, hw, model, foreign, options)._reusable_confirmations(cfg) == {}
+    engine._tuning_budget_enforced = False
+    assert engine._reusable_confirmations(cfg) == {}
+
+
+def test_confirmation_all_cached_needs_no_remaining_budget(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, model, llama, options = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    engine = search._Engine(session, hw, model, llama, options)
+    engine._establish_baseline()
+    cfg = _envelope_config(1)
+    for index in range(1, options.baseline_runs + 1):
+        session.append(
+            {
+                "type": "confirmation_run",
+                "trial_id": cfg.trial_id,
+                "run": index,
+                "confirmation_key": engine._confirmation_key(cfg),
+                "purpose": "confirmation",
+                "status": "ok",
+                "pp_mean": 100.0,
+                "tg_mean": 20.0,
+            }
+        )
+    engine.executed_count = options.budget_trials
+    monkeypatch.setattr(engine, "_run_child", lambda **_kwargs: pytest.fail("cached run executed"))
+    result = engine._confirm(cfg)
+    assert result.pp is not None and result.tg is not None
+    assert engine.executed_count == options.budget_trials
+
+
+def test_confirmation_capture_allocation_preserves_previous_attempt(
+    tmp_path: Path, fake_bin_dir: Path, tiny_gguf: Path
+) -> None:
+    session, _, _, _, _ = _setup(tmp_path, fake_bin_dir, tiny_gguf)
+    first = session.confirmation_dir("trial", 1)
+    (first / "stdout.json").write_bytes(b"retained")
+    second = session.confirmation_dir("trial", 1)
+    assert second != first and second.is_dir()
+    assert (first / "stdout.json").read_bytes() == b"retained"
+    with pytest.raises(SessionPathError):
+        session.confirmation_dir("../../../outside", 1)
+
+
+def _confirmation_rows(session_dir: Path) -> list[dict[str, Any]]:
+    return [
+        entry
+        for entry in Session.load(session_dir).entries
+        if entry.get("type") == "confirmation_run"
+    ]
+
+
+def _run_confirmed_session(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    *,
+    budget_trials: int = 40,
+) -> tuple[Session, HardwareReport, LlamaCppReport]:
+    session, hw, model, llama, options = _setup(
+        tmp_path,
+        fake_bin_dir,
+        tiny_gguf,
+        budget_trials=budget_trials,
+        observe_vram=False,
+    )
+    outcome = search.run_tuning(session, hw, model, llama, options)
+    assert outcome.exit_code == 0
+    assert outcome.analysis["winner"] is not None
+    assert len(_confirmation_rows(session.dir)) == options.baseline_runs
+    return session, hw, llama
+
+
+def _rebuild_fake_bench(fake_bin_dir: Path) -> LlamaCppReport:
+    bench_path = fake_bin_dir / ("llama-bench.cmd" if sys.platform == "win32" else "llama-bench")
+    previous = discover_llama(fake_bin_dir)
+    comment = (
+        b"\r\n@REM rebuilt without help changes\r\n"
+        if sys.platform == "win32"
+        else b"\n# rebuilt without help changes\n"
+    )
+    bench_path.write_bytes(bench_path.read_bytes() + comment)
+    if sys.platform != "win32":
+        bench_path.chmod(0o755)
+    rebuilt = discover_llama(fake_bin_dir)
+    assert rebuilt.bench_sha256 != previous.bench_sha256
+    assert rebuilt.help_sha256 == previous.help_sha256
+    return rebuilt
+
+
+def test_public_resume_rebuild_replaces_complete_confirmation_cache(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, llama = _run_confirmed_session(tmp_path, fake_bin_dir, tiny_gguf)
+    old_rows = _confirmation_rows(session.dir)
+    rebuilt = _rebuild_fake_bench(fake_bin_dir)
+    restored: list[tuple[str | None, str | None]] = []
+    original_load = search._Engine._load_baseline_stage
+
+    def tracked_load(engine: search._Engine, stage: dict[str, Any]) -> None:
+        before = engine.llama.bench_sha256
+        original_load(engine, stage)
+        restored.append((before, engine.llama.bench_sha256))
+
+    monkeypatch.setattr(search._Engine, "_load_baseline_stage", tracked_load)
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda: hw)
+
+    outcome = search.resume_tuning(session.dir)
+
+    rows = _confirmation_rows(session.dir)
+    new_rows = rows[len(old_rows) :]
+    assert restored == [(rebuilt.bench_sha256, llama.bench_sha256)]
+    assert outcome.exit_code == 0
+    assert outcome.analysis["winner"]["confirmed"] is True
+    assert len(new_rows) == 3
+    assert all(row["confirmation_key"]["bench_sha256"] == rebuilt.bench_sha256 for row in new_rows)
+
+
+def test_public_resume_rebuild_replaces_partial_confirmation_cache(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, model, llama, options = _setup(
+        tmp_path, fake_bin_dir, tiny_gguf, budget_trials=40, observe_vram=False
+    )
+    original_append = search._Engine._append
+
+    def interrupt_after_first_confirmation(engine: search._Engine, record: dict[str, Any]) -> None:
+        original_append(engine, record)
+        if record.get("type") == "confirmation_run":
+            raise KeyboardInterrupt
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(search._Engine, "_append", interrupt_after_first_confirmation)
+        assert search.run_tuning(session, hw, model, llama, options).exit_code == 4
+    old_rows = _confirmation_rows(session.dir)
+    assert len(old_rows) == 1
+    rebuilt = _rebuild_fake_bench(fake_bin_dir)
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda: hw)
+
+    outcome = search.resume_tuning(session.dir)
+
+    rows = _confirmation_rows(session.dir)
+    new_rows = rows[len(old_rows) :]
+    assert outcome.exit_code == 0
+    assert outcome.analysis["winner"]["confirmed"] is True
+    assert [row["run"] for row in rows] == [1, 1, 2, 3]
+    assert len(new_rows) == 3
+    assert all(row["confirmation_key"]["bench_sha256"] == rebuilt.bench_sha256 for row in new_rows)
+
+
+def test_public_resume_unchanged_build_reuses_complete_confirmation_cache(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, _llama = _run_confirmed_session(tmp_path, fake_bin_dir, tiny_gguf)
+    old_rows = _confirmation_rows(session.dir)
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda: hw)
+
+    outcome = search.resume_tuning(session.dir)
+
+    assert outcome.exit_code == 0
+    assert outcome.analysis["winner"]["confirmed"] is True
+    assert _confirmation_rows(session.dir) == old_rows
+
+
+def test_public_resume_without_current_hash_records_uncacheable_confirmation_rows(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, _llama = _run_confirmed_session(
+        tmp_path, fake_bin_dir, tiny_gguf, budget_trials=60
+    )
+    old_rows = _confirmation_rows(session.dir)
+    _rebuild_fake_bench(fake_bin_dir)
+    original_discover = discover_llama
+
+    def discover_without_bench_hash(path: Path | None = None) -> LlamaCppReport:
+        return dataclasses.replace(original_discover(path), bench_sha256=None)
+
+    monkeypatch.setattr("llamatune.llama.discover_llama", discover_without_bench_hash)
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda: hw)
+
+    first = search.resume_tuning(session.dir)
+    first_new_rows = _confirmation_rows(session.dir)[len(old_rows) :]
+    second = search.resume_tuning(session.dir)
+    all_rows = _confirmation_rows(session.dir)
+
+    assert first.exit_code == 0
+    assert second.exit_code == 0
+    assert len(first_new_rows) == 3
+    assert len(all_rows) == len(old_rows) + 6
+    assert all(row["confirmation_key"]["bench_sha256"] is None for row in all_rows[len(old_rows) :])
+
+
+def test_public_resume_rebuild_at_budget_does_not_promote_unconfirmed_winner(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, _llama = _run_confirmed_session(
+        tmp_path, fake_bin_dir, tiny_gguf, budget_trials=33
+    )
+    old_rows = _confirmation_rows(session.dir)
+    _rebuild_fake_bench(fake_bin_dir)
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda: hw)
+
+    outcome = search.resume_tuning(session.dir)
+
+    assert (outcome.analysis["winner"] or {}).get("confirmed") is not True
+    assert _confirmation_rows(session.dir) == old_rows
+    assert any("confirmation skipped" in warning for warning in outcome.analysis["warnings"])
+
+
+def test_revalidation_records_live_identity_after_baseline_restore(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, hw, _llama = _run_confirmed_session(tmp_path, fake_bin_dir, tiny_gguf)
+    old_rows = _confirmation_rows(session.dir)
+    rebuilt = _rebuild_fake_bench(fake_bin_dir)
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda: hw)
+
+    outcome = search.revalidate_session(session.dir)
+
+    new_rows = _confirmation_rows(session.dir)[len(old_rows) :]
+    assert outcome.exit_code == 0
+    assert len(new_rows) == 3
+    assert all(row["purpose"] == "revalidation" for row in new_rows)
+    assert all(row["confirmation_key"]["bench_sha256"] == rebuilt.bench_sha256 for row in new_rows)
+
+
+def test_public_default_discovery_binds_confirmation_and_retry_to_live_build(
+    tmp_path: Path,
+    fake_bin_dir: Path,
+    tiny_gguf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench_name = "llama-bench.cmd" if sys.platform == "win32" else "llama-bench"
+    old_bin = tmp_path / "old-bin"
+    fresh_bin = tmp_path / "fresh-bin"
+    old_bin.mkdir()
+    fresh_bin.mkdir()
+    source = fake_bin_dir / bench_name
+    old_path = old_bin / bench_name
+    fresh_path = fresh_bin / bench_name
+    build_comment = (
+        b"\r\n@REM different build\r\n" if sys.platform == "win32" else b"\n# different build\n"
+    )
+    old_path.write_bytes(source.read_bytes())
+    fresh_path.write_bytes(source.read_bytes() + build_comment)
+    if sys.platform != "win32":
+        old_path.chmod(0o755)
+        fresh_path.chmod(0o755)
+
+    hw = _hardware()
+    saved_llama = discover_llama(old_bin)
+    model = inspect_model(tiny_gguf)
+    options = dataclasses.replace(
+        _options(tmp_path / "sessions", old_bin, budget_trials=60, observe_vram=True),
+        llama_bin=None,
+    )
+    session = Session.create(
+        options.sessions_dir,
+        model=model,
+        hardware=hw,
+        llama=saved_llama,
+        options=options,
+        argv=["llamatune", "tune", str(tiny_gguf)],
+    )
+    assert options.llama_bin is None
+    assert discover_llama(fresh_bin).help_sha256 == saved_llama.help_sha256
+    assert discover_llama(fresh_bin).bench_sha256 != saved_llama.bench_sha256
+
+    native_probe_attempts: list[str] = []
+
+    def forbid_native_probe(argv: list[str]) -> str | None:
+        native_probe_attempts.append(argv[0])
+        raise AssertionError("native hardware probe requested despite fixture isolation")
+
+    monkeypatch.setattr("llamatune.hardware._run_probe", forbid_native_probe)
+    monkeypatch.setattr("llamatune.hardware.sample_gpu_states", lambda: ())
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda: hw)
+
+    initial = search.run_tuning(session, hw, model, saved_llama, options)
+    assert initial.exit_code == 0
+    assert native_probe_attempts == []
+    old_rows = _confirmation_rows(session.dir)
+    journal_prefix = (session.dir / "journal.jsonl").read_bytes()
+    metadata = (session.dir / "llamacpp.json").read_bytes()
+    captures = {
+        str(path.relative_to(session.dir)): path.read_bytes()
+        for path in (session.dir / "trials").rglob("*")
+        if path.is_file()
+    }
+    entries_before = Session.load(session.dir).entries
+    count_before = search._count_executed(entries_before)
+    monkeypatch.setenv("PATH", str(fresh_bin) + os.pathsep + os.defpath)
+
+    original_child = search._Engine._run_child
+    original_load = search._Engine._load_baseline_stage
+    restored: list[tuple[Path, Path]] = []
+    confirmation_argv: list[tuple[str, ...]] = []
+    contaminate_next_primary = True
+
+    def observe_child(
+        engine: search._Engine, **kwargs: Any
+    ) -> tuple[executor.ExecResult, search._RunObservation]:
+        nonlocal contaminate_next_primary
+        result, observation = original_child(engine, **kwargs)
+        if kwargs["kind"] not in {"confirm", "confirmation"}:
+            return result, observation
+        argv = kwargs["argv"]
+        confirmation_argv.append(argv)
+        if kwargs["run_id"].endswith("-thermal-retry"):
+            return result, search._RunObservation(None, None, (_gpu_sample(70.0),))
+        if contaminate_next_primary:
+            contaminate_next_primary = False
+            return result, search._RunObservation(None, None, (_gpu_sample(90.0),))
+        return result, search._RunObservation(None, None, ())
+
+    def observe_load(engine: search._Engine, stage: dict[str, Any]) -> None:
+        discovered = engine.llama.bench_path
+        original_load(engine, stage)
+        restored.append((discovered, engine.llama.bench_path))
+
+    monkeypatch.setattr(search._Engine, "_run_child", observe_child)
+    monkeypatch.setattr(search._Engine, "_load_baseline_stage", observe_load)
+    monkeypatch.setattr(
+        search,
+        "_detect_gpu_throttle",
+        lambda samples: bool(samples and samples[0].temperature_c == 90.0),
+    )
+
+    live_llama = discover_llama()
+    resumed = search.resume_tuning(session.dir)
+    resumed_rows = _confirmation_rows(session.dir)[len(old_rows) :]
+    entries_after_resume = Session.load(session.dir).entries
+    count_after_resume = search._count_executed(entries_after_resume)
+    resumed_pair_checks = [
+        entry
+        for entry in entries_after_resume[len(entries_before) :]
+        if entry.get("type") == "pair_check"
+    ]
+
+    assert live_llama.bench_path == fresh_path
+    assert restored == [(fresh_path, old_path)]
+    assert resumed.exit_code == 0
+    assert native_probe_attempts == []
+    assert len(resumed_rows) == options.baseline_runs
+    assert len(resumed_pair_checks) == 2
+    assert count_after_resume == count_before + len(confirmation_argv) + len(resumed_pair_checks)
+    assert all(
+        row["confirmation_key"]["bench_sha256"] == live_llama.bench_sha256 for row in resumed_rows
+    )
+    assert all(Path(argv[0]) == fresh_path for argv in confirmation_argv)
+    assert all(
+        row["confirmation_key"]["bench_sha256"]
+        == hash_binary(
+            Path(
+                json.loads((session.dir / row["capture_dir"] / "command.json").read_text())["argv"][
+                    0
+                ]
+            )
+        )
+        for row in resumed_rows
+    )
+    retry_commands = list((session.dir / "trials").glob("*/confirm-1*/thermal-retry/command.json"))
+    assert len(retry_commands) == 1
+    assert Path(json.loads(retry_commands[0].read_text())["argv"][0]) == fresh_path
+    assert (
+        hash_binary(Path(json.loads(retry_commands[0].read_text())["argv"][0]))
+        == live_llama.bench_sha256
+    )
+    assert (
+        len(
+            [
+                entry
+                for entry in Session.load(session.dir).entries
+                if entry.get("type") == "thermal_retry" and entry.get("run_kind") == "confirmation"
+            ]
+        )
+        == 1
+    )
+    assert _confirmation_rows(session.dir)[: len(old_rows)] == old_rows
+    assert (session.dir / "journal.jsonl").read_bytes().startswith(journal_prefix)
+    assert (session.dir / "llamacpp.json").read_bytes() == metadata
+    assert all((session.dir / path).read_bytes() == data for path, data in captures.items())
+
+    confirmation_argv.clear()
+    second_resume = search.resume_tuning(session.dir)
+    entries_after_second_resume = Session.load(session.dir).entries
+    second_resume_pair_checks = [
+        entry
+        for entry in entries_after_second_resume[len(entries_after_resume) :]
+        if entry.get("type") == "pair_check"
+    ]
+    assert second_resume.exit_code == 0
+    assert native_probe_attempts == []
+    assert _confirmation_rows(session.dir) == old_rows + resumed_rows
+    assert len(second_resume_pair_checks) == 2
+    assert search._count_executed(entries_after_second_resume) == count_after_resume + len(
+        second_resume_pair_checks
+    )
+    assert confirmation_argv == []
+
+    contaminate_next_primary = True
+    confirmation_argv.clear()
+    before_revalidation = len(_confirmation_rows(session.dir))
+    revalidated = search.revalidate_session(session.dir)
+    revalidation_rows = _confirmation_rows(session.dir)[before_revalidation:]
+
+    assert revalidated.exit_code == 0
+    assert native_probe_attempts == []
+    assert len(revalidation_rows) == options.baseline_runs
+    assert all(row["purpose"] == "revalidation" for row in revalidation_rows)
+    assert all(
+        row["confirmation_key"]["bench_sha256"] == live_llama.bench_sha256
+        for row in revalidation_rows
+    )
+    assert all(Path(argv[0]) == fresh_path for argv in confirmation_argv)
+    assert all(
+        row["confirmation_key"]["bench_sha256"]
+        == hash_binary(
+            Path(
+                json.loads((session.dir / row["capture_dir"] / "command.json").read_text())["argv"][
+                    0
+                ]
+            )
+        )
+        for row in revalidation_rows
+    )

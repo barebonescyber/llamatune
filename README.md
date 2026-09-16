@@ -572,13 +572,13 @@ KV-cache recommendation, add `--compare-lossless` to run the evaluated and lossl
 configurations serially and report per-suite deltas. Select `perplexity` only with a local
 `--quality-corpus PATH`.
 
-Generated Python is always data unless the operator explicitly enables `--exec`. That
-option runs declared coding assertions in a fresh, resource-limited POSIX subprocess with
-bounded output and time. This is an accident barrier, not a security boundary: POSIX
-limits do not inherently block network system calls, and unprivileged network namespaces
-may be unavailable. On macOS, the platform's unreliable `RLIMIT_AS` implementation is
-reported and that single address-space cap is omitted; the CPU, file-size, descriptor, and
-core-dump limits remain active. Do not enable it for an adversarial model.
+Generated-code execution is temporarily disabled on every platform. Passing `--exec`
+returns exit 2 before model discovery or run creation, including with `--list-suites`.
+Resuming a run whose saved options enable execution also returns exit 2. Quality evaluation
+without `--exec` remains available and skips `exec_python` graders. The retained
+resource-limit runner is inactive and not a security boundary for untrusted code.
+Re-enablement requires mandatory filesystem and network confinement, verified memory
+limits, and adversarial tests. No reduced-isolation override is supported.
 
 Each run writes under `<sessions-dir>/quality/<run>/`, including identity/config metadata,
 an fsynced journal, bounded request/response evidence, `quality.json`, and

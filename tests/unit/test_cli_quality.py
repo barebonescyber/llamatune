@@ -203,17 +203,22 @@ def test_quality_validation_exits_2(args: list[str], message: str) -> None:
     assert message in result.stderr
 
 
-def test_quality_exec_platform_validation_precedes_run_creation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr("llamatune.cli._quality_exec_supported", lambda: False)
+def test_quality_exec_is_rejected_before_run_creation(tmp_path: Path) -> None:
     result = runner.invoke(
         app,
         ["quality", str(tmp_path / "model.gguf"), "--sessions-dir", str(tmp_path), "--exec"],
     )
     assert result.exit_code == 2
-    assert "POSIX resource limits" in result.stderr
+    assert "generated-code execution is disabled" in result.stderr
     assert not (tmp_path / "quality").exists()
+
+
+def test_quality_exec_is_rejected_with_list_suites() -> None:
+    result = runner.invoke(app, ["quality", "--list-suites", "--exec"])
+
+    assert result.exit_code == 2
+    assert "generated-code execution is disabled" in result.stderr
+    assert result.stdout == ""
 
 
 def test_quality_resume_wiring_and_conflicts(

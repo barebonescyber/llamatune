@@ -20,6 +20,7 @@ _POSIX_ONLY = pytest.mark.skipif(os.name != "posix", reason="POSIX sandbox only"
 @pytest.fixture(autouse=True)
 def _disable_unshare(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sandbox, "_network_wrapper", lambda: ())
+    monkeypatch.setattr(sandbox, "require_exec_isolation", lambda: None)
 
 
 @_POSIX_ONLY
@@ -195,6 +196,7 @@ def test_unavailable_platform_and_invalid_timeout_errors(monkeypatch: pytest.Mon
     with pytest.raises(RuntimeError, match="POSIX resource limits"):
         sandbox.run_python("pass\n", timeout_s=1.0)
     monkeypatch.undo()
+    monkeypatch.setattr(sandbox, "require_exec_isolation", lambda: None)
     for value in (0.0, -1.0, float("inf"), float("nan")):
         with pytest.raises(ValueError, match="finite and positive"):
             sandbox.run_python("pass\n", timeout_s=value)

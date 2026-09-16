@@ -128,13 +128,18 @@ existing CLI conventions.
 - `0` — shift completed; every item that was started succeeded. Items
   deferred because the deadline arrived are normal and still exit 0 (they
   are listed in the report).
-- `1` — shift completed but at least one started item failed (a tune exited
-  3/4, a calibration errored). Evidence and the report are still written.
+- `1`: shift completed but at least one started item failed (a tune exited
+  3, a calibration errored, or the consecutive tune-failure circuit breaker
+  tripped). Evidence and the report are still written.
 - `2` — usage or configuration error.
 - `3` — environment error: `llama-bench` missing/unusable, `MODELS_DIR`
   missing or unreadable, or no GGUF file survives discovery/filters.
-- `4` — interrupted by signal with work remaining (§7.5). Re-running the
-  same command resumes naturally (§7.6).
+- `4`: user interruption or an interrupted child session (§7.5). Re-running
+  the same command resumes naturally (§7.6).
+
+Night Shift exits 4 for user interruption or an interrupted child session.
+The consecutive tune-failure circuit breaker exits 1 and records a failed window.
+A stop caused only by the work window ending is not a user interruption.
 
 ## 4. Model discovery (`discovery.py`)
 
@@ -702,8 +707,9 @@ calibration at 0.85 (drift) or 1.0 (consistent) without touching evidence.
 ## 14. Documentation
 
 README gains a "Night Shift" section (command synopsis, one worked example
-using `./models`, deadline semantics, where the report lands). DESIGN.md is
-not modified; this document is the Night Shift spec.
+using `./models`, deadline semantics, where the report lands). DESIGN.md may
+be updated only to align Night Shift exit-code documentation. This document
+remains the Night Shift spec.
 
 ## 15. Future work (post-v1)
 

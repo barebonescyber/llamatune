@@ -111,6 +111,10 @@ configuration error; `3` environment error (missing/unusable llama-bench,
 unreadable model); `4` interrupted or failed mid-run with a resumable
 session.
 
+Night Shift exits 4 for user interruption or an interrupted child session.
+The consecutive tune-failure circuit breaker exits 1 and records a failed window.
+A stop caused only by the work window ending is not a user interruption.
+
 An exit-3 tuning outcome is rendered as `tuning did not start`, with its
 failure stage, reason, and session evidence path. It is never described as a
 completed search with no confirmed improvement.
@@ -489,6 +493,10 @@ warning. (v1 deliberately does not hash-chain the journal — it is
 honest-operator evidence, not tamper-proof; documented divergence from
 infer-tune.)
 
+Marathon journal recovery has its own reader-specific policy. See
+`docs/marathon-design.md` §13.4; it does not change this strict session
+resume reader or its warned torn-final-line recovery.
+
 Thermally observed `trial` and `confirmation_run` records carry contamination,
 retry, and replacement-contamination state. A final trial rejected for thermal
 provenance additionally carries `thermal_rejected: true` and has `score: null`.
@@ -513,6 +521,12 @@ trial and probe ids are skipped. The remaining budget is reconstructed from
 every countable execution entry, including stability reruns, thermal retries,
 pair checks, validation runs, and confirmation; restarting the engine therefore
 does not restore budget consumed by auxiliary measurements.
+
+Confirmation resume reuses only successful measurements with matching configuration,
+model fingerprint, benchmark/help hashes, workload, depth, and confirmation settings.
+Each new confirmation_run carries confirmation_key, purpose, and capture_dir.
+Records without that identity remain evidence and budget-counted but are not reused.
+Revalidation always measures again. New attempts use distinct capture directories.
 
 ## 13. Architecture
 
@@ -708,7 +722,7 @@ versioned in `check_module_coverage.py`; experimental orchestration and quality
 evaluation modules are not used to weaken or average away this per-module
 gate.
 
-Dependencies: `typer<1`, `gguf<1` (numpy transitively). Dev: `pytest`,
+Dependencies: `typer>=0.27.0,<1`, `gguf>=0.19.0,<1` (numpy transitively). Dev: `pytest`,
 `pytest-cov`, `ruff`, `mypy`. Python >= 3.11.
 
 ## 17. Future work (post-v1)

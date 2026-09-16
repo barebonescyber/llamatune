@@ -563,6 +563,22 @@ class Session:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def confirmation_dir(self, trial_id: str, run: int) -> Path:
+        if run < 1:
+            raise ValueError("confirmation run must be positive")
+        for attempt in range(10):
+            name = f"confirm-{run}"
+            if attempt:
+                name += f"-attempt-{secrets.token_hex(3)}"
+            path = _confine(self._dir, "trials", trial_id, name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                path.mkdir(exist_ok=False)
+            except FileExistsError:
+                continue
+            return path
+        raise OSError("could not allocate confirmation capture directory")
+
     def baseline_dir(self, n: int) -> Path:
         path = _confine(self._dir, "baseline", f"run-{n}")
         path.mkdir(parents=True, exist_ok=True)

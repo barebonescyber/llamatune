@@ -299,6 +299,8 @@ def test_exec_and_no_exec_paths_never_overlap_server_and_sandbox(
     original_stop = qualserver.ServerHandle.stop
     original_sandbox = sandbox.run_python
 
+    monkeypatch.setattr(sandbox, "require_exec_isolation", lambda: None)
+
     def tracked_start(*args: Any, **kwargs: Any) -> qualserver.ServerHandle:
         nonlocal active_server
         handle = original_start(*args, **kwargs)
@@ -863,3 +865,51 @@ def test_dry_run_has_estimates_and_creates_no_run_directory(
     assert outcome.summary["suites"][0]["tasks"] == 1
     assert "<ephemeral>" in outcome.summary["server_argv"]
     assert not (root / "quality").exists()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_exec_run_refuses_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool
+) -> None:
+    options = _options(
+        tmp_path / "unused.gguf",
+        tmp_path / "bin",
+        tmp_path / "sessions",
+        ("coding",),
+        exec_enabled=True,
+        dry_run=dry_run,
+    )
+    monkeypatch.setattr(
+        quality, "assess_hardware", lambda: pytest.fail("hardware discovery started")
+    )
+    result = quality.run_quality(options)
+    assert result.exit_code == 2
+    assert result.summary["error"] == sandbox.EXEC_DISABLED_REASON
+    assert not options.sessions_dir.exists()
+
+
+def test_exec_resume_refuses_persisted_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options = _options(
+        tmp_path / "unused.gguf",
+        tmp_path / "bin",
+        tmp_path / "sessions",
+        ("coding",),
+        exec_enabled=True,
+    )
+    run_dir = tmp_path / "previous-run"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(
+        json.dumps({"schema_version": 1, "options": quality._options_dict(options)}),
+        encoding="utf-8",
+    )
+    (run_dir / "journal.jsonl").write_bytes(b'{"type":"quality_start"}\n')
+    before = {path.name: path.read_bytes() for path in run_dir.iterdir() if path.is_file()}
+    monkeypatch.setattr(
+        quality, "assess_hardware", lambda: pytest.fail("hardware discovery started")
+    )
+    result = quality.resume_quality(run_dir)
+    assert result.exit_code == 2
+    assert result.summary["error"] == sandbox.EXEC_DISABLED_REASON
+    assert before == {path.name: path.read_bytes() for path in run_dir.iterdir() if path.is_file()}

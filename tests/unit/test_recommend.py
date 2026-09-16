@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
+import shlex
 from pathlib import Path
 from typing import Any
 
-from llamatune import recommend
+import pytest
+
+from llamatune import recommend, report
 from llamatune.types import BaselineResult, LlamaCppReport, MetricStats, ModelReport, TrialConfig
 
 _ALL_CAPS = frozenset({"fa", "mmp", "nkvo", "ctk", "ctv", "ncmoe", "r", "o"})
@@ -337,8 +341,29 @@ class TestRecommendedSh:
         assert "--no-kv-offload" in text
         assert "-ctk q8_0" in text
         assert "-ctv q8_0" in text
-        assert f"llama-server -m {_model().path}" in text
-        assert f"llama-cli -m {_model().path}" in text
+        expected_runtime_flags = [
+            "-ngl",
+            "33",
+            "-b",
+            "2048",
+            "-ub",
+            "512",
+            "-t",
+            "8",
+            "--n-cpu-moe",
+            "24",
+            "-fa",
+            "on",
+            "--no-mmap",
+            "--no-kv-offload",
+            "-ctk",
+            "q8_0",
+            "-ctv",
+            "q8_0",
+        ]
+        for program in ("llama-server", "llama-cli"):
+            line = next(line[2:] for line in text.splitlines() if line.startswith(f"# {program} "))
+            assert shlex.split(line) == [program, "-m", str(_model().path), *expected_runtime_flags]
         # Reference only: every content line is commented out.
         for line in text.splitlines():
             assert line == "" or line.startswith("#")
@@ -369,3 +394,56 @@ class TestRecommendedSh:
             ctx_size=8192,
         )
         assert "-c 8192" in text
+
+
+@pytest.mark.parametrize("model_path", ["/models/plain.gguf", "/models/model one's.gguf"])
+def test_recommended_commands_preserve_runtime_placement(model_path: str) -> None:
+    cfg = _config(
+        threads_batch=4,
+        ot_spec="blk.0.ffn_.*_exps=CPU",
+        moe_cpu_layers=3,
+        tensor_split=(2.0, 1.0),
+        split_mode="layer",
+        mmap=False,
+        no_kv_offload=True,
+        cache_type_k="q8_0",
+        cache_type_v="q4_0",
+    )
+    model = dataclasses.replace(_model(), path=Path(model_path))
+    snippet = recommend.build_recommended_sh(
+        config=cfg,
+        model=model,
+        expected={},
+        confirmed=True,
+        target="balanced",
+        moe=True,
+        ctx_size=4096,
+    )
+    exported = report.render_export(
+        {"config": cfg.to_dict(), "model": {"path": str(model.path)}},
+        {"options": {"ctx_size": 4096}},
+        "llama-cli",
+    )
+    line = next(line[2:] for line in snippet.splitlines() if line.startswith("# llama-cli -m "))
+    argv = shlex.split(line)
+    assert argv == shlex.split(exported)
+    for flag, value in (("-tb", "4"), ("-ot", cfg.ot_spec), ("-ts", "2,1"), ("-sm", "layer")):
+        assert argv.count(flag) == 1
+        assert argv[argv.index(flag) + 1] == value
+    assert "--n-cpu-moe" not in argv
+
+
+def test_runtime_flags_default_omission_and_moe_gate() -> None:
+    from llamatune.runtimeflags import runtime_flags
+
+    cfg = _config(moe_cpu_layers=3)
+    assert "--n-cpu-moe" in runtime_flags(cfg, moe=True)
+    assert "--n-cpu-moe" not in runtime_flags(cfg, moe=False)
+    for flag in ("-tb", "-ot", "-ts", "-sm"):
+        assert flag not in runtime_flags(cfg)
+
+
+def test_config_text_has_no_duplicate_optional_fields() -> None:
+    text = report._format_config(_config(threads_batch=4, ot_spec="x=CPU").to_dict())
+    assert text.count("tb=") == 1
+    assert text.count("ot=") == 1

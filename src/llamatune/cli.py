@@ -689,7 +689,13 @@ def quality(
     suites: Annotated[list[str] | None, typer.Option("--suite")] = None,
     task_filters: Annotated[list[str] | None, typer.Option("--tasks")] = None,
     list_suites: Annotated[bool, typer.Option("--list-suites")] = False,
-    exec_enabled: Annotated[bool, typer.Option("--exec")] = False,
+    exec_enabled: Annotated[
+        bool,
+        typer.Option(
+            "--exec",
+            help="Reserved: generated-code execution is disabled pending verified confinement.",
+        ),
+    ] = False,
     ctx_size: Annotated[int, typer.Option("--ctx-size")] = 8192,
     quality_corpus: Annotated[Path | None, typer.Option("--quality-corpus")] = None,
     reps: Annotated[int, typer.Option("--reps")] = 1,
@@ -702,6 +708,12 @@ def quality(
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Experimental: evaluate deterministic quality suites for one model/configuration."""
+    if exec_enabled:
+        from llamatune.sandbox import EXEC_DISABLED_REASON
+
+        typer.echo(f"error: {EXEC_DISABLED_REASON}", err=True)
+        raise typer.Exit(code=2)
+
     from llamatune.qualsuites import bundled_suites, load_suite
 
     if list_suites:
@@ -776,10 +788,6 @@ def quality(
     ):
         typer.echo("error: quality timeouts must be finite and positive", err=True)
         raise typer.Exit(code=2)
-    if exec_enabled and not _quality_exec_supported():
-        typer.echo("error: --exec requires POSIX resource limits", err=True)
-        raise typer.Exit(code=2)
-
     selected = tuple(suites or ("coding", "tooluse", "agentic", "ifollow"))
     try:
         loaded = tuple(load_suite(name) for name in selected)

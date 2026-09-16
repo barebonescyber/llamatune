@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -98,6 +99,42 @@ def test_reentry_identity_is_exact() -> None:
     changed = {**value, "tg": 64}
     assert not identity_matches({"identity": changed}, options(), "abc")
     assert not identity_matches({}, options(), "abc")
+
+
+@pytest.mark.parametrize("bad", ["{broken", "[]", '"not an object"'])
+def test_marathon_middle_corruption_keeps_later_records(tmp_path: Path, bad: str) -> None:
+    path = tmp_path / "journal.jsonl"
+    original = ('{"type":"marathon_start"}\n' + bad + '\n{"type":"marathon_end"}\n').encode()
+    path.write_bytes(original)
+    with pytest.warns(RuntimeWarning, match=r"journal.jsonl line 2"):
+        entries = marathon_module._entries(tmp_path)
+    assert [entry["type"] for entry in entries] == ["marathon_start", "marathon_end"]
+    assert path.read_bytes() == original
+
+
+def test_completed_marathon_is_not_resumed_after_corruption(tmp_path: Path) -> None:
+    opts = options()
+    run_dir = tmp_path / "marathon" / "run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(
+        json.dumps({"identity": identity(opts, "fp")}), encoding="utf-8"
+    )
+    (run_dir / "journal.jsonl").write_bytes(
+        b'{"type":"marathon_start"}\n{broken\n{"type":"marathon_end"}\n'
+    )
+    with pytest.warns(RuntimeWarning, match="line 2"):
+        candidate, mismatches = marathon_module.find_reentry(tmp_path, opts, "fp")
+    assert candidate is None
+    assert mismatches == ()
+
+
+def test_marathon_blank_lines_and_torn_tail_do_not_change_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "journal.jsonl"
+    original = b'\n{"type":"marathon_start"}\n\n{torn'
+    path.write_bytes(original)
+    with pytest.warns(RuntimeWarning, match="line 4"):
+        assert marathon_module._entries(tmp_path) == [{"type": "marathon_start"}]
+    assert path.read_bytes() == original
 
 
 def test_plan_profile_and_remaining_budget() -> None:

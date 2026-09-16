@@ -503,7 +503,11 @@ def _finalize(
             "started": start.isoformat(),
             "ended": _utc_iso(),
             "deadline": deadline.isoformat() if deadline else None,
-            "outcome": "interrupted" if stopped else "completed",
+            "outcome": "interrupted"
+            if exit_code == 4
+            else "failed"
+            if exit_code == 1
+            else "completed",
         },
         "items": items,
         "counts": _summary_counts(items),
@@ -651,10 +655,12 @@ def run_nightshift(
     by_fingerprint = {model.report.fingerprint: model for model in models}
     stop = False
     second_signal = False
+    user_interrupted = False
     old_handlers: dict[signal.Signals, Any] = {}
 
     def handle_signal(signum: int, _frame: Any) -> None:
-        nonlocal stop, second_signal
+        nonlocal stop, second_signal, user_interrupted
+        user_interrupted = True
         if stop:
             second_signal = True
             run.append({"type": "interrupted", "signal": signum, "immediate": True})
@@ -958,22 +964,17 @@ def run_nightshift(
     except KeyboardInterrupt:
         stop = True
         second_signal = True
+        user_interrupted = True
     finally:
         for sig, handler in old_handlers.items():
             signal.signal(sig, handler)
 
-    exit_code = (
-        4
-        if stop
-        and (
-            second_signal
-            or any(item.get("outcome") == "interrupted" for item in items)
-            or phase_queues
-        )
-        else 1
-        if failed
-        else 0
+    interrupted = (
+        user_interrupted
+        or second_signal
+        or any(item.get("outcome") == "interrupted" for item in items)
     )
+    exit_code = 4 if interrupted else 1 if failed else 0
     return _finalize(
         run,
         options,

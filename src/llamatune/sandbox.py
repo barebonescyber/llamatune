@@ -39,6 +39,16 @@ class ExecVerdict:
     stderr_tail: str
 
 
+EXEC_DISABLED_REASON = (
+    "generated-code execution is disabled until filesystem, network, and memory "
+    "confinement are verified; omit --exec to use non-executing graders"
+)
+
+
+def require_exec_isolation() -> None:
+    raise ValueError(EXEC_DISABLED_REASON)
+
+
 def _limits() -> tuple[tuple[int, int], ...]:
     if _resource is None:
         raise RuntimeError("Python execution sandbox requires POSIX resource limits")
@@ -181,7 +191,8 @@ def terminate_active() -> bool:
 
 
 def run_python(code: str, *, timeout_s: float) -> ExecVerdict:
-    """Execute Python with bounded POSIX resources and process-group cleanup."""
+    """Unconditionally refuse execution; retained sandbox mechanics are inactive."""
+    require_exec_isolation()
     if os.name != "posix" or _resource is None:
         raise RuntimeError("Python execution sandbox requires POSIX resource limits")
     if not _valid_timeout(timeout_s):
