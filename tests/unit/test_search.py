@@ -3237,8 +3237,11 @@ def test_public_default_discovery_binds_confirmation_and_retry_to_live_build(
     source = fake_bin_dir / bench_name
     old_path = old_bin / bench_name
     fresh_path = fresh_bin / bench_name
+    build_comment = (
+        b"\r\n@REM different build\r\n" if sys.platform == "win32" else b"\n# different build\n"
+    )
     old_path.write_bytes(source.read_bytes())
-    fresh_path.write_bytes(source.read_bytes() + b"\n# different build\n")
+    fresh_path.write_bytes(source.read_bytes() + build_comment)
     if sys.platform != "win32":
         old_path.chmod(0o755)
         fresh_path.chmod(0o755)
@@ -3262,8 +3265,19 @@ def test_public_default_discovery_binds_confirmation_and_retry_to_live_build(
     assert discover_llama(fresh_bin).help_sha256 == saved_llama.help_sha256
     assert discover_llama(fresh_bin).bench_sha256 != saved_llama.bench_sha256
 
+    native_probe_attempts: list[str] = []
+
+    def forbid_native_probe(argv: list[str]) -> str | None:
+        native_probe_attempts.append(argv[0])
+        raise AssertionError("native hardware probe requested despite fixture isolation")
+
+    monkeypatch.setattr("llamatune.hardware._run_probe", forbid_native_probe)
+    monkeypatch.setattr("llamatune.hardware.sample_gpu_states", lambda: ())
+    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda: hw)
+
     initial = search.run_tuning(session, hw, model, saved_llama, options)
     assert initial.exit_code == 0
+    assert native_probe_attempts == []
     old_rows = _confirmation_rows(session.dir)
     journal_prefix = (session.dir / "journal.jsonl").read_bytes()
     metadata = (session.dir / "llamacpp.json").read_bytes()
@@ -3274,8 +3288,6 @@ def test_public_default_discovery_binds_confirmation_and_retry_to_live_build(
     }
     entries_before = Session.load(session.dir).entries
     count_before = search._count_executed(entries_before)
-    monkeypatch.setattr("llamatune.hardware.assess_hardware", lambda: hw)
-    monkeypatch.setattr("llamatune.hardware.sample_gpu_states", lambda: ())
     monkeypatch.setenv("PATH", str(fresh_bin) + os.pathsep + os.defpath)
 
     original_child = search._Engine._run_child
@@ -3327,6 +3339,7 @@ def test_public_default_discovery_binds_confirmation_and_retry_to_live_build(
     assert live_llama.bench_path == fresh_path
     assert restored == [(fresh_path, old_path)]
     assert resumed.exit_code == 0
+    assert native_probe_attempts == []
     assert len(resumed_rows) == options.baseline_runs
     assert len(resumed_pair_checks) == 2
     assert count_after_resume == count_before + len(confirmation_argv) + len(resumed_pair_checks)
@@ -3376,6 +3389,7 @@ def test_public_default_discovery_binds_confirmation_and_retry_to_live_build(
         if entry.get("type") == "pair_check"
     ]
     assert second_resume.exit_code == 0
+    assert native_probe_attempts == []
     assert _confirmation_rows(session.dir) == old_rows + resumed_rows
     assert len(second_resume_pair_checks) == 2
     assert search._count_executed(entries_after_second_resume) == count_after_resume + len(
@@ -3390,6 +3404,7 @@ def test_public_default_discovery_binds_confirmation_and_retry_to_live_build(
     revalidation_rows = _confirmation_rows(session.dir)[before_revalidation:]
 
     assert revalidated.exit_code == 0
+    assert native_probe_attempts == []
     assert len(revalidation_rows) == options.baseline_runs
     assert all(row["purpose"] == "revalidation" for row in revalidation_rows)
     assert all(
